@@ -29,6 +29,11 @@ every actual result.
 For the UCX optional Go-binding build failure, see the
 [update and retry instructions](docs/standalone-hardening/README.md#if-ucx-stops-while-building-go-bindings).
 
+For MPI/PML errors or Mellanox setup, use the
+[copy-and-paste diagnostics and system settings](docs/standalone-hardening/README.md#collect-mpi-and-fabric-diagnostics).
+It locates the saved trial installations and prints the exact local report path
+to share. Keep using this README and its linked workflow for current procedures.
+
 Maintainers can exercise the UCX configure/binding regression using the pinned
 release archive and a locally available Linux Go/GCC Docker image:
 

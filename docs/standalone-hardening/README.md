@@ -259,6 +259,62 @@ Completed driver builds are checked and skipped on a repeated command. On failur
 
 This preserves the failed attempt and starts its build again. It does not remove more flags because of an arbitrary package/test failure. Existing manual installations are retained; the driver will explain if an audit or a separate trial root is needed. Changing build flags/dependencies after a successful build requires a fresh experiment root. Scheduling/reporting updates only need refreshed scripts.
 
+## Collect MPI and fabric diagnostics
+
+Use this when an MPI/UCX verification fails or before choosing a site's fabric
+settings. The collector finds the full/reference prefixes through the saved
+`mpi-env*.sh` files and uses the documented installation layout when an arm is
+incomplete. It records versions, UCX transports/devices, RDMA port state,
+memlock, UCX PML library resolution, build flags and recent MPI error logs.
+
+On the login node, update the source checkout on the shared filesystem:
+
+```bash
+export TRIAL_ROOT="${TRIAL_ROOT:-$HOME/COMPILER_HARDENING}"
+export RUNBOOK_REPO="${RUNBOOK_REPO:-$TRIAL_ROOT/compiler-hardening-trial}"
+git -C "$RUNBOOK_REPO" pull --ff-only
+```
+
+Then, in the allocated compute-node shell where the error occurred, with its
+normal site modules loaded:
+
+```bash
+export TRIAL_ROOT="${TRIAL_ROOT:-$HOME/COMPILER_HARDENING}"
+export RUNBOOK_REPO="${RUNBOOK_REPO:-$TRIAL_ROOT/compiler-hardening-trial}"
+python3 "$RUNBOOK_REPO/scripts/collect_mpi_diagnostics.py" --trial-root "$TRIAL_ROOT"
+```
+
+No driver reinstall is needed for this diagnostic command. It uses Python's
+standard library and runs no MPI jobs, downloads or rebuilds. Saved activation
+and any selected tuning file run in child shells; the calling shell is unchanged.
+Missing optional tools or incomplete installations are recorded in the report.
+The only new files are the reports under
+`$TRIAL_ROOT/results/diagnostics/mpi-<time>-<host>-<unique>/`. The command prints
+the exact `report.txt` path to share; `report.json` retains full device output.
+Run on each selected compute-node type/host as needed. Inventory does not prove
+multi-node connectivity or qualify a performance result.
+
+### Settings that belong to each system
+
+| Setting | When to select it |
+|---|---|
+| `TRIAL_ROOT` | Set once to the existing trial's absolute path; keep the same shared path on login and compute nodes. |
+| `RUNBOOK_REPO` | Set to the public checkout; its folder name does not change build state. |
+| Required site modules and library/header locations | Use the site's supported setup before configuration and execution; retain those choices with the results. |
+| `TRIAL_UCX_CONFIGURE_ARGS` | Choose before UCX builds. For the intended RDMA trial, select compatible verbs/rdmacm support and any required prefixes; the driver default is TCP/shared-memory bring-up. |
+| `UCX_TLS` and optional `UCX_NET_DEVICES` | Qualify the transport and usable local device/port on allocated compute nodes. Do not copy an example `mlx5_0:1` blindly between systems. |
+| `TRIAL_MPI_TUNING` | Optional absolute path to the recorded site runtime settings. The collector applies it after each arm's activation and records the effective values; this does not fix propagation in another launcher or prove that timed runs applied it. |
+| RoCE GID/traffic class, InfiniBand service level and similar tuning | Set only when required and supplied by the site; leave unspecified values at the qualified defaults. |
+| Slurm account, partition/constraint, walltime and test scales | Select for the site and campaign. Allocation size alone does not define a sweep. |
+| `IO_DIR` / `SHARED_IO_DIR` | Choose the actual measurement filesystem, shared across MPI nodes for the I/O cases. |
+
+Keep system-specific paths and device choices in the saved site configuration
+and evidence, rather than editing the general recipe for each machine. Use the
+[UCX/RDMA procedure](00b-openmpi-ucx.md#2-select-the-ucx-transport-prerequisites)
+to interpret the report before changing completed build inputs. This section
+is the current diagnostic procedure; future fixes update it in place rather
+than adding a separate competing update guide.
+
 ## 4. Test one package when it is ready
 
 For a Mellanox/RDMA system, first qualify the
