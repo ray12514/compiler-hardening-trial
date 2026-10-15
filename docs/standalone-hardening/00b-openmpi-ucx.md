@@ -86,9 +86,10 @@ support through `UCX_TLS` or `mpirun` options afterward.
 
 Changing this setting changes the recorded UCX build inputs and dependent MPI
 stack. Do not use `--retry` to relabel completed TCP builds as RDMA builds or
-delete completion records. Preserve the current trial and choose an explicit
-rebuild plan after inspecting the completed/pending state. Failed, incomplete
-driver attempts use the existing retry procedure.
+delete completion records. Use the [explicit MPI graph recovery](README.md#recover-a-completed-tcp-only-mpi-build-for-rdma)
+to preserve serial progress and archive the old MPI files/records before
+rebuilding both arms. Failed, incomplete driver attempts use the existing retry
+procedure when the build inputs are unchanged.
 
 ```bash
 UCX_TRANSPORT_ARGS=(--without-verbs --without-rdmacm)
@@ -116,8 +117,9 @@ index, service level or device name. See [UCX network selection](https://openucx
 
 The activation scripts clear inherited UCX settings. Apply qualified tuning
 after each MPI environment activation. Campaign 08/10 supports a recorded
-`TRIAL_MPI_TUNING` file; the individual driver pilot and manual smoke must also
-be checked for propagation after activation before relying on those settings.
+`TRIAL_MPI_TUNING` file, and the updated driver reapplies it after activation in
+individual verification/build/test shells. When running the raw manual blocks
+outside the driver, explicitly source the chosen tuning file after each activation.
 Retain the MPI placement/communication verification: a PML or device-open
 failure holds the MPI results until resolved.
 

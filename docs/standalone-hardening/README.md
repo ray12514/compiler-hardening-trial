@@ -44,7 +44,7 @@ local edits. The repositories have separate histories; do not pull the new
 repository into the old one or merge their histories. No rename, remote change
 or reset of the old checkout is needed.
 
-Next, follow **step 1 below, including its Python installer**. This selects the
+Next, follow **step 1 below, including its installer**. This selects the
 new checkout and refreshes `runner/trial.py`, its launcher and recipe snapshot
 inside the existing trial root. It leaves build records, installed packages,
 saved environment files and results in place. Pulling Git alone does not update
@@ -105,29 +105,7 @@ Record the printed commit with the experiment results. **Stop here if Git report
 Install/update the command and its recipe snapshot using Python 3.10 or newer:
 
 ```bash
-python3 - <<'PY'
-import fcntl, os, pathlib, re, shlex, shutil, subprocess, sys
-if sys.version_info < (3,10): raise SystemExit('Use Python 3.10 or newer for this installer and ReFrame.')
-root = pathlib.Path(os.environ['TRIAL_ROOT']).expanduser().resolve()
-repo = pathlib.Path(os.environ['RUNBOOK_REPO']).expanduser().resolve()
-if any(c.isspace() for c in str(root)): raise SystemExit('TRIAL_ROOT must have no whitespace.')
-source = repo/'docs/standalone-hardening'
-code = re.findall(r'```python\n(.*?)\n```', (source/'13-driver.md').read_text(), re.S)[0]
-compile(code, 'trial.py', 'exec')
-runner = root/'runner'; runner.mkdir(parents=True, exist_ok=True)
-with (runner/'lock').open('w') as lock:
-    try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError: raise SystemExit('A trial command is active; install after it finishes.')
-    recipes = runner/'recipes'; recipes.mkdir(exist_ok=True)
-    for path in source.glob('*.md'): shutil.copy2(path, recipes/path.name)
-    (runner/'trial.py').write_text(code+'\n')
-    launcher = runner/'trial'
-    launcher.write_text('#!/bin/bash\nexec '+shlex.quote(sys.executable)+' '+shlex.quote(str(runner/'trial.py'))+' "$@"\n')
-    launcher.chmod(0o755)
-    commit = subprocess.run(['git','-C',str(repo),'rev-parse','HEAD'], capture_output=True,text=True)
-    (runner/'procedure.txt').write_text(commit.stdout.strip() if commit.returncode == 0 else 'archive-snapshot')
-print('Installed. On the login node: prepare-mpi before MPI builds, prepare-tests before testing. New trials then run setup on a build/compute node.')
-PY
+python3 "$RUNBOOK_REPO/scripts/install_driver.py" --trial-root "$TRIAL_ROOT"
 ```
 
 A Git pull updates the documentation; running this installer updates the command
@@ -194,7 +172,7 @@ selection; the [UCX recipe](00b-openmpi-ucx.md#3-build-matching-ucx-variants)
 explains the optional-binding failure.
 
 After the failed command and any queued trial work have stopped, update the
-public checkout and rerun step 1's Python installer. In the existing compute
+public checkout and rerun step 1's installer. In the existing compute
 allocation/root, resume the interrupted all-package build with:
 
 ```bash
@@ -230,6 +208,12 @@ You do not need to source `env.sh` or paste the sections of 01. Setup also repai
 
 After login-node `prepare-mpi` completes, build everything in a site-approved Slurm build allocation (MPI package correctness tests launch MPI processes):
 
+One allocated node is sufficient for compilation and these local package checks.
+Allocate enough CPU slots on that node: some upstream checks launch multiple MPI
+ranks, and the HDF5 recipe allows two. Do not enable oversubscription to hide a
+slot shortage. A successful one-node check does not verify inter-node RDMA;
+use two nodes for the fabric qualification in step 4.
+
 ```bash
 "$TRIAL_ROOT/runner/trial" build all
 ```
@@ -258,6 +242,85 @@ Completed driver builds are checked and skipped on a repeated command. On failur
 ```
 
 This preserves the failed attempt and starts its build again. It does not remove more flags because of an arbitrary package/test failure. Existing manual installations are retained; the driver will explain if an audit or a separate trial root is needed. Changing build flags/dependencies after a successful build requires a fresh experiment root. Scheduling/reporting updates only need refreshed scripts.
+
+## Recover a completed TCP-only MPI build for RDMA
+
+Use this when the report shows active InfiniBand hardware but UCX was built
+without verbs/RDMA-CM. A completed TCP build cannot be repaired by adding runtime
+flags or by ordinary `--retry`. Keep the same trial root and qualification;
+retire its affected dependency graph explicitly before rebuilding it.
+
+First stop all running and queued trial builds/tests using this tree. On the
+login node, with the trial's Python 3.10+ available:
+
+```bash
+export TRIAL_ROOT="${TRIAL_ROOT:-$HOME/COMPILER_HARDENING}"
+export RUNBOOK_REPO="${RUNBOOK_REPO:-$TRIAL_ROOT/compiler-hardening-trial}"
+git -C "$RUNBOOK_REPO" pull --ff-only &&
+python3 "$RUNBOOK_REPO/scripts/install_driver.py" --trial-root "$TRIAL_ROOT"
+```
+
+In the Slurm build allocation, with the saved site modules/environment available,
+inspect the plan first. These commands select the normal system development
+headers/libraries and automatic local RDMA device selection:
+
+Your current one-node build allocation is sufficient if it has the intended
+fabric visible and enough CPU slots for the package checks described in step 3.
+Keep the two-node allocation for the subsequent inter-node verification.
+
+```bash
+export TRIAL_ROOT="${TRIAL_ROOT:-$HOME/COMPILER_HARDENING}"
+export RUNBOOK_REPO="${RUNBOOK_REPO:-$TRIAL_ROOT/compiler-hardening-trial}"
+unset TRIAL_UCX_CONFIGURE_ARGS TRIAL_MPI_TUNING
+python3 "$RUNBOOK_REPO/scripts/recover_mpi_rdma.py" --trial-root "$TRIAL_ROOT"
+```
+
+Then apply and rebuild:
+
+```bash
+python3 "$RUNBOOK_REPO/scripts/recover_mpi_rdma.py" --trial-root "$TRIAL_ROOT" --apply &&
+"$TRIAL_ROOT/runner/trial" build all --retry
+```
+
+The helper checks completed artifact hashes and qualification, takes the driver
+lock and verifies the downloaded MPI/UCX archives. Before moving the old graph,
+it compiles and runs a small link probe for verbs/RDMA-CM using the saved GCC
+environment. Missing prerequisites stop there with a log, leaving the old graph
+in place. Nonstandard installations can be selected with `--verbs-prefix` and
+`--rdmacm-prefix` on both the plan and apply commands. Use only the actual site
+development prefixes; site-specific runtime library paths must also be available.
+
+Recovery moves the old UCX, Open MPI, FFTW-MPI and HDF5-MPI build/install paths,
+callers, environment files and state records for both arms under one
+`build/retired/mpi-rdma-<time>/` directory with a recovery manifest. GCC, serial
+FFTW/HDF5/BLAS/LAPACK, source downloads, qualification and prior results remain.
+The archive preserves old evidence and file mappings; it is not a relocated,
+ready-to-run old MPI installation. Preparation errors roll back the moves when
+storage allows; an incomplete rollback is reported with its manifest path.
+Unmanaged directories, modified completed artifacts and symlinked/external
+state require inspection rather than automatic retirement.
+
+`runner/mpi-config.json` saves `--with-verbs --with-rdmacm` and the selected
+runtime file for future driver commands, so a new shell does not silently
+return to TCP build defaults. The default runtime file selects `rc,sm,self` and
+lets UCX choose available RDMA devices. For an already qualified site-specific
+runtime file, pass `--tuning-file /absolute/path/to/file` when applying recovery.
+Conflicting exported build/runtime selections fail explicitly. Repeating the
+same recovery after it is recorded preserves progress and tells you to resume.
+
+The rebuild verifies/reuses completed serial artifacts and creates both full and
+reference UCX/Open MPI/MPI payloads. A requested RDMA UCX arm must expose an RC
+transport on the build node before the driver records it complete. Run in an
+allocation with the intended fabric visible. This is a local capability check;
+finish with the two-node MPI verification in step 4 before accepting timings.
+The driver now reapplies selected runtime tuning after each arm's activation
+for verification, package build helpers and ReFrame execution.
+
+If `ompi_info` still warns about missing optional-component libraries, keep the
+diagnostic report identifying the affected components. Correct required library
+paths/dependencies before qualification; do not infer that every warning is the
+cause of a UCX PML failure or suppress it without checking. The collector now
+includes `ompi_info --all` diagnostics for this purpose.
 
 ## Collect MPI and fabric diagnostics
 
@@ -303,7 +366,7 @@ multi-node connectivity or qualify a performance result.
 | Required site modules and library/header locations | Use the site's supported setup before configuration and execution; retain those choices with the results. |
 | `TRIAL_UCX_CONFIGURE_ARGS` | Choose before UCX builds. For the intended RDMA trial, select compatible verbs/rdmacm support and any required prefixes; the driver default is TCP/shared-memory bring-up. |
 | `UCX_TLS` and optional `UCX_NET_DEVICES` | Qualify the transport and usable local device/port on allocated compute nodes. Do not copy an example `mlx5_0:1` blindly between systems. |
-| `TRIAL_MPI_TUNING` | Optional absolute path to the recorded site runtime settings. The collector applies it after each arm's activation and records the effective values; this does not fix propagation in another launcher or prove that timed runs applied it. |
+| `TRIAL_MPI_TUNING` | Optional absolute path to qualified site runtime settings. RDMA recovery saves its selection in `runner/mpi-config.json`; the driver and collector reapply it after activation. Timed result settings still need checking against qualification evidence. |
 | RoCE GID/traffic class, InfiniBand service level and similar tuning | Set only when required and supplied by the site; leave unspecified values at the qualified defaults. |
 | Slurm account, partition/constraint, walltime and test scales | Select for the site and campaign. Allocation size alone does not define a sweep. |
 | `IO_DIR` / `SHARED_IO_DIR` | Choose the actual measurement filesystem, shared across MPI nodes for the I/O cases. |

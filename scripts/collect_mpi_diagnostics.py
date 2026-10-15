@@ -51,6 +51,16 @@ env -0
     child_env = os.environ.copy()
     for key in ("BASH_ENV", "ENV"):
         child_env.pop(key, None)
+    config = root / "runner/mpi-config.json"
+    if config.is_file():
+        try:
+            saved = json.loads(config.read_text()).get("tuning_file")
+        except (ValueError, OSError, AttributeError) as error:
+            return None, f"Cannot read saved MPI configuration: {error}"
+        if saved:
+            if child_env.get("TRIAL_MPI_TUNING", saved) != saved:
+                return None, "Inherited TRIAL_MPI_TUNING conflicts with runner/mpi-config.json"
+            child_env["TRIAL_MPI_TUNING"] = saved
     result = run(["bash", "--noprofile", "--norc", "-c", code,
                   "trial-diagnostics", str(root), str(activation)], env=child_env)
     if result["returncode"] != 0:
@@ -97,6 +107,7 @@ def collect_arm(root, arm):
         ("ucx_devices", "UCX_PREFIX", "ucx_info", ["-d"]),
         ("mpi_version", "MPI_PREFIX", "ompi_info", ["--version"]),
         ("mpi_pml", "MPI_PREFIX", "ompi_info", ["--param", "pml", "ucx"]),
+        ("mpi_components", "MPI_PREFIX", "ompi_info", ["--all"]),
     ):
         executable = Path(prefixes[prefix]) / "bin" / binary
         commands[label] = run([str(executable), *arguments], env=active)
@@ -160,7 +171,7 @@ def write_report(root, result):
                   f"Transports: {', '.join(data['transports']) or 'not reported'}",
                   f"Devices: {', '.join(data['devices']) or 'not reported'}"]
         for name, command in data["commands"].items():
-            output = command["stdout"] if name != "ucx_devices" else "Full device inventory is in report.json."
+            output = command["stdout"] if name not in ("ucx_devices", "mpi_components") else "Full inventory is in report.json; errors are shown below."
             lines += [f"\n{name}: exit={command['returncode']}", output, command["stderr"]]
         for path, tail in data["build_log_tails"].items():
             lines += [f"\nBuild log tail: {path}", "\n".join(tail.splitlines()[-25:])]

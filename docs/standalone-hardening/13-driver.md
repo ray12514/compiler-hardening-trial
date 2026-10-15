@@ -97,18 +97,50 @@ def header(profiles=True):
     if profiles: text += 'source "$TRIAL_ROOT/profiles.sh"\n'
     return text
 
+def ucx_configure_args():
+    config = read(HERE/'mpi-config.json', {})
+    saved = config.get('ucx_configure_args')
+    override = os.environ.get('TRIAL_UCX_CONFIGURE_ARGS')
+    args = saved if saved is not None else shlex.split(override or '--without-verbs --without-rdmacm')
+    if saved is not None and override is not None and shlex.split(override) != saved:
+        raise RuntimeError('TRIAL_UCX_CONFIGURE_ARGS conflicts with runner/mpi-config.json. Keep the recorded build selection.')
+    allowed = ('--with-verbs','--without-verbs','--with-rdmacm','--without-rdmacm')
+    if not isinstance(args,list) or not args or any(not isinstance(a,str) or
+        (a not in allowed and not a.startswith(('--with-verbs=','--with-rdmacm='))) for a in args):
+        raise RuntimeError('UCX configure arguments must contain only verbs/rdmacm options and explicit prefixes.')
+    return args
+
+def with_mpi_tuning(text):
+    # Apply runtime choices after activation clears inherited UCX variables.
+    pattern = r'(?m)^([ \t]*)(activate_mpi_profile [^\n]+|source "\$TRIAL_ROOT/mpi-env(?:-reference)?\.sh")[ \t]*$'
+    return re.sub(pattern, lambda m: m[0]+'\n'+m[1]+
+        'if test -n "${TRIAL_MPI_TUNING:-}"; then source "$TRIAL_MPI_TUNING"; fi', text)
+
+def verify_ucx_rdma(prefix):
+    code = 'export LD_LIBRARY_PATH='+shlex.quote(str(prefix/'lib'))+':"$GCC_LIB_DIRS${TRIAL_SITE_LIB_DIRS:+:$TRIAL_SITE_LIB_DIRS}"\n'
+    code += shlex.quote(str(prefix/'bin/ucx_info'))+' -d\n'
+    output = shell('ucx-rdma-capability', code, profiles=False, capture=True)
+    if not re.search(r'^\s*#\s*Transport:\s*rc_(?:mlx5|verbs)\b',output,re.M):
+        raise RuntimeError('Requested RDMA UCX has no available RC transport in this allocation. Check verbs support, drivers and active ports; no TCP fallback is accepted.')
+    return output
+
 def environment():
     env = os.environ.copy()
     env['TRIAL_PROCEDURE_COMMIT'] = (HERE/'procedure.txt').read_text().strip() if (HERE/'procedure.txt').exists() else 'unrecorded'
     env.update(TRIAL_ROOT=str(ROOT), TRIAL_DRIVER_SCRIPT=str(HERE/'trial.py'),
                TRIAL_DRIVER_PYTHON=sys.executable, TRIAL_COMPONENT_ID='global')
+    tuning = read(HERE/'mpi-config.json', {}).get('tuning_file')
+    if tuning:
+        if env.get('TRIAL_MPI_TUNING',tuning) != tuning:
+            raise RuntimeError('TRIAL_MPI_TUNING conflicts with the recorded MPI selection. Use its saved site runtime file.')
+        env['TRIAL_MPI_TUNING'] = tuning
     return env
 
 def shell(task, text, *, profiles=True, capture=False, extra=None):
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     script = HERE/'jobs'/f'{task}-{stamp}.sh'
     script.parent.mkdir(exist_ok=True)
-    script.write_text(header(profiles)+text)
+    script.write_text(header(profiles)+with_mpi_tuning(text))
     log = ROOT/'logs'/'runner'/f'{task}-{stamp}.log'
     log.parent.mkdir(parents=True, exist_ok=True)
     env = environment(); env.update(extra or {})
@@ -350,9 +382,7 @@ def build_one(package, arm, retry=False):
     if package=='openmpi': recipe = recipe.removesuffix('source "$TRIAL_ROOT/mpi-env.sh"\n')
     recipe = f'{array}=({arm})\nLAPACK_SOURCE="$TRIAL_ROOT/src/lapack-3.12.1"\n'+recipe
     if package=='ucx':
-        args = shlex.split(os.environ.get('TRIAL_UCX_CONFIGURE_ARGS','--without-verbs --without-rdmacm'))
-        if not args or any(not a.startswith(('--with-verbs','--without-verbs','--with-rdmacm','--without-rdmacm')) for a in args):
-            raise RuntimeError('TRIAL_UCX_CONFIGURE_ARGS must contain only verbs/rdmacm configure options.')
+        args = ucx_configure_args()
         recipe = 'UCX_TRANSPORT_ARGS=('+shlex.join(args)+')\n'+recipe
     caller = ''
     if package in CALLERS:
@@ -384,6 +414,9 @@ def build_one(package, arm, retry=False):
     shell(name,recipe+caller)
     artifacts = inventory(prefix)
     if not artifacts: raise RuntimeError(f'{name}: no installed artifacts')
+    if package=='ucx' and any(a=='--with-verbs' or a.startswith('--with-verbs=') for a in ucx_configure_args()):
+        evidence = verify_ucx_rdma(prefix)
+        (ROOT/'logs'/('ucx-fixed' if arm=='full' else 'ucx-reference')/'rdma-capability.txt').write_text(evidence)
     if caller:
         binary = ROOT/'bench'/f'{package}-{"reference" if arm=="reference" else "fixed"}'
         artifacts[str(binary.relative_to(ROOT))] = filehash(binary)

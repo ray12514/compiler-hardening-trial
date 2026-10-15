@@ -32,6 +32,7 @@ class DiagnosticsTests(unittest.TestCase):
             sentinel = root / "runner/state/ucx-full.json"
             sentinel.parent.mkdir(parents=True)
             sentinel.write_text('{"preserve":true}\n')
+            (root / "runner/mpi-config.json").write_text(json.dumps({"tuning_file": str(tuning)}))
             for arm in ("full", "reference"):
                 # Discover saved non-default prefixes, not just the fallback paths.
                 ucx, mpi = root / f"custom-{arm}-ucx", root / f"custom-{arm}-mpi"
@@ -49,8 +50,7 @@ fi
                 activation.write_text(
                     f"source '{root / 'env.sh'}'\n"
                     f"export MPI_PREFIX='{mpi}' UCX_PREFIX='{ucx}'\n")
-            with patch.dict(os.environ, {"TRIAL_MPI_TUNING": str(tuning),
-                                         "UCX_TLS": "tcp", "PRIVATE_TEST_SECRET": "never-print-this"}):
+            with patch.dict(os.environ, {"UCX_TLS": "tcp", "PRIVATE_TEST_SECRET": "never-print-this"}):
                 result = diagnostics.collect(root)
                 out = diagnostics.write_report(root, result)
                 self.assertEqual(os.environ["UCX_TLS"], "tcp")
