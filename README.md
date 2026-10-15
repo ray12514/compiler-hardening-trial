@@ -25,3 +25,18 @@ Target-system GCC/package builds and campaign qualification remain outstanding.
 The included reporting figures use illustrative data. Record the procedure
 commit, source checksums, exact build identities and allocation conditions with
 every actual result.
+
+For the UCX optional Go-binding build failure, see the
+[update and retry instructions](docs/standalone-hardening/README.md#if-ucx-stops-while-building-go-bindings).
+
+Maintainers can exercise the UCX configure/binding regression using the pinned
+release archive and a locally available Linux Go/GCC Docker image:
+
+```bash
+python3 scripts/check_ucx_go_bindings.py /path/to/ucx-1.16.0.tar.gz
+```
+
+The check verifies the archive checksum, runs the actual recipe's configure
+command and optional-binding target with Go installed, and uses a disposable
+container with networking disabled. It does not run the target-system package
+builds or performance campaign.

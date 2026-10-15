@@ -105,7 +105,7 @@ mkdir -p "$build" "$TRIAL_ROOT/logs/$tag"
     "$TRIAL_ROOT/src/ucx-1.16.0/contrib/configure-release" \
     --prefix="$UCX_PREFIX" --libdir="$UCX_PREFIX/lib" \
     --enable-shared --disable-static --enable-mt \
-    --without-cuda --without-rocm --without-java --without-knem --without-xpmem \
+    --without-cuda --without-rocm --without-java --without-go --without-knem --without-xpmem \
     "${UCX_TRANSPORT_ARGS[@]}" \
     2>&1 | tee "$TRIAL_ROOT/logs/$tag/configure.log"
   make -j "$JOBS" V=1 2>&1 | tee "$TRIAL_ROOT/logs/$tag/build.log"
@@ -121,6 +121,16 @@ done
 ```
 
 Review configure warnings for unrecognized options and confirm threading support and the selected network transports in the built configuration. Testing requirements may vary by installed optional transport; retain failures and resolve them rather than ignoring the test result.
+
+Go bindings are explicitly disabled for both arms. UCX 1.16.0 otherwise guesses
+Go support from the available compiler, while the pinned release archive omits
+the Go source directories referenced by its binding Makefiles. That combination
+fails late in `make` with missing `bindings/go/src/ucx` or
+`bindings/go/src/examples/perftest` paths and Go module/source errors. The trial
+uses UCX's C library through Open MPI, so these optional bindings are outside
+its build scope. See UCX's [Go configure rule](https://github.com/openucx/ucx/blob/v1.16.0/config/m4/go.m4)
+and [binding Makefile](https://github.com/openucx/ucx/blob/v1.16.0/bindings/go/Makefile.am).
+The configure summary should show an empty `Bindings` list.
 
 ## 4. Build matching Open MPI variants against UCX
 

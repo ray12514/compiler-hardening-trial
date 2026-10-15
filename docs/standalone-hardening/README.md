@@ -184,6 +184,34 @@ Transfer the complete `reframe-wheels` directory through the site's transfer rou
 
 If a dependency has no compatible wheel, prepare one on the compatible staging host with `python3 -m pip wheel 'reframe-hpc==4.10.4' -w reframe-wheels` before transfer. The offline installation disables the package index; retain the wheel directory and the generated `tools/reframe-venv/installed.txt`. [pip local installation documentation](https://pip.pypa.io/en/stable/user_guide/#installing-from-local-packages).
 
+### If UCX stops while building Go bindings
+
+Missing `bindings/go/src/ucx` or `bindings/go/src/examples/perftest`, followed by
+`go.mod`/`no Go files` errors, can occur after the UCX C/C++ libraries and tools
+compile. The recipe now passes `--without-go` for both full/reference builds.
+It keeps the same UCX version, source checksum, hardening flags and transport
+selection; the [UCX recipe](00b-openmpi-ucx.md#3-build-matching-ucx-variants)
+explains the optional-binding failure.
+
+After the failed command and any queued trial work have stopped, update the
+public checkout and rerun step 1's Python installer. In the existing compute
+allocation/root, resume the interrupted all-package build with:
+
+```bash
+"$TRIAL_ROOT/runner/trial" build all --retry
+```
+
+The driver preserves the failed UCX attempt under `build/retired/`, configures
+a fresh attempt with Go bindings disabled and verifies/reuses unchanged completed
+FFTW/HDF5/LAPACK/BLAS artifacts. This recipe-only change needs no repeat of setup
+or flag qualification. For an interrupted single-package route, repeat its
+original command with `--retry`, such as `build fftw --mpi --retry`.
+
+These retry instructions apply to a failed, driver-recorded UCX attempt. If a
+UCX arm or dependent MPI build already completed under different configure
+options, retain it and follow the driver's changed-input guidance; do not delete
+completion records or relabel the old binaries as the new build.
+
 ## 2. Set up and qualify the flags
 
 ```bash
