@@ -286,6 +286,45 @@ unchanged. No new setup/flag qualification is required. Keep existing completion
 and pending records; do not patch the old CMake cache or install arbitrary MFU
 libraries to bypass this optional dependency.
 
+## If parallel h5diff tests fail with UCX_PREFIX warnings
+
+If `MPI_TEST_H5DIFF-*` fails with `COMPARE Result: 1` and the extra output is
+`UCX WARN unused environment variable: UCX_PREFIX`, the warning is contaminating
+an exact-output comparison. `UCX_PREFIX` names our installation directory; it
+is not a UCX runtime option. This explains that output mismatch, but does not
+establish the cause of any other failures in the suite.
+
+The updated driver removes the export attribute from `UCX_PREFIX` after MPI
+activation and saved runtime tuning. The path remains available to the build
+shell, while MPI programs no longer inherit it. Other UCX warnings, saved
+transport/device choices and HDF5 correctness tests remain enabled.
+
+After the failed build and any queued trial work have stopped:
+
+```bash
+export TRIAL_ROOT="${TRIAL_ROOT:-$HOME/COMPILER_HARDENING}"
+export RUNBOOK_REPO="${RUNBOOK_REPO:-$TRIAL_ROOT/compiler-hardening-trial}"
+git -C "$RUNBOOK_REPO" pull --ff-only &&
+python3 "$RUNBOOK_REPO/scripts/install_driver.py" --trial-root "$TRIAL_ROOT"
+```
+
+Then, in the build allocation with at least two MPI slots available:
+
+```bash
+"$TRIAL_ROOT/runner/trial" build all --retry
+```
+
+No new setup or compiler qualification is needed. The fix changes runtime
+activation in the driver, leaving package recipe identities unchanged. Completed
+packages are verified and skipped. The failed HDF5 attempt is archived, then
+configured, compiled, tested and installed again; `--retry` does not resume at
+CTest. Do not delete completion records or bypass the failed comparisons.
+
+For a manually launched check, use `export -n UCX_PREFIX` after sourcing the
+matching `mpi-env*.sh` and runtime tuning file in the same Bash shell. Sourcing
+the activation file again restores its export attribute, so repeat the command
+after each activation. Avoid globally suppressing unused-variable warnings.
+
 ## Recover a completed TCP-only MPI build for RDMA
 
 Use this when the report shows active InfiniBand hardware but UCX was built

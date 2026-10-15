@@ -114,7 +114,10 @@ def with_mpi_tuning(text):
     # Apply runtime choices after activation clears inherited UCX variables.
     pattern = r'(?m)^([ \t]*)(activate_mpi_profile [^\n]+|source "\$TRIAL_ROOT/mpi-env(?:-reference)?\.sh")[ \t]*$'
     return re.sub(pattern, lambda m: m[0]+'\n'+m[1]+
-        'if test -n "${TRIAL_MPI_TUNING:-}"; then source "$TRIAL_MPI_TUNING"; fi', text)
+        'if test -n "${TRIAL_MPI_TUNING:-}"; then source "$TRIAL_MPI_TUNING"; fi\n'+m[1]+
+        # UCX_PREFIX is a shell path, not a UCX setting. Its unused-variable
+        # warning contaminates ph5diff output compared against golden files.
+        'export -n UCX_PREFIX', text)
 
 def verify_ucx_rdma(prefix):
     code = 'export LD_LIBRARY_PATH='+shlex.quote(str(prefix/'lib'))+':"$GCC_LIB_DIRS${TRIAL_SITE_LIB_DIRS:+:$TRIAL_SITE_LIB_DIRS}"\n'

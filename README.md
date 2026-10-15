@@ -32,6 +32,9 @@ For the UCX optional Go-binding build failure, see the
 For HDF5's `Could NOT find MFU` configure failure, use the
 [parallel HDF5 update and retry steps](docs/standalone-hardening/README.md#if-parallel-hdf5-configuration-cannot-find-mfu).
 
+For parallel `h5diff` output mismatches containing `UCX_PREFIX` warnings, use the
+[runtime environment fix and continuation steps](docs/standalone-hardening/README.md#if-parallel-h5diff-tests-fail-with-ucx_prefix-warnings).
+
 For MPI/PML errors or Mellanox setup, use the
 [copy-and-paste diagnostics and system settings](docs/standalone-hardening/README.md#collect-mpi-and-fabric-diagnostics).
 It locates the saved trial installations and prints the exact local report path

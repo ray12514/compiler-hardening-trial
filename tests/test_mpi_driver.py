@@ -38,6 +38,40 @@ def executable(path, body):
 
 
 class DriverSettingsTests(unittest.TestCase):
+    def test_ucx_prefix_stays_in_shell_but_not_h5diff_process_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            driver = driver_at(root)
+            (root / "env.sh").write_text("")
+            (root / "profiles.sh").write_text('''activate_mpi_profile() {
+    if test "$1" = reference; then source "$TRIAL_ROOT/mpi-env-reference.sh";
+    else source "$TRIAL_ROOT/mpi-env.sh"; fi
+}
+''')
+            tuning = root / "fabric.sh"
+            tuning.write_text('export UCX_PREFIX="$TRIAL_ROOT/ucx"\nexport UCX_TLS=rc,sm,self\n')
+            driver.save(driver.HERE / "mpi-config.json", {"tuning_file": str(tuning)})
+            for name in ("mpi-env.sh", "mpi-env-reference.sh"):
+                (root / name).write_text('export UCX_PREFIX="$TRIAL_ROOT/ucx"\n')
+            executable(root / "ucx/bin/ph5diff", '''test "$UCX_TLS" = rc,sm,self
+test -z "${UCX_WARN_UNUSED_ENV_VARS+x}"
+if test -n "${UCX_PREFIX+x}"; then
+    echo 'UCX WARN unused environment variable: UCX_PREFIX'
+fi
+echo '0 differences found'
+''')
+            activations = ('activate_mpi_profile full', 'activate_mpi_profile reference',
+                           'source "$TRIAL_ROOT/mpi-env.sh"',
+                           'source "$TRIAL_ROOT/mpi-env-reference.sh"')
+            with patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(io.StringIO()):
+                for activation in activations:
+                    with self.subTest(activation=activation):
+                        output = driver.shell("h5diff-output", activation + '''
+test "$UCX_PREFIX" = "$TRIAL_ROOT/ucx"
+"$UCX_PREFIX/bin/ph5diff"
+''', capture=True)
+                        self.assertEqual(output.strip(), "0 differences found")
+
     def test_saved_rdma_build_selection_survives_a_new_shell(self):
         with tempfile.TemporaryDirectory() as tmp:
             driver = driver_at(Path(tmp))
