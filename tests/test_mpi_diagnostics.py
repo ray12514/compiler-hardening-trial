@@ -28,7 +28,7 @@ class DiagnosticsTests(unittest.TestCase):
             root = Path(tmp)
             (root / "env.sh").write_text("unset UCX_TLS UCX_NET_DEVICES\n")
             tuning = root / "fabric.sh"
-            tuning.write_text("export UCX_TLS=rc,sm,self\nexport UCX_NET_DEVICES=mlx5_2:1\n")
+            tuning.write_text("export UCX_TLS=rc,sm,self\nexport UCX_NET_DEVICES=mlx5_2:1\nexport OMPI_MCA_mtl='^mxm'\n")
             sentinel = root / "runner/state/ucx-full.json"
             sentinel.parent.mkdir(parents=True)
             sentinel.write_text('{"preserve":true}\n')
@@ -61,6 +61,7 @@ fi
                 self.assertEqual(data["transports"], ["posix", "rc_mlx5"])
                 self.assertIn("mlx5_2:1", data["devices"])
                 self.assertEqual(data["runtime_settings"]["UCX_TLS"], "rc,sm,self")
+                self.assertEqual(data["runtime_settings"]["OMPI_MCA_mtl"], "^mxm")
             self.assertEqual(sentinel.read_text(), '{"preserve":true}\n')
             self.assertFalse((root / "MPI_WAS_LAUNCHED").exists())
             self.assertNotIn("never-print-this", (out / "report.json").read_text())

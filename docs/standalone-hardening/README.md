@@ -210,8 +210,13 @@ After login-node `prepare-mpi` completes, build everything in a site-approved Sl
 
 One allocated node is sufficient for compilation and these local package checks.
 Allocate enough CPU slots on that node: some upstream checks launch multiple MPI
-ranks, and the HDF5 recipe allows two. Do not enable oversubscription to hide a
-slot shortage. A successful one-node check does not verify inter-node RDMA;
+ranks. FFTW 3.3.11 runs 1/2/3/4 ranks and, with threads enabled here, a
+3-rank × 2-thread check; HDF5 allows two ranks. Request at least four MPI slots
+and six allocated CPUs for FFTW's complete checks; a one-node allocation with
+eight task slots (for example, the site-approved equivalent of
+`--nodes=1 --ntasks=8 --cpus-per-task=1`) covers these counts. Inspect the generated
+test commands and allocation CPU binding as well. Do not enable oversubscription
+to hide a slot shortage. A successful one-node check does not verify inter-node RDMA;
 use two nodes for the fabric qualification in step 4.
 
 ```bash
@@ -356,6 +361,98 @@ The only new files are the reports under
 the exact `report.txt` path to share; `report.json` retains full device output.
 Run on each selected compute-node type/host as needed. Inventory does not prove
 multi-node connectivity or qualify a performance result.
+
+### FFTW MPI check hangs or reports a UD QP permission error
+
+If `make check` stops updating after an MPI command such as `mpirun -np 2`,
+the driver's `still running` message means it is waiting for its child process.
+It does not establish that the test is making progress. The first ten passing
+checks do not establish that the later multi-rank check passed. In
+[FFTW 3.3.11's upstream MPI checks](https://github.com/FFTW/fftw3/blob/fftw-3.3.11/mpi/Makefile.am),
+the `1 CPU` success message precedes the `-np 2` command; the suite continues
+with three/four ranks and, in this threaded build, three ranks with two threads
+each. Step 3 gives the full allocation requirement. A two-rank probe below needs
+only two slots and is deliberately smaller.
+
+For a stuck foreground build, press Ctrl-C in the terminal running the driver;
+Ctrl-C in a `tail -f` terminal only stops the log viewer. For a batch build,
+identify and cancel that build job through Slurm. Do not cancel an unrelated job
+or delete the trial root/state. Confirm the old build/MPI processes and any
+associated Slurm steps have stopped before starting a new attempt. Retain the
+allocation if possible; one node with two allocated MPI slots is enough for the
+following startup diagnostic.
+
+Keep `mpirun` from the private Open MPI inside the allocation. The UCX selection
+is `pml=ucx`, not a replacement launcher. Direct `srun` application launch needs
+separately qualified site PMI/PMIx integration; changing launcher is not a fix
+for a verbs queue-pair failure. See [Open MPI v4 Slurm integration](https://www.open-mpi.org/faq/?category=slurm).
+
+An `error initializing an OpenFabrics device` warning can originate in the old
+`openib` BTL even when the UCX PML is selected. Selecting UCX alone does not
+disable that BTL. A separate [upstream report](https://github.com/easybuilders/easybuild-easyconfigs/issues/20233)
+of `Failed to modify UD QP to INIT ... Operation not permitted` identified OFI/
+libfabric component probing. These are diagnostic leads, not proof of this
+site's cause. UCX/device permissions, driver/firmware compatibility and the
+actual linked libraries still require checking if the error persists.
+[Open MPI's OpenFabrics FAQ](https://www.open-mpi.org/faq/?category=openfabrics#ofa-device-error)
+explains why disabling the old `openib` BTL leaves UCX's fabric support available.
+Do not rebuild UCX without verbs or hide warnings to make a test appear to pass.
+
+After the old attempt has stopped, update the checkout on the connected login
+node, then run the inventory collector above on the affected compute node. No
+driver reinstall is needed for this standalone startup probe. In that same
+allocated compute-node shell:
+
+```bash
+export TRIAL_ROOT="${TRIAL_ROOT:-$HOME/COMPILER_HARDENING}"
+export RUNBOOK_REPO="${RUNBOOK_REPO:-$TRIAL_ROOT/compiler-hardening-trial}"
+python3 "$RUNBOOK_REPO/scripts/probe_mpi_startup.py" --trial-root "$TRIAL_ROOT" --arm full --mode saved
+```
+
+This compiles a tiny diagnostic with the selected private `mpicc`, then launches
+two ranks on the current allocated host using its private `mpirun`, explicit
+`pml=ucx`, no oversubscription and the saved runtime tuning. It prints markers
+before/after `MPI_Init`, checks a collective, and requires both ranks to finish.
+Each compile/startup step is limited to 45 seconds, followed by up to three
+seconds for local process cleanup. It preserves output and exact commands under
+`results/diagnostics/mpi-startup-*`; it changes no build state or saved tuning.
+It refuses an active driver lock or a host outside the allocation. Slurm steps
+can still require operator cleanup after a broken launcher; inspect them after
+a timeout before launching another probe.
+
+If startup fails or warns, compare component selections one at a time:
+
+```bash
+python3 "$RUNBOOK_REPO/scripts/probe_mpi_startup.py" --trial-root "$TRIAL_ROOT" --arm full --mode no-openib
+python3 "$RUNBOOK_REPO/scripts/probe_mpi_startup.py" --trial-root "$TRIAL_ROOT" --arm full --mode no-openib-ofi
+```
+
+`no-openib` sets the diagnostic BTL selection to `^uct,openib`.
+`no-openib-ofi` additionally excludes the OFI BTL and MTL, using
+`btl=^uct,openib,ofi` and `mtl=^ofi`. Compare the logs as well as exit status:
+warning disappearance and successful startup are separate observations. These
+overrides are diagnostic only; the report retains the original saved settings
+and each actual command. For a failing reference arm, use `--arm reference`.
+If even the isolated selection fails, share its complete `startup.log`, the
+probe's `report.json`, and the inventory report before another rebuild.
+
+An earlier GPU/LAMMPS launch example used `btl=self,vader`, `mtl=^mxm`, and
+`opal_common_ucx_opal_mem_hooks=1`. For a controlled comparison of its BTL choice,
+run the same probe with `--mode local-btls`. This still forces the UCX PML;
+its network path is separate from the BTL selection. The photo's command alone
+does not prove which fabric carried its traffic. Excluding `mxm` does not
+exclude OFI. The memory-hooks option addresses UCX memory-unmap handling, a
+different issue documented in [Open MPI's memory-hooks report](https://github.com/open-mpi/ompi/issues/9859);
+it is not evidence of a fix for a QP permission failure. Leave GPU/compiler
+settings out of this CPU-only trial and test memory-hook changes separately
+only when its actual warning or site guidance calls for them.
+
+Once startup is understood, record the qualified working options in the same
+`TRIAL_MPI_TUNING` file selected for both arms, then retry only the failed driver
+build (for example, `trial build fftw --mpi --retry`). The driver preserves the
+failed attempt and reuses completed prerequisites. Keep the upstream checks;
+the small probe saves repeating them during diagnosis, and is not a substitute
+for their correctness coverage or the later two-node RDMA verification.
 
 ### Settings that belong to each system
 

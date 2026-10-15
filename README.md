@@ -34,6 +34,11 @@ For MPI/PML errors or Mellanox setup, use the
 It locates the saved trial installations and prints the exact local report path
 to share. Keep using this README and its linked workflow for current procedures.
 
+For a stalled FFTW MPI check or a UD QP permission error, follow
+[the bounded MPI startup diagnostic](docs/standalone-hardening/README.md#fftw-mpi-check-hangs-or-reports-a-ud-qp-permission-error)
+before retrying the package suite. It compares startup components without
+changing completed builds or saved runtime settings.
+
 If UCX is already installed without RDMA support, follow
 [the MPI graph recovery](docs/standalone-hardening/README.md#recover-a-completed-tcp-only-mpi-build-for-rdma).
 It preserves serial progress, archives the old MPI graph, saves the RDMA
