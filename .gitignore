@@ -1,0 +1,19 @@
+# Trial-local configuration, generated programs, downloads and results.
+/env.sh
+/site-env.sh
+/profiles.sh
+/mpi-env*.sh
+/runner/
+/downloads/
+/src/
+/build/
+/install/
+/toolchains/
+/tools/
+/bench/
+/reframe/
+/logs/
+/results/
+__pycache__/
+*.pyc
+.DS_Store

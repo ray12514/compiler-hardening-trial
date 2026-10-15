@@ -1,0 +1,23 @@
+# Compiler hardening trial
+
+Standalone procedures for measuring the correctness and runtime effects of
+compiler hardening on FFTW, HDF5 and LAPACK, including parallel FFTW/HDF5 with
+Open MPI and UCX.
+
+The experiment uses GCC 12.5.0, Open MPI 4.1.8 and UCX 1.16.0. The runbooks
+include toolchain bootstrap, flag qualification, direct source builds, matched
+benchmark callers, paired measurements, ReFrame execution and Slurm campaigns.
+Connected preparation and offline compute-node execution are documented.
+
+Start with the [installation and trial workflow](docs/standalone-hardening/README.md).
+Keep the checkout inside the trial working root as described there; build
+artifacts and results live beside the checkout.
+
+- [Experiment design and measurement controls](docs/standalone_compiler_hardening_performance_trial_v1.md)
+- [Published performance evidence and its limits](docs/standalone_compiler_hardening_performance_evidence_v1.md)
+- [Interpreting and presenting results](docs/standalone-hardening/09-results-presentation.md)
+
+Target-system GCC/package builds and campaign qualification remain outstanding.
+The included reporting figures use illustrative data. Record the procedure
+commit, source checksums, exact build identities and allocation conditions with
+every actual result.
