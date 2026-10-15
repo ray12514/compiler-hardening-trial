@@ -73,6 +73,23 @@ UCX can run over TCP/shared memory without RDMA development libraries. For an In
 
 Choose exactly one array below. The default is a portable TCP/shared-memory bring-up. If the trial is intended to exercise RDMA, select the RDMA array before building and fail if its prerequisites cannot be found.
 
+**For driver-managed Mellanox/RDMA builds**, set
+`export TRIAL_UCX_CONFIGURE_ARGS='--with-verbs --with-rdmacm'`
+before the first UCX arm is built.
+
+The driver otherwise uses `--without-verbs --without-rdmacm`. The manual array
+below does not change that driver setting. Site-specific prefixes may be needed
+for compatible development headers/libraries. Inspect both arms' `flags.txt`,
+`configure.log` and `ucx_info -v/-d`; hardware being present does not prove UCX
+was compiled with access to it. A UCX build without verbs cannot acquire RDMA
+support through `UCX_TLS` or `mpirun` options afterward.
+
+Changing this setting changes the recorded UCX build inputs and dependent MPI
+stack. Do not use `--retry` to relabel completed TCP builds as RDMA builds or
+delete completion records. Preserve the current trial and choose an explicit
+rebuild plan after inspecting the completed/pending state. Failed, incomplete
+driver attempts use the existing retry procedure.
+
 ```bash
 UCX_TRANSPORT_ARGS=(--without-verbs --without-rdmacm)
 # For an IB/RoCE system with development libraries installed, use instead:
@@ -82,6 +99,34 @@ UCX_TRANSPORT_ARGS=(--without-verbs --without-rdmacm)
 ```
 
 Leave UCX's runtime transport selection at its normal defaults initially. Record any later `UCX_TLS`/`UCX_NET_DEVICES` choices and apply them identically to both arms. A non-IB fabric requires its own supported UCX configuration; verify available transports rather than guessing from the machine's vendor name.
+
+For a CPU-only RDMA pilot, an explicitly qualified allow-list such as
+`UCX_TLS=rc,sm,self` retains shared memory within nodes and RC/its bootstrap
+transports between nodes while excluding UCX TCP payload transport. `--mca pml
+ucx` alone does not establish which UCX transport carried the data. Launcher and
+scheduler control traffic can still use TCP.
+
+Use `ucx_info -d` on the allocated compute nodes, plus available site tools such
+as `ibv_devinfo`/`ibstat`, to identify usable device/port pairs. UCX names look
+like `mlx5_0:1`, but that is an example, not a portable setting. Device presence
+does not establish an active, mutually reachable port. Leave device selection
+automatic until qualified, or select ports verified on every selected host.
+InfiniBand and RoCE may require different site settings; do not guess a GID
+index, service level or device name. See [UCX network selection](https://openucx.readthedocs.io/en/master/faq.html#selecting-networks-and-transports).
+
+The activation scripts clear inherited UCX settings. Apply qualified tuning
+after each MPI environment activation. Campaign 08/10 supports a recorded
+`TRIAL_MPI_TUNING` file; the individual driver pilot and manual smoke must also
+be checked for propagation after activation before relying on those settings.
+Retain the MPI placement/communication verification: a PML or device-open
+failure holds the MPI results until resolved.
+
+The report must identify both arms' UCX configure options and library paths,
+device/port capabilities on every host, runtime transport/device settings,
+memlock limit, and a successful native multi-node qualification log showing
+the selected RDMA path. `UCX_TLS` in a summary records a request, not proof of
+the selected network. Keep verbose UCX diagnostics out of timed samples and
+retain qualification failures alongside the eventual successful evidence.
 
 ## 3. Build matching UCX variants
 

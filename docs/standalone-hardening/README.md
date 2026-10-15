@@ -261,6 +261,17 @@ This preserves the failed attempt and starts its build again. It does not remove
 
 ## 4. Test one package when it is ready
 
+For a Mellanox/RDMA system, first qualify the
+[UCX build and network selection](00b-openmpi-ucx.md#2-select-the-ucx-transport-prerequisites).
+The default TCP/shared-memory build is a bring-up configuration; it does not
+qualify the high-speed inter-node experiment. A failed UCX PML/device check
+must be resolved before timing rather than skipped.
+
+The driver's primary comparison is complete-stack scope: full package/caller
+with full MPI/UCX versus reference package/caller with reference MPI/UCX.
+The separate library-only follow-up holds full MPI/UCX fixed. Match network,
+placement and workload settings between the two arms in either scope.
+
 **FFTW can be tested as soon as its build finishes and ReFrame is prepared. HDF5 and LAPACK are not prerequisites.** Prepare ReFrame on the login node using the step above. On each compute-node environment, `prepare-tests --check` verifies it without installing or downloading anything; `test` repeats that check automatically.
 
 Run inside a Slurm compute allocation. Replace the account and partition in this example with the site values. After `salloc` grants the allocation, `srun` moves the command shell onto a compute node:
@@ -295,6 +306,19 @@ Set `TRIAL_ROOT` and run `"$TRIAL_ROOT/runner/trial" status`. Completed artifact
 ## Larger campaigns and recipe references
 
 Once individual pilots work, [08 — separate Slurm jobs](08-slurm-campaign.md) runs the full suite across allocations. [10 — one reserved allocation](10-single-allocation.md) is the optional 8/4/2-node controller. These advanced campaign scripts still require their documented site settings and generation steps; `trial test` is the simpler independent-package route. Do not regenerate/rebuild while queued or running campaigns use the trial tree.
+
+Use a two-node pilot to qualify MPI and the fabric before submitting the larger
+campaign with `sbatch`. Slurm grants the resources; the trial's private Open MPI
+`mpirun` launches the MPI callers inside that allocation. Interactive
+`salloc`/`srun --pty` is useful for diagnosis; qualify overlapping job-step
+behavior before nesting `mpirun` under a resource-holding interactive step.
+
+Allocation size and test scales are separate inputs. The current single-job
+controller accepts 2, 4 or 8 allocated nodes and scale choices 1, 2, 4 and 8;
+it rejects twelve nodes. The individual command's `--nodes N` tests that one
+scale on a selected subset, not an automatic sweep. General allocation-driven
+planning, including remainder groups, needs an implementation change before
+claiming support for arbitrary allocation sizes.
 
 | Reference | Purpose |
 |---|---|
