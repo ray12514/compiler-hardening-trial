@@ -46,10 +46,15 @@ fi
 """)
                 self.executable(mpi / "bin/ompi_info", "echo 'Open MPI 4.1.8 / ucx'\n")
                 self.executable(mpi / "bin/mpirun", f"touch '{root / 'MPI_WAS_LAUNCHED'}'\nexit 99\n")
+                self.executable(mpi / "bin/mpicc", "exit 99\n")
                 activation = root / ("mpi-env.sh" if arm == "full" else "mpi-env-reference.sh")
                 activation.write_text(
                     f"source '{root / 'env.sh'}'\n"
-                    f"export MPI_PREFIX='{mpi}' UCX_PREFIX='{ucx}'\n")
+                    f"export MPI_PREFIX='{mpi}' UCX_PREFIX='{ucx}'\n"
+                    f"export PATH='{mpi}/bin':\"$PATH\"\n")
+                build = root / "build" / f"fftw-mpi-{arm}" / "mpi"
+                build.mkdir(parents=True)
+                (build / "Makefile").write_text(f"MPIRUN = mpirun\nMPICC = {mpi}/bin/mpicc\n")
             with patch.dict(os.environ, {"UCX_TLS": "tcp", "PRIVATE_TEST_SECRET": "never-print-this"}):
                 result = diagnostics.collect(root)
                 out = diagnostics.write_report(root, result)
@@ -62,6 +67,9 @@ fi
                 self.assertIn("mlx5_2:1", data["devices"])
                 self.assertEqual(data["runtime_settings"]["UCX_TLS"], "rc,sm,self")
                 self.assertEqual(data["runtime_settings"]["OMPI_MCA_mtl"], "^mxm")
+                expected = str(root / f"custom-{arm}-mpi" / "bin/mpirun")
+                self.assertEqual(data["path_resolution"]["mpirun"], expected)
+                self.assertIn("MPIRUN = mpirun", data["fftw_mpi_makefile_commands"]["mpi/Makefile"])
             self.assertEqual(sentinel.read_text(), '{"preserve":true}\n')
             self.assertFalse((root / "MPI_WAS_LAUNCHED").exists())
             self.assertNotIn("never-print-this", (out / "report.json").read_text())

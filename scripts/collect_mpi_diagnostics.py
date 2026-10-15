@@ -8,6 +8,7 @@ from pathlib import Path
 import platform
 import re
 import resource
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -18,6 +19,16 @@ ENV_KEYS = (
     "UCX_IB_TRAFFIC_CLASS", "UCX_LOG_LEVEL", "OMPI_MCA_pml", "OMPI_MCA_btl", "OMPI_MCA_mtl",
     "OMPI_MCA_plm", "OMPI_MCA_ras", "TRIAL_MPI_TUNING",
 )
+
+
+def allocation_context():
+    keys = ("SLURM_JOB_ID", "SLURM_JOB_NODELIST", "SLURM_JOB_NUM_NODES", "SLURM_STEP_ID",
+            "SLURM_NTASKS", "SLURM_TASKS_PER_NODE", "SLURM_CPUS_PER_TASK",
+            "SLURM_JOB_CPUS_PER_NODE", "SLURM_CPUS_ON_NODE", "SLURM_STEP_NUM_TASKS",
+            "SLURM_STEP_TASKS_PER_NODE", "SLURM_CPU_BIND", "SLURM_CPU_BIND_LIST")
+    result = {key: os.environ[key] for key in keys if key in os.environ}
+    result["allowed_cpus"] = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None
+    return result
 
 
 def run(command, env=None, timeout=20):
@@ -113,6 +124,15 @@ def collect_arm(root, arm):
         commands[label] = run([str(executable), *arguments], env=active)
     component = Path(prefixes["MPI_PREFIX"]) / "lib/openmpi/mca_pml_ucx.so"
     commands["pml_libraries"] = run(["ldd", str(component)], env=active)
+    fftw_build = root / "build" / f"fftw-mpi-{arm}"
+    fftw_commands = {}
+    for relative in ("Makefile", "mpi/Makefile"):
+        path = fftw_build / relative
+        if path.is_file():
+            fftw_commands[relative] = re.findall(r"^(?:MPIRUN|MPICC)\s*=.*$", path.read_text(errors="replace"), re.M)
+    bench = fftw_build / "mpi/.libs/mpi-bench"
+    if bench.is_file():
+        commands["fftw_mpi_libraries"] = run(["ldd", str(bench)], env=active)
     devices = commands["ucx_devices"]["stdout"]
     logs = {}
     for package in ("ucx", "openmpi"):
@@ -121,6 +141,9 @@ def collect_arm(root, arm):
             if path.is_file():
                 logs[str(path.relative_to(root))] = text_file(path)
     return {"activation": note, "activated": env is not None, "prefixes": prefixes,
+            "path_resolution": {name: shutil.which(name, path=active.get("PATH", ""))
+                                for name in ("mpirun", "mpicc")} if env is not None else {},
+            "fftw_mpi_makefile_commands": fftw_commands,
             "runtime_settings": selected_env(active), "commands": commands,
             "transports": sorted(set(re.findall(r"^\s*#\s*Transport:\s*(\S+)", devices, re.M))),
             "devices": sorted(set(re.findall(r"^\s*#\s*Device:\s*(\S+)", devices, re.M))),
@@ -132,9 +155,7 @@ def collect(root):
     result = {
         "trial_root": str(root), "host": socket.gethostname(), "platform": platform.platform(),
         "time_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "allocation": {key: os.environ[key] for key in (
-            "SLURM_JOB_ID", "SLURM_JOB_NODELIST", "SLURM_JOB_NUM_NODES", "SLURM_STEP_ID")
-            if key in os.environ},
+        "allocation": allocation_context(),
         "memlock_bytes": {name: "unlimited" if value == resource.RLIM_INFINITY else value
                           for name, value in zip(("soft", "hard"), limit)},
         "inherited_runtime_settings": selected_env(os.environ),
@@ -167,6 +188,8 @@ def write_report(root, result):
              "Inventory only: no MPI launch or RDMA performance qualification was performed."]
     for arm, data in result["arms"].items():
         lines += [f"\n[{arm}] {data['activation']}", json.dumps(data["prefixes"]),
+                  f"Activated PATH resolution: {json.dumps(data['path_resolution'])}",
+                  f"FFTW configured launchers: {json.dumps(data['fftw_mpi_makefile_commands'])}",
                   f"Runtime settings: {json.dumps(data['runtime_settings'])}",
                   f"Transports: {', '.join(data['transports']) or 'not reported'}",
                   f"Devices: {', '.join(data['devices']) or 'not reported'}"]

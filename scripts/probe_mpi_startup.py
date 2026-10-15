@@ -11,7 +11,7 @@ import socket
 import subprocess
 import tempfile
 
-from collect_mpi_diagnostics import activated_env, selected_env
+from collect_mpi_diagnostics import activated_env, allocation_context, selected_env
 
 
 SOURCE = r"""#include <mpi.h>
@@ -65,7 +65,7 @@ def run_logged(command, env, log, timeout):
             "log": str(log)}
 
 
-def probe(root, arm, mode, timeout):
+def probe(root, arm, mode, timeout, oversubscribe=False):
     if not os.environ.get("SLURM_JOB_ID"):
         raise RuntimeError("Run inside the existing Slurm allocation on a compute node.")
     hosts = subprocess.check_output(["scontrol", "show", "hostnames", os.environ["SLURM_JOB_NODELIST"]],
@@ -88,13 +88,22 @@ def probe(root, arm, mode, timeout):
     source, binary = out / "startup.c", out / "startup"
     source.write_text(SOURCE)
     result = {"arm": arm, "mode": mode, "host": host, "activation": note,
+              "allocation": allocation_context(), "oversubscribe": oversubscribe,
               "runtime_settings": selected_env(env), "mpi_prefix": str(mpi),
               "qualification": "Diagnostic only; one node does not verify inter-node RDMA."}
+    print(f"Private MPI compiler: {mpi / 'bin/mpicc'}\nPrivate MPI launcher: {mpi / 'bin/mpirun'}", flush=True)
+    print(f"Slurm/CPU context: {json.dumps(result['allocation'])}", flush=True)
+    if oversubscribe:
+        print("Diagnostic CPU sharing enabled: --oversubscribe --bind-to none; no performance result is qualified.", flush=True)
     result["compile"] = run_logged([str(mpi / "bin/mpicc"), "-O0", str(source), "-o", str(binary)],
                                    env, out / "compile.log", timeout)
     if result["compile"]["returncode"] == 0 and not result["compile"]["timed_out"]:
-        command = [str(mpi / "bin/mpirun"), "-np", "2", "--host", host,
-                   "--map-by", "slot", "--bind-to", "core", "--nooversubscribe",
+        # A bare --host node caps that node at one slot in Open MPI 4.x.
+        # An explicit :2 keeps this probe local; Slurm's allocated slot limit
+        # still applies unless diagnostic oversubscription was requested.
+        command = [str(mpi / "bin/mpirun"), "-np", "2", "--host", host + ":2",
+                   "--map-by", "slot", "--bind-to", "none" if oversubscribe else "core",
+                   "--oversubscribe" if oversubscribe else "--nooversubscribe",
                    "--mca", "pml", "ucx", "--mca", "pml_base_verbose", "20",
                    "--mca", "orte_base_help_aggregate", "0"]
         if mode == "local-btls":
@@ -124,6 +133,8 @@ def main():
     parser.add_argument("--arm", choices=("full", "reference"), default="full")
     parser.add_argument("--mode", choices=("saved", "no-openib", "no-openib-ofi", "local-btls"), default="saved")
     parser.add_argument("--timeout", type=int, default=45, help="Seconds per compile/startup step (default 45)")
+    parser.add_argument("--oversubscribe", action="store_true",
+                        help="Diagnostic only: allow two ranks to share slots/CPUs and disable rank binding")
     args = parser.parse_args()
     if not 1 <= args.timeout <= 300:
         parser.error("Choose a timeout between 1 and 300 seconds.")
@@ -136,7 +147,7 @@ def main():
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise RuntimeError("A trial command is active. Stop that attempt before running this probe.") from None
-            passed = probe(root, args.arm, args.mode, args.timeout)
+            passed = probe(root, args.arm, args.mode, args.timeout, args.oversubscribe)
     except (RuntimeError, OSError, KeyError, subprocess.SubprocessError) as error:
         parser.exit(1, f"ERROR: {error}\n")
     parser.exit(0 if passed else 1)

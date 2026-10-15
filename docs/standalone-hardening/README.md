@@ -420,6 +420,41 @@ It refuses an active driver lock or a host outside the allocation. Slurm steps
 can still require operator cleanup after a broken launcher; inspect them after
 a timeout before launching another probe.
 
+If an earlier probe reports `not enough slots`, it failed before the application
+could initialize MPI. That result does not test UCX/OpenFabrics or show that the
+MPI build is broken. The probe now uses `--host node:2`; the previous bare
+`--host node` could cap the host at one slot even when Slurm advertised more.
+This correction retains Slurm's resource limit. The report and terminal now
+include Slurm task/CPU variables and the calling shell's allowed CPU affinity.
+
+Open MPI also reads Slurm's task counts, so an interactive `srun -n 1` shell can
+advertise one MPI slot even when the job reserved more CPUs. For this short
+startup diagnostic only, explicitly allow two ranks to share the available
+slots/CPUs if needed:
+
+```bash
+python3 "$RUNBOOK_REPO/scripts/probe_mpi_startup.py" --trial-root "$TRIAL_ROOT" --arm full --mode no-openib-ofi --oversubscribe
+```
+
+This selects `--oversubscribe --bind-to none` for this probe and records that
+choice. It does not request more Slurm resources, remove cgroup limits, change
+saved settings or qualify a performance run. Slurm `--overlap` controls sharing
+between job steps and is a separate option. A nested launcher waiting for Slurm
+step resources is a different failure from a slot-count rejection. Use a batch
+allocation sized as in step 3 for the full suite; the batch shell avoids an
+extra interactive shell step. Do not fake Slurm resource variables or infer
+usable MPI slots solely from the node's physical CPU count.
+
+The probe always prints and executes absolute private `mpicc`/`mpirun` paths.
+The inventory collector also records what `mpirun`/`mpicc` resolve to after saved
+activation, FFTW's configured `MPIRUN`/`MPICC` values, and the MPI bench's loaded
+libraries when its binary exists. FFTW upstream checks can invoke `mpirun` by
+name; that resolution must agree with the intended private MPI. An absolute
+launcher alone does not rule out a mismatched runtime library or component.
+Inspect this evidence before unloading modules, since site modules may also
+supply required Slurm/fabric libraries. Do not change the saved module/toolchain
+environment while a build is running.
+
 If startup fails or warns, compare component selections one at a time:
 
 ```bash

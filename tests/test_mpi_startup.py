@@ -45,6 +45,10 @@ done
 """)
             executable(mpi / "bin/mpirun", """test "$UCX_TLS" = rc,sm,self
 case " $* " in
+*' --host node1:2 '*) ;;
+*) echo 'There are not enough slots available to satisfy the 2 slots requested'; exit 1;;
+esac
+case " $* " in
 *' --mca btl ^uct,openib'*) printf 'startup probe: rank 0 PASS\\nstartup probe: rank 1 PASS\\n';;
 *' --mca btl self,vader '*) printf 'startup probe: rank 0 PASS\\nstartup probe: rank 1 PASS\\n';;
 *) echo 'Failed to modify UD QP to INIT on mlx5_0: Operation not permitted'; exit 1;;
@@ -58,14 +62,19 @@ esac
                 self.assertTrue(startup.probe(root, "full", "no-openib", 2))
                 self.assertTrue(startup.probe(root, "full", "no-openib-ofi", 2))
                 self.assertTrue(startup.probe(root, "full", "local-btls", 2))
+                self.assertTrue(startup.probe(root, "full", "no-openib-ofi", 2, oversubscribe=True))
             reports = [json.loads(p.read_text()) for p in root.glob("results/diagnostics/*/report.json")]
-            self.assertEqual(len(reports), 4)
+            self.assertEqual(len(reports), 5)
             for report in reports:
                 self.assertEqual(report["passed"], report["mode"] != "saved")
                 self.assertEqual(report["runtime_settings"]["UCX_TLS"], "rc,sm,self")
                 self.assertEqual(report["runtime_settings"]["OMPI_MCA_btl"], "^uct")
                 self.assertIn(str(mpi / "bin/mpirun"), report["startup"]["command"])
-                self.assertIn("--nooversubscribe", report["startup"]["command"])
+                command = report["startup"]["command"]
+                self.assertIn("node1:2", command)
+                self.assertIn("--oversubscribe" if report["oversubscribe"] else "--nooversubscribe", command)
+                binding = command[command.index("--bind-to") + 1]
+                self.assertEqual(binding, "none" if report["oversubscribe"] else "core")
             ofi = next(r for r in reports if r["mode"] == "no-openib-ofi")
             self.assertIn("^ofi", ofi["startup"]["command"])
             self.assertEqual(config.read_bytes(), before)
