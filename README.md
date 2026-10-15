@@ -13,6 +13,10 @@ Start with the [installation and trial workflow](docs/standalone-hardening/READM
 Keep the checkout inside the trial working root as described there; build
 artifacts and results live beside the checkout.
 
+Already building from the earlier Planning checkout? Use the
+[existing trial handoff](docs/standalone-hardening/README.md#existing-trial-from-the-earlier-planning-checkout)
+to keep the same environment, build state and results while switching sources.
+
 - [Experiment design and measurement controls](docs/standalone_compiler_hardening_performance_trial_v1.md)
 - [Published performance evidence and its limits](docs/standalone_compiler_hardening_performance_evidence_v1.md)
 - [Interpreting and presenting results](docs/standalone-hardening/09-results-presentation.md)

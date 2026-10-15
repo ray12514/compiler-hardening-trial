@@ -2,7 +2,74 @@
 
 Use private GCC 12.5.0 to compare the supplied hardening controls with a matched reference for FFTW, HDF5 and LAPACK. The normal workflow is now **prepare downloads on a login node → setup → build → test**. The driver handles profiles, flag qualification, prerequisites, callers and measurement files. The numbered runbooks contain the recipes it runs; you do not need to jump through their sections.
 
-If you have finished GCC bootstrap and made `profiles.sh`, **start at step 1 below**. Setup will regenerate that profile and explain the qualification result. It does not rebuild GCC.
+If you are continuing a trial from the earlier Planning checkout, use the
+[existing trial handoff](#existing-trial-from-the-earlier-planning-checkout)
+first. For a new trial with GCC bootstrap and `profiles.sh` complete, start at
+step 1, then run setup. Setup does not rebuild GCC.
+
+## Existing trial from the earlier Planning checkout
+
+The public repository is now `compiler-hardening-trial`. Your existing checkout
+may still be named `stack-planning-hardening` or something else. Its name does
+not control the trial's state: the installer uses `RUNBOOK_REPO` for source and
+`TRIAL_ROOT` for the existing environment, runner, downloads, installations and
+results.
+
+Wait until builds/tests and queued campaigns using this trial tree have stopped.
+Use the same trial root you have already been building in. The commands below
+use the established `~/COMPILER_HARDENING` layout; if your root differs, set
+`TRIAL_ROOT` to that existing path. Run in Bash on the login/staging node, with
+the same site modules and Python 3.10+ used for the trial.
+
+```bash
+set +e
+set +u
+set +o pipefail
+export TRIAL_ROOT="$HOME/COMPILER_HARDENING"
+test -f "$TRIAL_ROOT/env.sh"
+```
+
+**Stop if `env.sh` is missing.** Locate the existing trial root before continuing.
+Clone the public source alongside your old checkout:
+
+```bash
+git clone --branch main --single-branch \
+  https://github.com/ray12514/compiler-hardening-trial.git \
+  "$TRIAL_ROOT/compiler-hardening-trial"
+```
+
+Stop if cloning fails. If that new directory already exists, use step 1 to
+inspect/update it instead of cloning over it. Keep the old checkout and its
+local edits. The repositories have separate histories; do not pull the new
+repository into the old one or merge their histories. No rename, remote change
+or reset of the old checkout is needed.
+
+Next, follow **step 1 below, including its Python installer**. This selects the
+new checkout and refreshes `runner/trial.py`, its launcher and recipe snapshot
+inside the existing trial root. It leaves build records, installed packages,
+saved environment files and results in place. Pulling Git alone does not update
+the installed driver.
+
+Then use [the login-node preparation section](#before-the-compute-allocation-prepare-mpi-sources-and-reframe-on-the-login-node)
+to run `prepare-mpi` and `prepare-tests`. Back in a compute allocation, run:
+
+```bash
+"$TRIAL_ROOT/runner/trial" status
+"$TRIAL_ROOT/runner/trial" prepare-mpi --check
+"$TRIAL_ROOT/runner/trial" prepare-tests --check
+```
+
+For the earlier **`mpi-sources` failure**, resume with `trial build all --retry`
+using the full launcher path shown below. If no build failed, use `trial build
+all` to continue the original all-package build. The driver verifies and skips
+unchanged completed artifacts. If only testing remains, go directly to step 4
+for the package you finished. Keep the same trial root and build settings.
+
+The MPI-source/ReFrame preparation update does not require repeating setup or
+flag qualification. If the driver reports stale generated measurement files or
+changed environment/qualification inputs, follow its specific setup instruction
+on the build/compute node. A changed profile recipe after completed builds needs
+a separate trial root; retain the current root and its results.
 
 ## 1. Pull updates and install the driver
 
@@ -63,7 +130,11 @@ print('Installed. On the login node: prepare-mpi before MPI builds, prepare-test
 PY
 ```
 
-A Git pull updates the documentation; running this installer updates the command snapshot. Then run setup to refresh the generated measurement scripts. For an archive checkout, replace it with a fresh extracted archive and run the same installer.
+A Git pull updates the documentation; running this installer updates the command
+snapshot. New trials continue to setup in step 2. Existing trials use the handoff
+above and rerun setup only when the updated driver requires it. For an archive
+checkout, extract the new source to a separate directory and point `RUNBOOK_REPO`
+there before installing; keep the existing trial root.
 
 For a new machine without `env.sh`, first complete [the site environment](00-build-environment.md), then [00 — GCC bootstrap](00-gcc-bootstrap.md), through the saved environment file and source downloads. Those are the only manual prerequisites before step 2. A working `/usr/bin/gcc` and `/usr/bin/g++` can seed the private GCC build. [Offline GCC prerequisites](00-gcc-bootstrap.md#stage-gcc-prerequisites-for-a-machine-without-download-access) and [FFTW mirror retries](00-gcc-bootstrap.md#retry-fftw-after-a-certificate-error) are covered there.
 
