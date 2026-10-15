@@ -482,12 +482,65 @@ it is not evidence of a fix for a QP permission failure. Leave GPU/compiler
 settings out of this CPU-only trial and test memory-hook changes separately
 only when its actual warning or site guidance calls for them.
 
-Once startup is understood, record the qualified working options in the same
-`TRIAL_MPI_TUNING` file selected for both arms, then retry only the failed driver
-build (for example, `trial build fftw --mpi --retry`). The driver preserves the
-failed attempt and reuses completed prerequisites. Keep the upstream checks;
-the small probe saves repeating them during diagnosis, and is not a substitute
-for their correctness coverage or the later two-node RDMA verification.
+### Continue package builds after startup passes
+
+The startup probe is a separate diagnostic, not an FFTW installation or a
+completion record. The FFTW-MPI build runs in this order: configure/compile,
+`make check`, `make install`, compile the fixed caller, then save the completion
+record. A stop in `make check` therefore leaves that attempt incomplete before
+installation. Other completed serial/MPI prerequisites remain installed.
+
+After all old builds and queued trial work have stopped, pull the public checkout
+and run step 1's installer on the login node. The updated driver applies saved
+runtime selections after each arm's activation. Then, in the compute-node
+environment where startup passed, save its component choices and inspect state:
+
+```bash
+export TRIAL_ROOT="${TRIAL_ROOT:-$HOME/COMPILER_HARDENING}"
+export RUNBOOK_REPO="${RUNBOOK_REPO:-$TRIAL_ROOT/compiler-hardening-trial}"
+python3 "$RUNBOOK_REPO/scripts/apply_mpi_startup_selection.py" --trial-root "$TRIAL_ROOT" &&
+unset TRIAL_MPI_TUNING &&
+"$TRIAL_ROOT/runner/trial" status
+```
+
+The helper requires the latest startup report to have passed and to match the
+current private MPI/fabric settings. `--report /absolute/path/to/report.json`
+selects a specific passing report instead. It creates a new runtime file that
+sources the previous file, then applies only the tested PML/BTL/MTL component
+choices. It preserves the UCX build selection, recovery manifest, old runtime
+file and build records. It does not copy the diagnostic's `--oversubscribe` or
+`--bind-to none` options. The new selection is saved in `runner/mpi-config.json`
+for both arms. The final `unset` drops any old exported file selection so later
+driver commands use that saved configuration. A repeated application is
+idempotent; a failed or mismatched report is rejected without changing settings.
+
+In `trial status`, `fftw-mpi-full: complete; artifacts verified` confirms that
+the driver has installed and recorded that arm and caller. An `incomplete`
+record means it still needs the build/check/install workflow. Do not infer
+completion from a library filename alone, delete pending records, or manually
+run `make install` to bypass the failed checks.
+
+For the complete continuation, submit a batch job with the site's normal
+account/partition/time settings, one node and enough task/CPU slots as in step 3.
+Export `TRIAL_ROOT` to that job and run the driver directly in its batch shell:
+
+```bash
+"$TRIAL_ROOT/runner/trial" build all --retry
+```
+
+This verifies/skips completed packages. It archives and rebuilds an interrupted
+package from configure onward, including upstream checks and installation; it
+does not resume at one individual check. Each package completes its full arm,
+then its reference, with matching dependencies built as required. If the stop
+was `fftw-mpi-full`, that arm must finish before FFTW-MPI reference and the
+remaining HDF5-MPI work can complete. `build fftw --mpi --retry` limits the work
+to FFTW and its MPI prerequisites if that is the intended scope.
+
+Keep the upstream correctness checks. The startup probe saves repeating them
+during diagnosis and does not replace their coverage. After `build all` finishes,
+run `trial status` again before moving to the separate ReFrame/performance step
+and the two-node RDMA verification. A local startup PASS is not fabric or timing
+qualification.
 
 ### Settings that belong to each system
 

@@ -38,6 +38,8 @@ For a stalled FFTW MPI check or a UD QP permission error, follow
 [the bounded MPI startup diagnostic](docs/standalone-hardening/README.md#fftw-mpi-check-hangs-or-reports-a-ud-qp-permission-error)
 before retrying the package suite. It compares startup components without
 changing completed builds or saved runtime settings.
+After startup passes, use [the package continuation steps](docs/standalone-hardening/README.md#continue-package-builds-after-startup-passes)
+to save the component selection, check installation state and finish both build arms.
 
 If UCX is already installed without RDMA support, follow
 [the MPI graph recovery](docs/standalone-hardening/README.md#recover-a-completed-tcp-only-mpi-build-for-rdma).
