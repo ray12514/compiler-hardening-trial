@@ -248,6 +248,44 @@ Completed driver builds are checked and skipped on a repeated command. On failur
 
 This preserves the failed attempt and starts its build again. It does not remove more flags because of an arbitrary package/test failure. Existing manual installations are retained; the driver will explain if an audit or a separate trial root is needed. Changing build flags/dependencies after a successful build requires a fresh experiment root. Scheduling/reporting updates only need refreshed scripts.
 
+## If parallel HDF5 configuration cannot find MFU
+
+The earlier parallel HDF5 recipe enabled `HDF5_BUILD_PARALLEL_TOOLS=ON`.
+In the pinned HDF5 2.1.0 source, that requests additional command-line utilities
+and requires MFU (mpi-file-utils), libcircle and DTCMP. The trial's fixed MPI
+caller uses the HDF5 library API directly and does not use those utilities.
+
+The corrected recipe sets `HDF5_BUILD_PARALLEL_TOOLS=OFF` for both arms.
+Parallel HDF5 remains enabled (`HDF5_ENABLE_PARALLEL=ON`), and the parallel
+correctness tests, regular tools and high-level library remain enabled. No MFU
+installation is needed for this trial. This does not disable HDF5 MPI support
+or skip its correctness tests.
+
+After the failed build and any queued trial work have stopped, update and
+refresh the driver snapshot on the login node:
+
+```bash
+export TRIAL_ROOT="${TRIAL_ROOT:-$HOME/COMPILER_HARDENING}"
+export RUNBOOK_REPO="${RUNBOOK_REPO:-$TRIAL_ROOT/compiler-hardening-trial}"
+git -C "$RUNBOOK_REPO" pull --ff-only &&
+python3 "$RUNBOOK_REPO/scripts/install_driver.py" --trial-root "$TRIAL_ROOT"
+```
+
+Then rerun the existing batch build command in a sufficiently sized allocation:
+
+```bash
+"$TRIAL_ROOT/runner/trial" build all --retry
+```
+
+For an interrupted `hdf5-mpi-full` configure, the driver retains the failed
+attempt and starts that package with a fresh build directory/cache. It verifies
+and skips completed FFTW, UCX/Open MPI and other unchanged packages, then
+continues HDF5-MPI full/reference. The changed build recipe affects only the
+MPI HDF5 package; the compiler profiles, serial HDF5 and FFTW recipes are
+unchanged. No new setup/flag qualification is required. Keep existing completion
+and pending records; do not patch the old CMake cache or install arbitrary MFU
+libraries to bypass this optional dependency.
+
 ## Recover a completed TCP-only MPI build for RDMA
 
 Use this when the report shows active InfiniBand hardware but UCX was built

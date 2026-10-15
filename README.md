@@ -29,6 +29,9 @@ every actual result.
 For the UCX optional Go-binding build failure, see the
 [update and retry instructions](docs/standalone-hardening/README.md#if-ucx-stops-while-building-go-bindings).
 
+For HDF5's `Could NOT find MFU` configure failure, use the
+[parallel HDF5 update and retry steps](docs/standalone-hardening/README.md#if-parallel-hdf5-configuration-cannot-find-mfu).
+
 For MPI/PML errors or Mellanox setup, use the
 [copy-and-paste diagnostics and system settings](docs/standalone-hardening/README.md#collect-mpi-and-fabric-diagnostics).
 It locates the saved trial installations and prints the exact local report path
@@ -57,3 +60,16 @@ The check verifies the archive checksum, runs the actual recipe's configure
 command and optional-binding target with Go installed, and uses a disposable
 container with networking disabled. It does not run the target-system package
 builds or performance campaign.
+
+The parallel HDF5 configuration regression uses the pinned release archive and
+a local Linux image with CMake 3.26+, GCC, Python 3 and system Open MPI under
+`/usr` (no MFU, libcircle or DTCMP required):
+
+```bash
+python3 scripts/check_hdf5_mpi_configure.py /path/to/hdf5-2.1.0.tar.gz --image YOUR_LINUX_MPI_CMAKE_IMAGE
+```
+
+It configures the actual recipe for both arms with system compilers and neutral
+flags in a disposable container with networking disabled, and checks that MPI,
+parallel test targets and regular tools remain enabled. Target GCC hardening,
+package builds/tests and fabric qualification remain separate checks.

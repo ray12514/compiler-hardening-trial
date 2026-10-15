@@ -142,7 +142,7 @@ Planning and communication can mask local arithmetic overhead; retain the serial
 
 ## 2. Build parallel HDF5 variants
 
-C-only, compression/plugin/thread-safe options off, high-level library and parallel tools on. Set MPI discovery explicitly; do not let CMake discover a system MPI ahead of the private one. Tests below run sequentially because MPI test jobs must fit the allocation; they still launch multiple ranks.
+C-only, compression/plugin/thread-safe options off, high-level library and regular tools on. Optional parallel command-line utilities are off: they require MFU (mpi-file-utils), libcircle and DTCMP, which the fixed HDF5 MPI caller does not use. `HDF5_ENABLE_PARALLEL=ON` still enables the parallel library/API and its upstream correctness tests. Set MPI discovery explicitly; do not let CMake discover a system MPI ahead of the private one. Tests below run sequentially because MPI test jobs must fit the allocation; they still launch multiple ranks.
 
 ```bash
 HDF5_MPI_VARIANTS=(full reference)
@@ -163,7 +163,7 @@ for p in "${HDF5_MPI_VARIANTS[@]}"; do
       -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_INSTALL_LIBDIR=lib \
       -DCMAKE_INSTALL_RPATH="$MPI_PREFIX/lib" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
       -DBUILD_SHARED_LIBS=ON -DBUILD_STATIC_LIBS=OFF -DBUILD_TESTING=ON \
-      -DHDF5_BUILD_TOOLS=ON -DHDF5_BUILD_PARALLEL_TOOLS=ON -DHDF5_BUILD_HL_LIB=ON \
+      -DHDF5_BUILD_TOOLS=ON -DHDF5_BUILD_PARALLEL_TOOLS=OFF -DHDF5_BUILD_HL_LIB=ON \
       -DHDF5_BUILD_CPP_LIB=OFF -DHDF5_BUILD_FORTRAN=OFF \
       -DHDF5_ENABLE_PARALLEL=ON -DHDF5_ENABLE_THREADSAFE=OFF \
       -DHDF5_ENABLE_ZLIB_SUPPORT=OFF -DHDF5_ENABLE_SZIP_SUPPORT=OFF \
