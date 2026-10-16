@@ -32,6 +32,7 @@ for a production-density campaign:
 | Current behavior | Required change |
 |---|---|
 | Driver and allocation controller accept one or four ranks per node | Accept validated positive counts and an allocated-physical-core mode |
+| Core binding has no explicit WEKA reservation audit | Discover service reservations per host and verify their exclusion from every rank's affinity |
 | FFT caller accepts cubic dimensions only, at most 256 | Support explicit dimensions, safe larger sizes, checked arithmetic and memory estimates |
 | FFT caller rejects empty local slabs | Keep this guard; add a collective preflight explaining incompatible geometry before measurements |
 | FFT caller repeats forward transforms of fixed input | Add persistent, numerically stable iteration state and a forward/inverse workload with plan reuse |
@@ -57,6 +58,53 @@ hardware resources and supports explicit mapping/binding and binding reports.
 [Open MPI 4.1.8](https://www.open-mpi.org/doc/v4.1/man1/mpirun.1.php),
 [Slurm CPU allocation and binding](https://slurm.schedmd.com/cpu_management.html)
 
+### Eligible cores and WEKA reservations
+
+For the first density progression, use **16, then 32, then all eligible physical
+cores per node**, subject to allocation capacity, FFT geometry, memory and run
+budget. These are planned layouts; the current driver still accepts only one or
+four ranks per node. The primary dense lane should eventually use the production
+core budget rather than stop at 16 ranks. If 92 physical cores are already usable
+by the job after reservations, the final target is 92 ranks per node. If 92 is the
+hardware count before reservations, determine the smaller eligible count first.
+
+Discover the actual WEKA reservation on **each selected host**; the tentative
+CPU range 19–22 is not configuration. Inspect the client resource assignments and
+its dedicated cgroup, and cross-check Slurm's service-core reservation. Reconcile
+OS CPU IDs with socket/core topology and Slurm's numbering before comparing masks.
+Exclude every SMT sibling of a reserved physical core. WEKA documents cgroup
+v1/v2 inspection and warns about CPU index mismatches.
+[WEKA CPU allocation guidance](https://docs.weka.io/best-practice-guides/weka-and-slurm-integration/avoid-conflicting-cpu-allocations)
+
+The placement preflight must:
+
+1. Resolve the selected job/step's actual cgroup and effective CPU allowance on
+   every host. A service-level or root cgroup is not proof of this job's grant.
+   For cgroup v2 use `cpuset.cpus.effective`; an empty configured `cpuset.cpus`
+   can inherit a parent's allowance. Discover paths rather than assume a fixed
+   WEKA or Slurm cgroup path.
+   [Kernel cpuset interface](https://cdn.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#cpuset)
+2. Intersect online CPUs with the job's allowed CPUs, subtract verified service
+   reservations expanded to whole physical cores, then select one hardware
+   thread per remaining core. Honor task slots as a separate constraint.
+   A broad inherited WEKA allowance is not evidence that every listed CPU is a
+   dedicated WEKA core; resolve ambiguous reservations before a dense run.
+3. Choose explicit per-host maps with a recorded socket/NUMA distribution. Use
+   the same maps for full and reference, and verify actual rank affinity before
+   timing. Reject shared physical cores and intersections with reserved cores.
+   Apply this policy to serial caller placement as well as MPI placement.
+4. Save requested and observed masks, reservation evidence and eligible physical
+   core counts in the local manifest. Do not assume all hosts reserve the same
+   CPU IDs. Stop qualification if the requested density cannot be verified;
+   never silently use reserved cores or reduce only one comparison arm.
+
+This is a read-only discovery and benchmark-placement change. It does not modify
+WEKA mounts, services or Slurm configuration. Existing pilot results have no
+explicit WEKA-exclusion evidence; audit saved affinities where available and
+otherwise label their reservation status unverified.
+
+### Rank and thread policy
+
 Reject unintended rank/core sharing, ranks outside selected hosts, mixed hardware
 groups, unavailable task slots and hidden threaded BLAS/FFT oversubscription.
 If the current job grants fewer slots/cores than this lane needs, record the
@@ -68,6 +116,9 @@ Overlap permits launching within the interactive allocation; it does not grant
 extra cores. Do not enable rank oversubscription to bypass allocation checks.
 
 Pure MPI is the first controlled lane, not a claim that all users run this way.
+Keep OpenMP and threaded numerical libraries at one thread per rank for this
+lane; do not count SMT threads as additional physical cores. In a hybrid layout,
+MPI communicates between nodes and threads execute within each rank on a node.
 If a target application uses MPI plus threads, add a separately labeled hybrid
 lane with explicit ranks, threads and disjoint core sets. Hold total allocated
 cores constant when comparing layouts; verify the threaded library configuration.
@@ -212,7 +263,7 @@ then clearly labeled scenario estimates with uncertainty and assumptions.
 
 | Milestone | Completion evidence |
 |---|---|
-| P0 placement and size validation | Allocation-aware core/slot checks; invalid geometry/overflow rejected before measurement; both arms bind correctly |
+| P0 placement and size validation | Per-host allocation/core/slot and WEKA reservation checks; one hardware thread per physical core; invalid geometry/overflow rejected before measurement; observed bindings exclude reserved cores in both arms |
 | P1 sustained callers | Equal-work FFT, HDF5 and integrated loops pass correctness, timeout, cleanup and bounded-storage checks |
 | P2 paired driver and exports | Reproducible frozen manifest, balanced randomized order, raw data and job-level metrics; existing screening remains usable |
 | P3 two-node dense pilot | Both stacks use intended libraries/fabric; no unintended oversubscription, empty slabs, memory failure or mislabeled I/O |
