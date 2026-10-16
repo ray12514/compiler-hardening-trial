@@ -640,6 +640,79 @@ to interpret the report before changing completed build inputs. This section
 is the current diagnostic procedure; future fixes update it in place rather
 than adding a separate competing update guide.
 
+## Qualify an existing multi-node allocation before the sweep
+
+Use this first when the builds have finished and an interactive allocation is
+already available. Keep the allocation; do not submit another eight-node job.
+Update the checkout while no trial work is running:
+
+```bash
+export TRIAL_ROOT="${TRIAL_ROOT:-$HOME/COMPILER_HARDENING}"
+export RUNBOOK_REPO="${RUNBOOK_REPO:-$TRIAL_ROOT/compiler-hardening-trial}"
+git -C "$RUNBOOK_REPO" pull --ff-only
+```
+
+Stop if the pull fails. This standalone helper uses the existing saved MPI
+activations/runtime configuration; it needs no driver reinstall, setup or
+package rebuild. Run from an allocated compute-node shell, with the site's
+required modules loaded:
+
+```bash
+"$TRIAL_ROOT/runner/trial" status &&
+python3 "$RUNBOOK_REPO/scripts/qualify_test_allocation.py" --trial-root "$TRIAL_ROOT"
+```
+
+This communication gate does not require ReFrame. Before the subsequent package
+pilots, run `"$TRIAL_ROOT/runner/trial" prepare-tests --check`; if it is not
+prepared, use the existing `prepare-tests` staging procedure. `status` verifies
+the recorded build artifacts; the exact
+effective compiler flags remain in `runner/qualification.json`. The new
+communication caller is a diagnostic compiled with `-O0`, not a performance
+measurement of those flags.
+
+The helper prints the full allocated host list and selects its first two hosts.
+For **each** private full/reference stack it runs two bound ranks locally, then
+one rank on each selected node. Every rank records its CPU affinity, memlock,
+available RC transports, port inventory and private caller/launcher/UCX component
+library paths before verifying a 512 KiB ring exchange and an MPI reduction.
+The local run exercises intra-node communication; only the inter-node run tests
+the network. `UCX_TLS` must already select `rc` (or `rc_mlx5`/`rc_verbs`) with
+optional `sm,self`; TCP fallback is rejected. The helper keeps saved PML/BTL/MTL
+choices, removes `UCX_PREFIX` from the process environment, and enables UCX info
+logging only for qualification. It does not change tuning or build state.
+
+Both participating nodes need at least two allocated core/slot resources for
+the local check. A launch/slot/binding failure stops the sequence; inspect the
+evidence rather than adding oversubscription to a measurement run. Each compile
+or launch is bounded to 90 seconds by default. Slurm's resource-holding
+interactive step can affect nested launches; this is why placement and launch
+behavior are qualified in this actual allocation first. See the
+[Slurm interactive-step guidance](https://slurm.schedmd.com/faq.html) and
+[UCX transport selection](https://openucx.readthedocs.io/en/master/faq.html#selecting-networks-and-transports).
+
+The final path is `results/diagnostics/mpi-allocation-*/report.json`.
+Each arm's `local/` and `inter-node/` directories retain `communication.log`
+(including bindings and UCX information) and a `rank-N.json` for each rank.
+Share the report and inter-node logs before starting the long campaign.
+A PASS covers only these hosts/layouts and communication checks; it is neither
+an overhead estimate nor qualification of the other six hosts.
+
+To choose a different allocated pair, use `--hosts nodeA,nodeB` with names from
+the printed list. A later `--ranks-per-node 4` check uses four bound ranks per
+selected node and requires corresponding allocated resources. Four ranks per
+node across eight nodes means 32 ranks, whereas one rank per node means eight;
+the latter is an inter-node baseline, not the intended limit of the experiment.
+
+After this gate, run short full/reference package pilots from step 4, inspect
+durations and variation, then prepare the automated single-allocation campaign
+in [10](10-single-allocation.md). That controller runs serial cases on every
+host and MPI scales on rotated disjoint groups. It is not an exhaustive set of
+all host combinations. Keep host/group/round and rank layouts distinct in the
+analysis; repeat rounds within these eight nodes do not count as new allocations.
+Choose a production-like rank layout and adequate workload sizes before the
+long sweep, using the pilot to budget the remaining allocation time. Do not
+assume a twelve-hour reservation makes every optional case necessary or feasible.
+
 ## 4. Test one package when it is ready
 
 For a Mellanox/RDMA system, first qualify the

@@ -13,6 +13,10 @@ Start with the [installation and trial workflow](docs/standalone-hardening/READM
 Keep the checkout inside the trial working root as described there; build
 artifacts and results live beside the checkout.
 
+Builds finished and already holding multiple nodes? Start with
+[qualification in the existing allocation](docs/standalone-hardening/README.md#qualify-an-existing-multi-node-allocation-before-the-sweep)
+before package pilots and the longer campaign.
+
 Already building from the earlier Planning checkout? Use the
 [existing trial handoff](docs/standalone-hardening/README.md#existing-trial-from-the-earlier-planning-checkout)
 to keep the same environment, build state and results while switching sources.
