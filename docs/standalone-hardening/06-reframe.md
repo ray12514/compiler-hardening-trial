@@ -188,7 +188,9 @@ class HardeningTrial(rfm.RunOnlyRegressionTest):
             for name in ('MPI_PREFIX','MPI_LIB_DIRS','MPI_MAP','OMPI_MCA_io',
                          'OMPI_MCA_plm','OMPI_MCA_ras'):
                 self.env_vars[name] = os.environ[name]
-            for name in ('MPI_EXTRA_ARGS','UCX_TLS','UCX_NET_DEVICES'):
+            for name in ('MPI_EXTRA_ARGS','UCX_TLS','UCX_NET_DEVICES','UCX_IB_GID_INDEX',
+                         'UCX_IB_SL','UCX_IB_TRAFFIC_CLASS','OMPI_MCA_btl','OMPI_MCA_mtl',
+                         'OMPI_MCA_plm_slurm_args'):
                 if name in os.environ:
                     self.env_vars[name] = os.environ[name]
             self.executable = 'python3'

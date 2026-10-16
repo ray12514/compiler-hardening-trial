@@ -2,7 +2,7 @@
 
 Install this driver using the [README](README.md). It needs Python 3.10 or newer and the completed private GCC 12.5 environment from 00. The source below is embedded here like the other runbook scripts; the installer copies it and the recipe snapshot into `TRIAL_ROOT/runner`.
 
-The public commands are `setup`, `prepare-mpi [--from-dir DIR | --check]`, `prepare-tests [--wheelhouse DIR | --check]`, `build PACKAGE [--mpi] [--retry]`, `test PACKAGE [--mpi] [--nodes N] [--pairs N]`, `status`, and `logs`. `build all` includes the three serial packages and both MPI packages. Tests select one package at a time; 08/10 provide the larger campaigns. Run MPI builds in a Slurm allocation because upstream correctness tests launch MPI processes.
+The public commands are `setup`, `refresh-tests`, `prepare-mpi [--from-dir DIR | --check]`, `prepare-tests [--wheelhouse DIR | --check]`, `build PACKAGE [--mpi] [--retry]`, `test PACKAGE [--mpi] [--nodes N] [--ranks-per-node 1|4] [--pairs N] [--slurm-overlap]`, `status`, and `logs`. `build all` includes the three serial packages and both MPI packages. `test all` runs a sequential five-session package pilot and exports its completed timing phases to CSV. 08/10 provide the larger host/scale campaigns. Run MPI builds in a Slurm allocation because upstream correctness tests launch MPI processes.
 
 `setup` generates profiles, probes C/C++/Fortran, checks emitted PIE/RELRO/NOW/non-executable-stack properties, checks mixed shared/tool linking, and generates measurement files. Every shell command runs in a separate strict Bash process; sourcing the saved environment no longer changes an interactive shell’s options. The driver prints progress every 30 seconds during long steps and the last 25 log lines on failure.
 
@@ -23,7 +23,7 @@ Run `prepare-tests` on a connected login/staging node before entering the test a
 Do not update the runner or regenerate files while a campaign is queued or running. The driver prevents overlapping driver commands in one trial root; independently submitted campaign jobs are the operator’s responsibility. A new setup does not adopt old libraries or change an earlier result’s identity.
 
 ```python
-import argparse, datetime, fcntl, hashlib, json, os, pathlib, re, shlex, shutil, subprocess, sys, time
+import argparse, csv, datetime, fcntl, hashlib, json, os, pathlib, re, shlex, shutil, socket, subprocess, sys, time
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -117,7 +117,11 @@ def with_mpi_tuning(text):
         'if test -n "${TRIAL_MPI_TUNING:-}"; then source "$TRIAL_MPI_TUNING"; fi\n'+m[1]+
         # UCX_PREFIX is a shell path, not a UCX setting. Its unused-variable
         # warning contaminates ph5diff output compared against golden files.
-        'export -n UCX_PREFIX', text)
+        'export -n UCX_PREFIX\n'+m[1]+
+        'if test "${TRIAL_SLURM_OVERLAP:-0}" = 1; then\n'+m[1]+
+        '  case " ${OMPI_MCA_plm_slurm_args:-} " in *" --overlap "*) ;;\n'+m[1]+
+        '    *) export OMPI_MCA_plm_slurm_args="${OMPI_MCA_plm_slurm_args:+$OMPI_MCA_plm_slurm_args }--overlap" ;; esac\n'+m[1]+
+        'fi', text)
 
 def verify_ucx_rdma(prefix):
     code = 'export LD_LIBRARY_PATH='+shlex.quote(str(prefix/'lib'))+':"$GCC_LIB_DIRS${TRIAL_SITE_LIB_DIRS:+:$TRIAL_SITE_LIB_DIRS}"\n'
@@ -256,9 +260,7 @@ def setup():
     qualify()
     if previous and previous != read(HERE/'qualification.json') and list((HERE/'state').glob('*.json')):
         raise RuntimeError('Effective flags changed after builds. Use a fresh trial root; do not time old builds under the new profile.')
-    generation = block('01-common',4)+block('00b-openmpi-ucx',5).split('export TRIAL_EXPECTED_NODES=2')[0]
-    generation += block('06-reframe',1)+block('06-reframe',2)+block('11-stack-comparison',2)
-    shell('measurement-files',generation)
+    generate_measurements()
     save(HERE/'setup.json',{'profile_recipe':digest(new_profile),'measurement_recipes':measurement_hash(),'qualification':read(HERE/'qualification.json'),
                            'env':filehash(ROOT/'env.sh'),'site_env':filehash(ROOT/'site-env.sh') if (ROOT/'site-env.sh').exists() else None})
     print('Setup complete. Next: trial build fftw, trial build fftw --mpi, or trial build all.')
@@ -266,7 +268,21 @@ def setup():
 def measurement_hash():
     return digest([block('01-common',4),block('06-reframe',1),block('06-reframe',2),block('11-stack-comparison',2),block('00b-openmpi-ucx',5)])
 
-def require_setup():
+def generate_measurements():
+    generation = block('01-common',4)+block('00b-openmpi-ucx',5).split('export TRIAL_EXPECTED_NODES=2')[0]
+    generation += block('06-reframe',1)+block('06-reframe',2)+block('11-stack-comparison',2)
+    shell('measurement-files',generation)
+
+def refresh_tests():
+    state = require_setup(check_measurements=False)
+    if state['qualification'] != read(HERE/'qualification.json'):
+        raise RuntimeError('Recorded qualification changed; do not refresh measurements over mismatched builds.')
+    generate_measurements()
+    state['measurement_recipes'] = measurement_hash()
+    save(HERE/'setup.json',state)
+    print('Measurement scripts refreshed; compiler qualification and package builds retained.')
+
+def require_setup(check_measurements=True):
     state = read(HERE/'setup.json')
     if not state: raise RuntimeError('Run trial setup first.')
     if state['qualification']['policy'] != read(HERE/'policy.json', {'disabled':{},'events':[]}):
@@ -276,8 +292,8 @@ def require_setup():
         raise RuntimeError('env.sh/site-env.sh changed since qualification. Run trial setup before continuing.')
     if state['profile_recipe'] != digest(block('01-common',0)):
         raise RuntimeError('Updated profile recipe requires trial setup.')
-    if state['measurement_recipes'] != measurement_hash():
-        raise RuntimeError('Measurement recipes changed. Run trial setup to refresh the generated files.')
+    if check_measurements and state['measurement_recipes'] != measurement_hash():
+        raise RuntimeError('Measurement recipes changed. Run trial refresh-tests to refresh measurement scripts without rebuilding packages.')
     return state
 
 def paths(package, arm):
@@ -467,42 +483,139 @@ def prepare_tests(args):
           profiles=False, extra={'PIP_DISABLE_PIP_VERSION_CHECK':'1'})
     print('ReFrame prepared. On the compute node run trial prepare-tests --check, then trial test PACKAGE. No payload rebuild is needed.')
 
-def test(args):
+def verify_test_tree(package, arm):
+    for dep in DEPS.get(package,[]): verify_test_tree(dep,arm)
+    state = verify_state(f'{package}-{arm}')
+    if state['effective_profile'] != read(HERE/'qualification.json'):
+        raise RuntimeError('Qualification differs from installed artifacts; use a fresh root.')
+
+def test_one(args, record=None):
     require_setup()
     if not os.environ.get('SLURM_JOB_ID'): raise RuntimeError('Run tests inside a Slurm allocation on compute nodes. See README salloc/srun example.')
     reframe = check_reframe()
     packages = selected(args.package,args.mpi)
     if args.mpi and args.package!='all': packages = [args.package+'-mpi']
-    if args.package=='all': raise RuntimeError('Use one package per trial test command, or the full campaign in 08/10.')
     package = packages[0]
-    def check_tree(p, arm):
-        for dep in DEPS.get(p,[]): check_tree(dep,arm)
-        state = verify_state(f'{p}-{arm}')
-        if state['effective_profile'] != read(HERE/'qualification.json'): raise RuntimeError('Qualification differs from installed artifacts; use a fresh root.')
-    for arm in ('full','reference'): check_tree(package,arm)
+    for arm in ('full','reference'): verify_test_tree(package,arm)
     run = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     out = ROOT/'results/reframe'/run; out.mkdir(parents=True)
+    if record is not None: record['result_dir'] = str(out.relative_to(ROOT))
     io = os.environ.get('IO_DIR')
     if package.startswith('hdf5') and not io: raise RuntimeError('Set IO_DIR to a dedicated trial directory on the filesystem you want to measure.')
     io = io or str(ROOT/'results/io'); pathlib.Path(io).mkdir(parents=True,exist_ok=True)
     extra = {'RUN_ID':run,'IO_DIR':io,'WORKLOADS':WORKLOADS[package],'COMPARATORS':'reference','TRIAL_SCOPE':'stack','PAIRS':str(args.pairs),
-             'CPUSET':os.environ.get('CPUSET',str(min(os.sched_getaffinity(0)))),'TRIAL_ALLOCATION_MODE':'individual','TRIAL_REPEAT_SCOPE':'allocation'}
+             'CPUSET':os.environ.get('CPUSET',str(min(os.sched_getaffinity(0)))),'TRIAL_ALLOCATION_MODE':'individual','TRIAL_REPEAT_SCOPE':'allocation',
+             'TRIAL_SLURM_OVERLAP':'1' if getattr(args,'slurm_overlap',False) else '0'}
+    if not args.mpi: extra.update(TRIAL_SELECTED_HOSTS=socket.gethostname(),TRIAL_EXPECTED_NODES='1')
     code = ''
     if args.mpi:
         hosts = subprocess.check_output(['scontrol','show','hostnames',os.environ['SLURM_JOB_NODELIST']],text=True).split()
         if args.nodes>len(hosts): raise RuntimeError(f'Requested {args.nodes} nodes; allocation has {len(hosts)}.')
         chosen = ','.join(hosts[:args.nodes])
-        extra.update(TRIAL_SELECTED_HOSTS=chosen,TRIAL_EXPECTED_NODES=str(args.nodes),RANKS_PER_NODE='1',MPI_NP=str(args.nodes),MPI_MAP='ppr:1:node',MPI_EXTRA_ARGS='--host '+chosen+' --nooversubscribe')
+        rpn = getattr(args,'ranks_per_node',1)
+        slots = ','.join(f'{host}:{rpn}' for host in hosts[:args.nodes])
+        extra.update(TRIAL_SELECTED_HOSTS=chosen,TRIAL_EXPECTED_NODES=str(args.nodes),RANKS_PER_NODE=str(rpn),MPI_NP=str(args.nodes*rpn),
+                     MPI_MAP=f'ppr:{rpn}:node',TRIAL_MPI_HOST_SLOTS=slots,MPI_EXTRA_ARGS='--host '+slots+' --nooversubscribe')
         smoke = block('00b-openmpi-ucx',5).split('export TRIAL_EXPECTED_NODES=2 RANKS_PER_NODE=1\n')[1]
-        smoke = smoke.replace('-np 2','-np "$MPI_NP" --host "$TRIAL_SELECTED_HOSTS" --nooversubscribe')
+        smoke = smoke.replace('-np 2','-np "$MPI_NP" --host "$TRIAL_MPI_HOST_SLOTS" --nooversubscribe')
+        smoke = smoke.replace('--map-by ppr:1:node','--map-by "$MPI_MAP"').replace("--mca btl '^uct'",'--mca btl "${OMPI_MCA_btl:-^uct}"')
         shell('mpi-placement',smoke,extra=extra)
         code += 'source "$TRIAL_ROOT/mpi-env.sh"\n'
     code += f'test "$("{reframe}" --version)" = 4.10.4\n'
     code += 'export PATH="$TRIAL_ROOT/tools/reframe-venv/bin:$PATH"\n'
     code += f'"{reframe}" -C "$TRIAL_ROOT/reframe/settings.py" -c "$TRIAL_ROOT/reframe/hardening.py" -r --exec-policy=serial --performance-report --prefix="{out}/rfm" --report-file="{out}/report.json"\n'
+    code = code.replace('export PATH="$TRIAL_ROOT/tools/reframe-venv/bin:$PATH"',
+                        'unset UCX_LOG_LEVEL\nexport PATH="$TRIAL_ROOT/tools/reframe-venv/bin:$PATH"')
     log = shell('reframe-'+package,code,extra=extra)
     shutil.copy2(log,out/'console.log')
     print(log.read_text()); print(f'Results: {out}\nTen pairs are a pilot; use 20 pairs and repeat in three allocations for the initial assessment.')
+    return out
+
+def collect_pilot(out, manifest):
+    fields = ['package','workload','phase','primary','scope','comparator','nodes','ranks_per_node','pairs',
+              'full_mean_seconds','full_stdev_seconds','reference_mean_seconds','reference_stdev_seconds',
+              'runtime_increase_percent','interval_low_percent','interval_high_percent','effective_profile_ids','summary']
+    rows = []; missing = []
+    for entry in manifest['runs']:
+        found = set()
+        if entry.get('result_dir'):
+            for path in sorted((ROOT/entry['result_dir']).glob('paired/*/*/*/summary.json')):
+                try:
+                    value = read(path); workload = value['case']
+                    if workload not in entry['expected_workloads'] or value['scope']!='stack' or value['comparator']!='reference':
+                        raise ValueError('Unexpected pilot summary scope or workload')
+                    pending = []
+                    for phase, metrics in value['phases'].items():
+                        interval = metrics['bootstrap_95_percent_interval']
+                        pending.append(dict(zip(fields,[entry['package'],workload,phase,phase==value.get('primary_phase'),
+                            value['scope'],value['comparator'],entry['nodes'],entry['ranks_per_node'],metrics['pairs'],
+                            metrics['full_runtime_seconds_mean'],metrics['full_runtime_seconds_stdev'],
+                            metrics['comparator_runtime_seconds_mean'],metrics['comparator_runtime_seconds_stdev'],
+                            metrics['full_runtime_increase_percent'],interval[0],interval[1],
+                            ';'.join(value.get('effective_profile_ids',[])),str(path.relative_to(ROOT))])))
+                    if not pending or not any(row['primary'] for row in pending): raise ValueError('Missing primary phase')
+                    rows.extend(pending); found.add(workload)
+                except (OSError,ValueError,KeyError,TypeError,IndexError):
+                    entry.setdefault('invalid_summary_files',[]).append(str(path.relative_to(ROOT)))
+        entry['missing_workloads'] = sorted(set(entry['expected_workloads'])-found)
+        missing.extend(entry['package']+':'+name for name in entry['missing_workloads'])
+    with (out/'phases.csv').open('w',newline='') as stream:
+        writer = csv.DictWriter(stream,fieldnames=fields); writer.writeheader(); writer.writerows(rows)
+    manifest['coverage_complete'] = not missing
+    if missing and manifest['status']=='finished': manifest['status']='coverage_incomplete'
+    manifest['completed_phase_rows'] = len(rows)
+    save(out/'pilot.json',manifest)
+    print('Package pilot: primary paired runtime changes (positive = full slower)',flush=True)
+    for row in rows:
+        if row['primary']:
+            print(f"{row['package']:10} {row['workload']:20} {row['runtime_increase_percent']:+.3f}% "
+                  f"[{row['interval_low_percent']:+.3f}, {row['interval_high_percent']:+.3f}]",flush=True)
+    print(f'Pilot results: {out}\nCSV: {out/"phases.csv"}\nCoverage complete: {not missing}',flush=True)
+    return not missing
+
+def test(args):
+    if args.package != 'all': return test_one(args)
+    require_setup()
+    if not os.environ.get('SLURM_JOB_ID'): raise RuntimeError('Run the package pilot in the existing compute allocation.')
+    if not os.environ.get('IO_DIR'): raise RuntimeError('Set IO_DIR to a dedicated shared measurement directory before test all.')
+    io = pathlib.Path(os.environ['IO_DIR'])
+    if not io.is_absolute(): raise RuntimeError('IO_DIR must be an absolute shared measurement directory.')
+    io.mkdir(parents=True,exist_ok=True)
+    hosts = subprocess.check_output(['scontrol','show','hostnames',os.environ['SLURM_JOB_NODELIST']],text=True).split()
+    if args.nodes > len(hosts): raise RuntimeError('Requested MPI node count exceeds this allocation.')
+    check_reframe()
+    for package in ('fftw','hdf5','lapack','fftw-mpi','hdf5-mpi'):
+        for arm in ('full','reference'): verify_test_tree(package,arm)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+    out = ROOT/'results/pilots'/stamp; out.mkdir(parents=True)
+    manifest = {'status':'running','pairs':args.pairs,'procedure_commit':(HERE/'procedure.txt').read_text().strip() if (HERE/'procedure.txt').exists() else 'unrecorded',
+                'scope':'stack','slurm_overlap_requested':getattr(args,'slurm_overlap',False),'runs':[]}
+    for package, mpi in (('fftw',False),('hdf5',False),('lapack',False),('fftw',True),('hdf5',True)):
+        name = package+('-mpi' if mpi else '')
+        manifest['runs'].append({'package':name,'argument_package':package,'mpi':mpi,'status':'pending',
+            'nodes':args.nodes if mpi else 1,'ranks_per_node':getattr(args,'ranks_per_node',1) if mpi else 0,
+            'expected_workloads':WORKLOADS[name].split(',')})
+    save(out/'pilot.json',manifest)
+    print(f'Package pilot plan: {out/"pilot.json"}',flush=True)
+    try:
+        for entry in manifest['runs']:
+            entry['status'] = 'running'; save(out/'pilot.json',manifest)
+            selected_args = argparse.Namespace(**vars(args))
+            selected_args.package = entry['argument_package']; selected_args.mpi = entry['mpi']
+            started = time.monotonic()
+            try: test_one(selected_args,entry)
+            finally: entry['elapsed_seconds'] = time.monotonic()-started
+            entry['status'] = 'passed'; save(out/'pilot.json',manifest)
+        manifest['status'] = 'finished'
+    except BaseException:
+        manifest['status'] = 'failed_or_interrupted'
+        for entry in manifest['runs']:
+            if entry['status']=='running': entry['status']='failed_or_interrupted'
+            elif entry['status']=='pending': entry['status']='not_run_after_failure'
+        raise
+    finally:
+        complete = collect_pilot(out,manifest)
+    if not complete: raise RuntimeError('Pilot workload coverage is incomplete; inspect pilot.json and ReFrame reports.')
 
 def main():
     if len(sys.argv)>1 and sys.argv[1]=='--effective-flags':
@@ -510,7 +623,7 @@ def main():
         return
     parser = argparse.ArgumentParser(description='Standalone GCC hardening setup, independent package builds and ReFrame pilots.')
     subs = parser.add_subparsers(dest='command',required=True)
-    subs.add_parser('setup'); subs.add_parser('status'); subs.add_parser('logs')
+    subs.add_parser('setup'); subs.add_parser('refresh-tests'); subs.add_parser('status'); subs.add_parser('logs')
     mpi_prep = subs.add_parser('prepare-mpi',help='Stage verified MPI/UCX archives on a login node; builds use local archives only.')
     mpi_mode = mpi_prep.add_mutually_exclusive_group()
     mpi_mode.add_argument('--from-dir',metavar='DIR')
@@ -522,7 +635,10 @@ def main():
     for cmd in ('build','test'):
         p = subs.add_parser(cmd); p.add_argument('package',choices=['fftw','hdf5','lapack','all']); p.add_argument('--mpi',action='store_true')
         if cmd=='build': p.add_argument('--retry',action='store_true')
-        else: p.add_argument('--pairs',type=int,default=10); p.add_argument('--nodes',type=int,default=2)
+        else:
+            p.add_argument('--pairs',type=int,default=10); p.add_argument('--nodes',type=int,default=2)
+            p.add_argument('--ranks-per-node',type=int,choices=(1,4),default=1)
+            p.add_argument('--slurm-overlap',action='store_true')
     args = parser.parse_args()
     if sys.version_info<(3,10): raise RuntimeError('Python 3.10 or newer is required.')
     for directory in ('state','pending'): (HERE/directory).mkdir(exist_ok=True)
@@ -530,6 +646,7 @@ def main():
         try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError: raise RuntimeError('Another trial command is active in this root.')
         if args.command=='setup': setup()
+        elif args.command=='refresh-tests': refresh_tests()
         elif args.command=='prepare-tests': prepare_tests(args)
         elif args.command=='prepare-mpi': prepare_mpi(args)
         elif args.command=='build':

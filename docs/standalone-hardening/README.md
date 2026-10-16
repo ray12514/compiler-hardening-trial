@@ -747,6 +747,94 @@ Choose a production-like rank layout and adequate workload sizes before the
 long sweep, using the pilot to budget the remaining allocation time. Do not
 assume a twelve-hour reservation makes every optional case necessary or feasible.
 
+## Builds complete and MPI qualified: run the package pilot
+
+**This is the next step after both stacks pass local/inter-node qualification.**
+The communication diagnostic is finished; this stage measures the actual
+prebuilt FFTW, HDF5 and LAPACK callers against their matching reference stacks.
+Stay in the existing allocation. The bootstrap, new-trial download and
+"coming back tomorrow" sections are not additional prerequisites.
+
+First update the installed driver and refresh its measurement scripts while
+no trial command is running:
+
+```bash
+export TRIAL_ROOT="${TRIAL_ROOT:-$HOME/COMPILER_HARDENING}"
+export RUNBOOK_REPO="${RUNBOOK_REPO:-$TRIAL_ROOT/compiler-hardening-trial}"
+git -C "$RUNBOOK_REPO" pull --ff-only &&
+python3 "$RUNBOOK_REPO/scripts/install_driver.py" --trial-root "$TRIAL_ROOT" &&
+"$TRIAL_ROOT/runner/trial" refresh-tests &&
+"$TRIAL_ROOT/runner/trial" prepare-tests --check
+```
+
+`refresh-tests` regenerates only the paired harness, ReFrame definitions and
+rank guards after verifying the recorded environment/profile/qualification.
+It preserves completed packages, their identities and compiler qualification.
+No compiler probes, package builds or downloads run. If ReFrame is not prepared,
+use the existing `prepare-tests` login/staging procedure and return here.
+
+Set `IO_DIR` locally to a **dedicated directory on the shared filesystem you
+want HDF5 to measure**. Both MPI nodes need access at the same absolute path.
+Keep the private path local; it is not needed to share the headline results.
+For example, replace the placeholder with the actual scratch path:
+
+```bash
+export IO_DIR=/YOUR/SHARED/SCRATCH/hardening-package-pilot
+```
+
+For the interactive allocation where Slurm overlap passed qualification:
+
+```bash
+"$TRIAL_ROOT/runner/trial" test all --pairs 10 --nodes 2 \
+    --ranks-per-node 4 --slurm-overlap
+```
+
+This is a short **all-package pilot**, not the full host/scale campaign.
+It runs the following five sessions sequentially and stops after a failure:
+
+| Session | Pilot coverage |
+|---|---|
+| Serial FFTW | Small/large transforms, planning and startup |
+| Serial HDF5 | Contiguous/chunked I/O and startup |
+| Serial LAPACK | Small/large solves and startup |
+| MPI FFTW | Small/medium transforms and planning |
+| MPI HDF5 | Collective/independent I/O and small data |
+
+There are 16 workload/comparator cases, each with warmups and ten alternating
+full/reference process pairs. Serial cases use an allowed CPU on the current
+compute host. MPI cases use the first two allocated hosts, four bound ranks per
+node (eight total), with matching full/reference MPI/UCX and saved component
+choices. This needs four allocated cores/slots per participating node; placement
+checks run before timing. `--ranks-per-node 1` selects the qualified inter-node
+baseline instead. `--slurm-overlap` reaches both the placement probes and the
+timed private `mpirun` launches; it shares the interactive step resources and
+does not enable MPI rank oversubscription. UCX info logging is off during timing.
+
+The driver prints the primary full/reference runtime changes and intervals, and
+the pilot directory under `results/pilots/`. That directory contains:
+
+- `pilot.json`: planned sessions, elapsed seconds, completion/failure status,
+  links to ReFrame sessions and missing-workload coverage.
+- `phases.csv`: one row per completed workload and timing phase, including
+  full/reference means and standard deviations, runtime change, interval bounds,
+  node/rank layout, effective profile IDs and the source summary reference.
+
+Every session also retains ReFrame reports, raw paired CSV, summary JSON,
+dependency evidence and driver logs under its linked `results/reframe/` path.
+Partial CSV and coverage records are written even if a later session fails;
+missing cases are not zero-overhead results. These are real measurement inputs
+for spreadsheet/Python plotting; no plot is generated or benchmark value invented
+by the pilot command.
+
+Inspect correctness, completeness, runtimes and variability before the larger
+campaign. Positive runtime change means full was slower; intervals crossing zero
+leave the direction unresolved. The next campaign expands to serial cases on
+every node, additional workloads and selected MPI host groups/scales through
+[10](10-single-allocation.md). Its rounds and rank layouts remain separate
+conditions, rather than one pooled average. Choose its runtime budget using
+the pilot's recorded durations. Skip to step 4 below only when testing one
+package independently.
+
 ## 4. Test one package when it is ready
 
 For a Mellanox/RDMA system, first qualify the
@@ -780,14 +868,14 @@ For MPI, obtain a two-node allocation with at least one core per node. Start the
 
 ```bash
 export TRIAL_ROOT="$HOME/COMPILER_HARDENING"
-"$TRIAL_ROOT/runner/trial" test fftw --mpi --nodes 2
+"$TRIAL_ROOT/runner/trial" test fftw --mpi --nodes 2 --slurm-overlap
 ```
 
-MPI testing first checks placement/communication using both private stacks, then measures the selected package. It uses one rank per selected node and records actual placement. `--nodes 1` supports an initial single-node MPI check; it does not establish multi-node behavior. HDF5 MPI uses `test hdf5 --mpi --nodes 2` with `IO_DIR` set to a directory shared by the selected nodes. Run only one measurement command at a time in the allocation.
+MPI testing first checks placement/communication using both private stacks, then measures the selected package. It defaults to one rank per selected node; `--ranks-per-node 4` selects four, and actual placement is recorded. `--nodes 1` supports an initial single-node MPI check; it does not establish multi-node behavior. HDF5 MPI uses `test hdf5 --mpi --nodes 2 --slurm-overlap` with `IO_DIR` set to a directory shared by the selected nodes. Omit `--slurm-overlap` for a batch shell with no resource-holding interactive step. Run only one measurement command at a time in the allocation.
 
 ## Coming back tomorrow
 
-Set `TRIAL_ROOT` and run `"$TRIAL_ROOT/runner/trial" status`. Completed artifacts are verified. Continue with the next build or test command. If pulling more updates, repeat step 1’s installer and step 2’s setup; there is no need to rebuild an unchanged GCC.
+Set `TRIAL_ROOT` and run `"$TRIAL_ROOT/runner/trial" status`. Completed artifacts are verified. Continue with the next build or test command. After pulling updates, repeat step 1's installer. If the driver reports changed measurement recipes, run `trial refresh-tests`; follow its specific environment/profile instruction for other changes. Refreshing measurements does not rebuild GCC or packages or repeat compiler qualification.
 
 `"$TRIAL_ROOT/runner/trial" logs` lists recent step logs. Inspect a printed path with `less /path/to/log`. A failed child command returns an error to your shell and shows where it stopped. Keep interactive `set -e` off.
 

@@ -310,6 +310,8 @@ for profile in profiles:
     if not prefix.is_dir():
         raise SystemExit(f'Missing installed variant: {prefix}')
     env = os.environ.copy()
+    env.pop('UCX_PREFIX', None)  # Shell installation path, not a UCX runtime setting.
+    env.pop('UCX_LOG_LEVEL', None)  # Qualification verbosity is excluded from timings.
     dep_profile = profile if scope == 'stack' else 'full'
     runtime = ''
     expected = [str(prefix.parent)]
@@ -327,9 +329,12 @@ for profile in profiles:
         expected.append(str(mpi))
         launcher = [str(mpi/'bin/mpirun'), '-np', str(mpi_np), '--map-by',
                     os.environ.get('MPI_MAP', 'ppr:1:node'), '--bind-to', 'core',
-                    '--mca', 'pml', 'ucx', '--mca', 'btl', '^uct',
+                    '--mca', 'pml', 'ucx', '--mca', 'btl', os.environ.get('OMPI_MCA_btl','^uct'),
                     '-x', 'PATH', '-x', 'LD_LIBRARY_PATH', '-x', 'OMPI_MCA_io',
                     '-x', 'OMPI_MCA_mca_base_component_path']
+        for name in ('mtl','plm','ras','plm_slurm_args'):
+            if 'OMPI_MCA_'+name in os.environ:
+                launcher += ['--mca',name,os.environ['OMPI_MCA_'+name]]
         for name in ('UCX_TLS','UCX_NET_DEVICES','TRIAL_EXPECTED_NODES','RANKS_PER_NODE'):
             if name in os.environ: launcher += ['-x', name]
         launcher += shlex.split(os.environ.get('MPI_EXTRA_ARGS', ''))
@@ -458,7 +463,8 @@ record = {'managed_builds': managed_builds,
               'MPI_NP','MPI_MAP','SCALING_MODE','IO_DIR','CPUSET','THREAD_CPUSET',
               'TRIAL_SELECTED_HOSTS','TRIAL_ALLOCATION_MODE','TRIAL_REPEAT_SCOPE',
               'SLURM_JOB_ID','SLURM_JOB_NODELIST','SLURM_JOB_NUM_NODES','SLURM_STEP_ID',
-              'TRIAL_REGRESSION_LIMIT_PERCENT','UCX_TLS','UCX_NET_DEVICES')},
+              'TRIAL_REGRESSION_LIMIT_PERCENT','UCX_TLS','UCX_NET_DEVICES',
+              'OMPI_MCA_btl','OMPI_MCA_mtl','OMPI_MCA_plm_slurm_args')},
           'hardening_set': os.environ.get('HARDENING_SET', 'listed'),
           'fortify_level': int(os.environ.get('FORTIFY_LEVEL', '2')),
           'scope': 'consumer-pie' if consumer else scope,

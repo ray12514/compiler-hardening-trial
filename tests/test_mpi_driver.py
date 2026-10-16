@@ -88,7 +88,7 @@ test "$UCX_PREFIX" = "$TRIAL_ROOT/ucx"
             root = Path(tmp)
             driver = driver_at(root)
             (root / "bench").mkdir()
-            (root / "env.sh").write_text("unset UCX_TLS UCX_NET_DEVICES\n")
+            (root / "env.sh").write_text("unset UCX_TLS UCX_NET_DEVICES OMPI_MCA_plm_slurm_args\n")
             (root / "profiles.sh").write_text("""profile_flags() { EXE_CFLAGS=-O2; EXE_LDFLAGS=-no-pie; }
 activate_mpi_profile() {
     if test "$1" = reference; then source "$TRIAL_ROOT/mpi-env-reference.sh";
@@ -96,7 +96,9 @@ activate_mpi_profile() {
 }
 """)
             tuning = root / "rdma-runtime.sh"
-            tuning.write_text("export UCX_TLS=rc,sm,self\nunset UCX_NET_DEVICES\n")
+            tuning.write_text("export UCX_TLS=rc,sm,self\nunset UCX_NET_DEVICES\n"
+                              "export OMPI_MCA_btl='^uct,openib,ofi' OMPI_MCA_mtl='^ofi'\n"
+                              "export OMPI_MCA_plm_slurm_args='--kill-on-bad-exit=1'\n")
             for arm, name in (("full", "mpi-env.sh"), ("reference", "mpi-env-reference.sh")):
                 mpi = root / arm
                 (root / name).write_text(
@@ -108,15 +110,22 @@ done
 """)
                 executable(mpi / "bin/mpirun", f"""test "${{UCX_TLS:-missing}}" = rc,sm,self
 test -z "${{UCX_NET_DEVICES:-}}"
+test "$OMPI_MCA_plm_slurm_args" = '--kill-on-bad-exit=1 --overlap'
+case " $* " in *' -np 8 --host node1:4,node2:4 --nooversubscribe --map-by ppr:4:node '*) ;; *) exit 9;; esac
+case " $* " in *' --mca btl ^uct,openib,ofi '*) ;; *) exit 9;; esac
 printf '%s\\n' '{arm}' >> "$TRIAL_ROOT/seen-arms.txt"
 """)
             reframe = root / "tools/reframe-venv/bin/reframe"
             executable(reframe, """if test "$1" = --version; then echo 4.10.4; exit 0; fi
 test "${UCX_TLS:-missing}" = rc,sm,self
+test "$OMPI_MCA_btl" = '^uct,openib,ofi'
+test "$OMPI_MCA_plm_slurm_args" = '--kill-on-bad-exit=1 --overlap'
+test -z "${UCX_LOG_LEVEL+x}"
 echo reframe >> "$TRIAL_ROOT/seen-arms.txt"
 """)
             driver.save(driver.HERE / "qualification.json", {})
-            args = types.SimpleNamespace(package="fftw", mpi=True, nodes=2, pairs=10)
+            args = types.SimpleNamespace(package="fftw", mpi=True, nodes=2, pairs=10,
+                                         ranks_per_node=4, slurm_overlap=True)
             with patch.dict(os.environ, {"SLURM_JOB_ID": "123", "SLURM_JOB_NODELIST": "node[1-2]",
                                          "TRIAL_MPI_TUNING": str(tuning), "UCX_TLS": "tcp"}), \
                  patch.object(driver, "require_setup", return_value={}), \
