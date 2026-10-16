@@ -870,6 +870,14 @@ First audit the **existing allocation**; no package build or measurement runs:
 allocation choose scales that fit. The audit checks every allocated host by
 default. It discovers the job's effective CPU grant, physical-core topology and
 WEKA's narrow cgroup masks and/or documented `weka local resources` core table.
+Job cpuset cgroups are used when available. On task/affinity-only sites or when
+the job ancestor is hidden, it requests one dedicated inventory task per host,
+bound by Slurm to that host's allocated CPU count. It accepts the fallback only
+when task/affinity is configured, Slurm reports binding, and the observed CPU
+mask matches the requested full-capacity count. An ordinary interactive shell
+mask is never used for this fallback. Rank-slot limits are applied separately
+after service-core exclusions; 92 task slots do not mean a 96-CPU grant must be
+cut to an arbitrary 92-CPU mask before discovering WEKA's cores.
 It excludes reserved cores and their SMT siblings and uses one hardware thread
 per core. It also checks Slurm CPU/task capacity separately. With 96 physical
 cores and 92 allocated slots, `all` can mean 92 **only if** 92 safe cores are
@@ -886,6 +894,25 @@ for a JSON object mapping each short hostname to its CPU-list string. Supply
 the same option to both the audit and measurement commands. `--reserved-cpus none`
 is an explicit assertion for systems with no service-core reservation.
 [WEKA allocation guidance](https://docs.weka.io/best-practice-guides/weka-and-slurm-integration/avoid-conflicting-cpu-allocations)
+
+For `Cannot locate this Slurm job cgroup`, pull and reinstall the updated driver
+using the commands above, then repeat the audit. No package rebuild, new
+allocation or Slurm/WEKA configuration change is needed to try the updated
+discovery. The fallback still stops if a CPU grant cannot be verified.
+
+To locate WEKA's cores independently of the Slurm check, run on a compute node:
+
+```bash
+python3 "$TRIAL_ROOT/runner/production/placement.py" --show-weka
+```
+
+This prints only discovered OS CPU IDs. Common cgroup v1 files are
+`/sys/fs/cgroup/cpuset/weka-client/cpuset.cpus` and `cpuset.effective_cpus` in the
+same directory. A common v2 path is
+`/sys/fs/cgroup/weka.slice/cpuset.cpus.effective`; actual paths vary. The helper
+searches WEKA-named cgroups and the local resources table rather than assuming
+those example paths. These files identify WEKA's reservation, not Slurm's grant.
+[Slurm binding documentation](https://slurm.schedmd.com/srun.html#OPT_cpu-bind)
 
 After the audit passes, keep your existing **`IO_DIR`** pointing at the dedicated
 shared trial directory on the filesystem to measure. Run the first dense stage:

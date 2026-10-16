@@ -18,6 +18,22 @@ def libraries(text, family, prefix):
         raise RuntimeError(f'Missing/mixed {family} dependency; expected {prefix}/lib')
 
 
+def allowed_cpus(layout, row):
+    try:
+        _, allowed, _ = job_cgroup(os.environ['SLURM_JOB_ID'])
+    except RuntimeError:
+        proof = row.get('binding_proof') or {}
+        if (row.get('allocation_source')!='slurm-full-capacity-task-binding'
+            or layout.get('job_id')!=os.environ['SLURM_JOB_ID']
+            or proof.get('cpus_per_task')!=len(row.get('allowed_cpus',[]))
+            or 'task/affinity' not in proof.get('task_plugin','').split(',')
+            or proof.get('binding_type') not in ('threads','mask_cpu')
+            or not proof.get('step_id','').isdigit()):
+            raise
+        allowed = set(row['allowed_cpus'])
+    return allowed
+
+
 def main():
     layout_path, evidence_path, binary, *arguments = sys.argv[1:]
     layout = json.loads(Path(layout_path).read_text())
@@ -28,7 +44,7 @@ def main():
     if int(os.environ['OMPI_COMM_WORLD_LOCAL_SIZE']) != layout['ranks_per_node']:
         raise RuntimeError('Wrong local rank count')
     cpu = row['cpus'][local]
-    _, allowed, _ = job_cgroup(os.environ['SLURM_JOB_ID'])
+    allowed = allowed_cpus(layout,row)
     forbidden = set(row['excluded_cpus'])
     for item in row['reservation_evidence']:
         current = cpus(Path(item['path']).read_text())
@@ -69,6 +85,7 @@ def main():
             raise RuntimeError('No RC transport on this node; TCP cannot qualify')
         (Path(evidence_path)/f'ucx-rank-{rank}.log').write_text(output)
     info = {'rank': rank, 'local_rank': local, 'host': host, 'cpus': observed,
+            'allocation_source':row.get('allocation_source','slurm-job-cgroup'),
             'mpi_prefix': str(mpi), 'ucx_prefix': str(ucx),
             'memlock_bytes': resource.getrlimit(resource.RLIMIT_MEMLOCK)}
     (Path(evidence_path)/f'rank-{rank}.json').write_text(json.dumps(info)+'\n')

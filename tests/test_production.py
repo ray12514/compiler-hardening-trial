@@ -43,6 +43,42 @@ def args(**overrides):
 
 
 class PlacementTests(unittest.TestCase):
+    def test_no_job_cgroup_uses_explicit_full_capacity_slurm_task_binding(self):
+        with patch.dict(os.environ,{'SLURM_JOB_ID':'123','SLURM_STEP_ID':'7',
+                 'SLURM_LOCALID':'0','SLURM_CPUS_PER_TASK':'92','SLURM_CPU_BIND_TYPE':'threads',
+                 'TRIAL_PRODUCTION_ALLOCATION_CPUS':'92','TRIAL_PRODUCTION_TASK_PLUGIN':'task/affinity'},clear=True), \
+             patch.object(placement,'job_cgroup',side_effect=RuntimeError('Cannot locate this Slurm job cgroup. No CPU grant inferred from the shell.')), \
+             patch.object(placement,'topology',return_value=(set(range(96)),inventory()['topology'])), \
+             patch.object(placement,'memory_available',return_value=1024**4), \
+             patch.object(placement.Path,'read_text',return_value='model name : test'), \
+             patch.object(placement.os,'sched_getaffinity',return_value=set(range(92)),create=True):
+            grant=placement.inventory(reserved='19-22')
+        self.assertEqual(set(grant['allowed']),set(range(92)))
+        self.assertEqual(grant['allocation_source'],'slurm-full-capacity-task-binding')
+
+    def test_no_cgroup_never_uses_a_shell_or_undersized_task_affinity(self):
+        with patch.object(placement,'job_cgroup',side_effect=RuntimeError('Cannot locate this Slurm job cgroup')), \
+             patch.object(placement.os,'sched_getaffinity',return_value={0},create=True), \
+             patch.dict(os.environ,{'SLURM_JOB_ID':'123','SLURM_CPUS_PER_TASK':'92',
+                 'SLURM_LOCALID':'0','SLURM_STEP_ID':'7'},clear=True):
+            with self.assertRaisesRegex(RuntimeError,'full-capacity'):
+                placement.allocation_grant(92)
+            with self.assertRaisesRegex(RuntimeError,'Cannot locate'):
+                placement.allocation_grant()
+
+    def test_fallback_rejects_ignored_binding_or_interactive_shell(self):
+        base={'SLURM_JOB_ID':'123','SLURM_CPUS_PER_TASK':'92','SLURM_LOCALID':'0',
+              'SLURM_STEP_ID':'7','SLURM_CPU_BIND_TYPE':'mask_cpu:',
+              'TRIAL_PRODUCTION_TASK_PLUGIN':'task/affinity'}
+        for extra,mask in (({},set(range(96))),({'SLURM_STEP_ID':'interactive'},set(range(92))),
+                           ({'TRIAL_PRODUCTION_TASK_PLUGIN':'task/none'},set(range(92))),
+                           ({'SLURM_CPU_BIND_TYPE':'none'},set(range(92)))):
+            with self.subTest(extra=extra,mask_size=len(mask)), patch.dict(os.environ,base|extra,clear=True), \
+                 patch.object(placement,'job_cgroup',side_effect=RuntimeError('Cannot locate this Slurm job cgroup')), \
+                 patch.object(placement.os,'sched_getaffinity',return_value=mask,create=True), \
+                 self.assertRaisesRegex(RuntimeError,'full-capacity'):
+                placement.allocation_grant(92)
+
     def test_92_slot_job_with_full_mask_can_use_92_safe_cores(self):
         info = {'a':inventory(),'b':inventory('b')}
         layout = placement.make_layout(info,['a','b'],'all',{'a':92,'b':92},184)
@@ -113,14 +149,59 @@ class PlacementTests(unittest.TestCase):
                 placement.weka_masks(set(range(96)),root)
             path.write_text('19-22')
             self.assertEqual(placement.weka_masks(set(range(96)),root)[0],{19,20,21,22})
+            path.unlink()
+            (service/'cpuset.cpus').write_text('19-22')
+            self.assertEqual(placement.weka_masks(set(range(96)),root)[0],{19,20,21,22})
 
     def test_resource_parser_reads_core_ids_without_network_or_management_fields(self):
         text='ROLES       NODE ID  CORE ID\nMANAGEMENT  0        <auto>\nFRONTEND    1        19\nFRONTEND    2        20\n\nNET DEVICE IDENTIFIER\nFRONTEND 123 999\n'
         self.assertEqual(placement.resource_cpus(text),{19,20})
         self.assertEqual(placement.resource_cpus('unknown output 19 20'),set())
 
+    def test_weka_only_lookup_does_not_require_a_slurm_cgroup(self):
+        output=io.StringIO()
+        with patch.object(sys,'argv',['placement.py','--show-weka']), \
+             patch.object(placement,'topology',return_value=(set(range(96)),{})), \
+             patch.object(placement,'weka_resources',return_value={21}), \
+             patch.object(placement,'weka_masks',return_value=({19,20},[])), \
+             patch.object(placement,'job_cgroup') as job, contextlib.redirect_stdout(output):
+            placement.main()
+        job.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue()),{'weka_os_cpus':[19,20,21]})
+
 
 class CampaignTests(unittest.TestCase):
+    def test_audit_requests_full_capacity_and_reaches_inventory_without_cgroups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out=Path(tmp); seen=[]
+            def run(command,env,folder,timeout,deadline):
+                self.assertIn('--cpus-per-task=96',command)
+                self.assertIn('--cpu-bind=verbose,threads',command)
+                self.assertIn('--overlap',command)
+                self.assertNotIn('SLURM_CPU_BIND_LIST',env)
+                self.assertNotIn('SLURM_TRES_PER_TASK',env)
+                host=next(v.split('=',1)[1] for v in command if v.startswith('--nodelist='))
+                child=env|{'SLURM_STEP_ID':'7','SLURM_LOCALID':'0','SLURM_CPUS_PER_TASK':'96',
+                           'SLURM_CPU_BIND_TYPE':'mask_cpu:'}
+                with patch.dict(os.environ,child,clear=True), \
+                     patch.object(placement,'job_cgroup',side_effect=RuntimeError('Cannot locate this Slurm job cgroup')), \
+                     patch.object(placement,'topology',return_value=(set(range(96)),inventory()['topology'])), \
+                     patch.object(placement,'memory_available',return_value=1024**4), \
+                     patch.object(placement.Path,'read_text',return_value='model name : test'), \
+                     patch.object(placement.os,'sched_getaffinity',return_value=set(range(96)),create=True), \
+                     patch.object(placement.socket,'gethostname',return_value=host):
+                    value=placement.inventory('19-22')
+                (out/'inventory'/f'{host}.json').write_text(json.dumps(value))
+                seen.append(host)
+            with patch.dict(os.environ,{'SLURM_JOB_ID':'123','SLURM_CPU_BIND_LIST':'old',
+                    'SLURM_TRES_PER_TASK':'cpu=1','SLURM_JOB_CPUS_PER_NODE':'96(x2)'}), \
+                 patch.object(campaign.subprocess,'check_output',return_value='TaskPlugin = task/affinity\n'), \
+                 patch.object(campaign,'run',side_effect=run):
+                values=campaign.audit(args(reserved_cpus='19-22'),out,['a','b'],100,{'a':92,'b':92})
+            self.assertEqual(seen,['a','b'])
+            layout=placement.make_layout(values,['a','b'],'all',{'a':92,'b':92},184)
+            self.assertEqual(layout['ranks_per_node'],92)
+            self.assertEqual(layout['hosts']['a']['allocation_source'],'slurm-full-capacity-task-binding')
     def test_host_groups_are_bounded_and_do_not_repeat_full_allocation(self):
         hosts=list('abcdefgh')
         self.assertEqual(campaign.host_groups(hosts,2,2),[['a','b'],['c','d']])
@@ -237,6 +318,16 @@ class CampaignTests(unittest.TestCase):
 
 
 class RankGuardTests(unittest.TestCase):
+    def test_missing_cgroup_uses_audited_binding_only_for_same_job(self):
+        row={'allocation_source':'slurm-full-capacity-task-binding','allowed_cpus':[7,9],
+             'binding_proof':{'step_id':'7','cpus_per_task':2,'task_plugin':'task/affinity','binding_type':'mask_cpu'}}
+        with patch.dict(os.environ,{'SLURM_JOB_ID':'123'}), \
+             patch.object(production_rank,'job_cgroup',side_effect=RuntimeError('Cannot locate this Slurm job cgroup')):
+            self.assertEqual(production_rank.allowed_cpus({'job_id':'123'},row),{7,9})
+            with self.assertRaisesRegex(RuntimeError,'Cannot locate'):
+                production_rank.allowed_cpus({'job_id':'another-job'},row)
+            with self.assertRaisesRegex(RuntimeError,'Cannot locate'):
+                production_rank.allowed_cpus({'job_id':'123'},dict(row,binding_proof={}))
     def test_guard_applies_exact_os_cpu_and_keeps_threads_on_one_core(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); layout=root/'layout.json'

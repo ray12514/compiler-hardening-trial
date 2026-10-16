@@ -139,25 +139,48 @@ def runtime(root, arm, overlap):
     return env
 
 
-def audit(args, out, hosts, deadline):
+def audit(args, out, hosts, deadline, cpu_counts):
     folder = out/'inventory'
     folder.mkdir()
-    command = ['srun','--mpi=none','--nodes='+str(len(hosts)), '--ntasks='+str(len(hosts)),
-               '--ntasks-per-node=1','--cpus-per-task=1','--cpu-bind=none','--exact',
-               '--nodelist='+','.join(hosts)]
-    if args.slurm_overlap:
-        command.append('--overlap')
-    command += [sys.executable,str(HERE/'placement.py'),'--out',str(folder)]
-    if args.reserved_cpus is not None:
-        command += ['--reserved-cpus',args.reserved_cpus]
-    if args.reservations:
-        command += ['--reservations',str(Path(args.reservations).expanduser().resolve())]
-    run(command,os.environ.copy(),out/'audit',args.timeout,deadline)
+    allocation_counts = cpu_counts
+    if os.environ.get('SLURM_JOB_CPUS_PER_NODE'):
+        raw = expand_counts(os.environ['SLURM_JOB_CPUS_PER_NODE'])
+        if len(raw)!=len(cpu_counts):
+            raise RuntimeError('Allocation CPU counts changed before inventory')
+        # Inventory the actual CPU grant before applying the rank-slot cap.
+        allocation_counts = dict(zip(cpu_counts,raw))
+    try:
+        config = subprocess.check_output(['scontrol','show','config'],text=True,timeout=15)
+        match = re.search(r'^\s*TaskPlugin\s*=\s*(\S+)',config,re.M)
+        plugin = match[1] if match else ''
+    except (OSError,subprocess.SubprocessError):
+        plugin = ''
+    # A whole-capacity task supplies actual OS CPU IDs even on task/affinity-only
+    # sites. This is not an inference from the interactive shell's binding.
+    for index,host in enumerate(hosts):
+        count = allocation_counts[host]
+        command = ['srun','--mpi=none','--nodes=1','--ntasks=1','--ntasks-per-node=1',
+                   '--cpus-per-task='+str(count),'--cpu-bind=verbose,threads','--exact',
+                   '--nodelist='+host,'--export=ALL']
+        if args.slurm_overlap:
+            command.append('--overlap')
+        command += [sys.executable,str(HERE/'placement.py'),'--out',str(folder)]
+        if args.reserved_cpus is not None:
+            command += ['--reserved-cpus',args.reserved_cpus]
+        if args.reservations:
+            command += ['--reservations',str(Path(args.reservations).expanduser().resolve())]
+        child = os.environ.copy()
+        for key in ('SLURM_CPU_BIND','SLURM_CPU_BIND_LIST','SLURM_CPU_BIND_TYPE',
+                    'SLURM_CPU_BIND_VERBOSE','SLURM_CPUS_PER_TASK','SLURM_TRES_PER_TASK'):
+            child.pop(key,None)
+        child.update(TRIAL_PRODUCTION_ALLOCATION_CPUS=str(count),TRIAL_PRODUCTION_TASK_PLUGIN=plugin)
+        run(command,child,out/'audit'/f'node-{index}',args.timeout,deadline)
     infos = {}
     for host in hosts:
         path = folder/f'{host}.json'
         if not path.is_file():
-            raise RuntimeError('Missing per-host CPU inventory; inspect audit/command.log')
+            log = out/'audit'/f'node-{hosts.index(host)}'/'command.log'
+            raise RuntimeError(f'Missing per-host CPU inventory; inspect {log}')
         info = json.loads(path.read_text())
         if info['job_id'] != os.environ['SLURM_JOB_ID'] or info['host'] != host:
             raise RuntimeError('Inventory host/job identity mismatch')
@@ -379,13 +402,14 @@ def campaign(driver, args):
     save(out/'manifest.json',manifest)
     print(f'Production results (private inventory stays local): {out}',flush=True)
     try:
-        infos = audit(args,out,selected,deadline)
+        infos = audit(args,out,selected,deadline,cpu_counts)
         safe_inventory = []
         for index,host in enumerate(selected):
             info = infos[host]
             candidates,_ = eligible(info)
             safe_inventory.append({'node_alias':f'node-{index}',
                 'physical_cores':len({(v['socket'],v['core']) for v in info['topology'].values()}),
+                'allocation_source':info.get('allocation_source','slurm-job-cgroup'),
                 'job_allowed_os_cpus':len(info['allowed']),'eligible_physical_cores':len(candidates),
                 'allocation_cpu_slot_cap':cpu_counts[host]})
         save(out/'shareable-inventory.json',safe_inventory)

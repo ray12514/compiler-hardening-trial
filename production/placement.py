@@ -47,7 +47,7 @@ def job_cgroup(job, proc=Path('/proc'), mounts=None):
             continue
         parts = Path(relative).parts[1:]
         for i, part in enumerate(parts):
-            if part in (f'job_{job}', f'job{job}'):
+            if re.fullmatch(r'(?:job_?|slurm-job_)'+re.escape(job)+r'(?:\.(?:scope|slice))?',part):
                 ancestor = Path('/').joinpath(*parts[:i+1])
                 if mounts is not None:
                     base = mounts / 'cpuset' if controllers else mounts
@@ -73,6 +73,32 @@ def job_cgroup(job, proc=Path('/proc'), mounts=None):
                 return directory, mask, path
     raise RuntimeError('Cannot locate this Slurm job cgroup. No CPU grant inferred from the shell. '
                        'Check site cgroup support before the dense campaign.')
+
+
+def allocation_grant(expected=None):
+    """Prefer the job cpuset; otherwise accept only a dedicated Slurm-bound audit task."""
+    try:
+        directory,mask,path = job_cgroup(os.environ['SLURM_JOB_ID'])
+        return {'directory':directory,'allowed':sorted(mask),'path':str(path),
+                'source':'slurm-job-cgroup','binding_proof':None}
+    except RuntimeError:
+        if expected is None:
+            raise
+    kind = os.environ.get('SLURM_CPU_BIND_TYPE','').strip().split(':')[0]
+    mask = sorted(os.sched_getaffinity(0))
+    if (expected<1 or os.environ.get('SLURM_CPUS_PER_TASK')!=str(expected)
+        or not os.environ.get('SLURM_STEP_ID','').isdigit()
+        or os.environ.get('SLURM_LOCALID')!='0'
+        or 'task/affinity' not in os.environ.get('TRIAL_PRODUCTION_TASK_PLUGIN','').split(',')
+        or kind not in ('threads','mask_cpu') or len(mask)!=expected):
+        raise RuntimeError('Cannot verify a full-capacity Slurm task binding. The inventory task '
+                           'must receive the requested allocated CPU count with task/affinity and '
+                           'thread binding. Shell affinity and online CPU counts were not used as a grant.')
+    return {'directory':None,'allowed':mask,'path':None,
+            'source':'slurm-full-capacity-task-binding',
+            'binding_proof':{'step_id':os.environ['SLURM_STEP_ID'],'cpus_per_task':expected,
+                             'task_plugin':os.environ['TRIAL_PRODUCTION_TASK_PLUGIN'],
+                             'binding_type':kind}}
 
 
 def topology(base=Path('/sys/devices/system/cpu')):
@@ -131,7 +157,7 @@ def weka_masks(online, mounts=Path('/sys/fs/cgroup')):
             dirs[:] = []
         if not named:
             continue
-        for name in ('cpuset.cpus.effective', 'cpuset.effective_cpus'):
+        for name in ('cpuset.cpus.effective', 'cpuset.effective_cpus', 'cpuset.cpus'):
             if name not in files:
                 continue
             file = path / name
@@ -154,8 +180,8 @@ def memory_available(job_dir, proc=Path('/proc')):
     limits = [int(match[1]) * 1024]
     # For cgroup v2 the job ancestor gives the job memory envelope. For v1,
     # use its corresponding memory-controller directory if present.
-    memory_dir = job_dir
-    if '/cpuset/' in str(job_dir):
+    memory_dir = job_dir or Path('/sys/fs/cgroup')
+    if job_dir is not None and '/cpuset/' in str(job_dir):
         memory_dir = Path(str(job_dir).replace('/cpuset/', '/memory/', 1))
     for directory in (memory_dir, *memory_dir.parents):
         for limit, used in (('memory.max', 'memory.current'),
@@ -170,7 +196,8 @@ def memory_available(job_dir, proc=Path('/proc')):
 
 def inventory(reserved=None):
     online, cores = topology()
-    directory, allowed, path = job_cgroup(os.environ['SLURM_JOB_ID'])
+    requested = os.environ.get('TRIAL_PRODUCTION_ALLOCATION_CPUS')
+    grant = allocation_grant(int(requested) if requested else None)
     if reserved is None:
         resource_ids = weka_resources()
         try:
@@ -194,11 +221,12 @@ def inventory(reserved=None):
                 'physical_core_count':len({(v['socket'],v['core']) for v in cores.values()})}
     return {'host': socket.gethostname().split('.')[0], 'job_id': os.environ['SLURM_JOB_ID'],
             'hardware':hardware,
-            'online': sorted(online), 'allowed': sorted(allowed),
-            'job_cpuset_file': str(path), 'reserved': sorted(excluded),
+            'online': sorted(online), 'allowed': grant['allowed'],
+            'allocation_source':grant['source'],'binding_proof':grant['binding_proof'],
+            'job_cpuset_file': grant['path'], 'reserved': sorted(excluded),
             'reservation_source': source, 'reservation_evidence': evidence,
             'weka_resource_cpus': sorted(resource_ids),
-            'topology': cores, 'available_memory_bytes': memory_available(directory)}
+            'topology': cores, 'available_memory_bytes': memory_available(grant['directory'])}
 
 
 def eligible(info):
@@ -231,6 +259,9 @@ def make_layout(infos, hosts, rpn, cpu_counts, task_limit):
         limit = min(len(candidates), cpu_counts[host])
         available[host] = {'eligible_cpus': candidates, 'excluded_cpus': forbidden,
                            'capacity': limit, 'job_cpuset_file': info['job_cpuset_file'],
+                           'allowed_cpus':info['allowed'],
+                           'allocation_source':info.get('allocation_source','slurm-job-cgroup'),
+                           'binding_proof':info.get('binding_proof'),
                            'reservation_evidence': info['reservation_evidence'],
                            'reservation_source': info.get('reservation_source','operator-verified-os-cpu-list'),
                            'weka_resource_cpus': info.get('weka_resource_cpus',[]),
@@ -248,10 +279,24 @@ def make_layout(infos, hosts, rpn, cpu_counts, task_limit):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--out', type=Path)
+    parser.add_argument('--show-weka',action='store_true',help='Print only discovered service CPU IDs; no Slurm job needed')
     parser.add_argument('--reserved-cpus')
     parser.add_argument('--reservations', type=Path)
     args = parser.parse_args()
+    if args.show_weka:
+        online,_ = topology()
+        resource_ids = weka_resources()
+        try:
+            mask,_ = weka_masks(online)
+        except RuntimeError:
+            if not resource_ids:
+                raise
+            mask = set()
+        print(json.dumps({'weka_os_cpus':sorted(mask|resource_ids)},indent=2))
+        return
+    if args.out is None:
+        parser.error('--out is required for allocation inventory')
     reserved = args.reserved_cpus
     if args.reservations:
         values = json.loads(args.reservations.read_text())
