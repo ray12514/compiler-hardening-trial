@@ -55,6 +55,29 @@ CODE
                          'OMPI_MCA_btl': '^uct,openib,ofi', 'OMPI_MCA_mtl': '^ofi'}
         return envs
 
+    def test_interactive_overlap_reaches_slurm_without_rank_oversubscription(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            envs = self.fixture(root)
+            for env in envs.values():
+                env['OMPI_MCA_plm_slurm_args'] = '--kill-on-bad-exit=1'
+            with patch.dict(os.environ, {'SLURM_JOB_ID': '123'}), \
+                 patch.object(qualification, 'activated_env', side_effect=lambda root, arm: (envs[arm].copy(), 'saved')), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                out = qualification.qualify(root, ['node2', 'node7'], 1, 3, slurm_overlap=True)
+            report = json.loads((out / 'report.json').read_text())
+            self.assertTrue(report['slurm_overlap_requested'])
+            for arm in ('full', 'reference'):
+                settings = report['arms'][arm]['runtime_settings']
+                self.assertEqual(settings['OMPI_MCA_plm_slurm_args'], '--kill-on-bad-exit=1 --overlap')
+                for case in report['arms'][arm]['cases']:
+                    command = case['command']
+                    index = command.index('plm_slurm_args')
+                    self.assertEqual(command[index + 1], '--kill-on-bad-exit=1 --overlap')
+                    self.assertIn('--nooversubscribe', command)
+                    self.assertEqual(command[command.index('--bind-to') + 1], 'core')
+            self.assertEqual(envs['full']['OMPI_MCA_plm_slurm_args'], '--kill-on-bad-exit=1')
+
     def test_both_arms_local_and_selected_nodes_keep_saved_settings_and_builds(self):
         for rpn in (1, 4):
             with self.subTest(rpn=rpn), tempfile.TemporaryDirectory() as tmp:

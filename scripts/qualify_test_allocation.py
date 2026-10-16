@@ -100,7 +100,7 @@ def check_placement(output, hosts, ranks_per_node):
         raise RuntimeError('Ranks did not use the selected hosts/layout')
 
 
-def qualify(root, hosts, ranks_per_node, timeout):
+def qualify(root, hosts, ranks_per_node, timeout, slurm_overlap=False):
     parent = root / 'results/diagnostics'
     parent.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
@@ -109,7 +109,8 @@ def qualify(root, hosts, ranks_per_node, timeout):
     report = {'qualification_only': True, 'job_id': os.environ['SLURM_JOB_ID'], 'hosts': hosts,
               'allocation': allocation_context(),
               'job': run(['scontrol', 'show', 'job', os.environ['SLURM_JOB_ID']], timeout=10),
-              'ranks_per_node': ranks_per_node, 'arms': {}, 'passed': False,
+              'ranks_per_node': ranks_per_node, 'slurm_overlap_requested': slurm_overlap,
+              'arms': {}, 'passed': False,
               'scope': 'Selected hosts/layout only; no overhead estimate or whole-allocation qualification.'}
     previous = None
     try:
@@ -117,6 +118,14 @@ def qualify(root, hosts, ranks_per_node, timeout):
             env, note = activated_env(root, arm)
             if env is None:
                 raise RuntimeError(note)
+            if slurm_overlap:
+                # Open MPI 4.1.x appends plm_slurm_args to its actual srun command.
+                # Sharing an interactive shell's Slurm step does not authorize
+                # extra MPI ranks per core; retain binding/nooversubscribe below.
+                arguments = env.get('OMPI_MCA_plm_slurm_args', '').split()
+                if '--overlap' not in arguments:
+                    arguments.append('--overlap')
+                env['OMPI_MCA_plm_slurm_args'] = ' '.join(arguments)
             validate_runtime(env)
             settings = selected_env(env)
             comparable = {k: v for k, v in settings.items() if k not in ('UCX_LOG_LEVEL', 'TRIAL_MPI_TUNING')}
@@ -146,7 +155,7 @@ def qualify(root, hosts, ranks_per_node, timeout):
                            '--host', ','.join(f'{h}:{rpn}' for h in selected),
                            '--map-by', f'ppr:{rpn}:node', '--bind-to', 'core', '--report-bindings',
                            '--nooversubscribe', '--mca', 'pml', 'ucx']
-                for name in ('btl', 'mtl', 'plm', 'ras'):
+                for name in ('btl', 'mtl', 'plm', 'ras', 'plm_slurm_args'):
                     if 'OMPI_MCA_' + name in env:
                         command += ['--mca', name, env['OMPI_MCA_' + name]]
                 for name in ('PATH', 'LD_LIBRARY_PATH', 'TRIAL_MPI_PREFIX', 'TRIAL_UCX_PREFIX', 'UCX_LOG_LEVEL'):
@@ -185,6 +194,8 @@ def main():
                         default=Path(os.environ.get('TRIAL_ROOT', str(Path.home() / 'COMPILER_HARDENING'))))
     parser.add_argument('--hosts', help='Comma-separated allocated hosts; default is the first two')
     parser.add_argument('--ranks-per-node', type=int, choices=(1, 4), default=1)
+    parser.add_argument('--slurm-overlap', action='store_true',
+                        help="Pass --overlap to Open MPI's srun steps when an interactive shell holds resources")
     parser.add_argument('--timeout', type=int, default=90, help='Seconds per compile/launch, 1-300')
     args = parser.parse_args()
     try:
@@ -202,12 +213,14 @@ def main():
         if socket.gethostname().split('.')[0] not in {h.split('.')[0] for h in hosts}:
             raise RuntimeError('Enter an allocated compute-node shell first')
         print(f'Allocated hosts: {",".join(hosts)}\nSelected hosts: {",".join(selected)}', flush=True)
+        if args.slurm_overlap:
+            print('Slurm step overlap enabled; MPI ranks remain core-bound with --nooversubscribe.', flush=True)
         with (root / 'runner/lock').open('a') as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise RuntimeError('A trial command is active; wait for it to finish') from None
-            qualify(root, selected, args.ranks_per_node, args.timeout)
+            qualify(root, selected, args.ranks_per_node, args.timeout, args.slurm_overlap)
     except (RuntimeError, OSError, KeyError, ValueError, subprocess.SubprocessError) as error:
         parser.exit(1, f'ERROR: {error}\n')
 

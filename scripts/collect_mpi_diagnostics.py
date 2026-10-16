@@ -17,7 +17,7 @@ import tempfile
 ENV_KEYS = (
     "UCX_TLS", "UCX_NET_DEVICES", "UCX_IB_GID_INDEX", "UCX_IB_SL",
     "UCX_IB_TRAFFIC_CLASS", "UCX_LOG_LEVEL", "OMPI_MCA_pml", "OMPI_MCA_btl", "OMPI_MCA_mtl",
-    "OMPI_MCA_plm", "OMPI_MCA_ras", "TRIAL_MPI_TUNING",
+    "OMPI_MCA_plm", "OMPI_MCA_ras", "OMPI_MCA_plm_slurm_args", "TRIAL_MPI_TUNING",
 )
 
 

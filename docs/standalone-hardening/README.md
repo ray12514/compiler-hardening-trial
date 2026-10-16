@@ -659,7 +659,8 @@ required modules loaded:
 
 ```bash
 "$TRIAL_ROOT/runner/trial" status &&
-python3 "$RUNBOOK_REPO/scripts/qualify_test_allocation.py" --trial-root "$TRIAL_ROOT"
+python3 "$RUNBOOK_REPO/scripts/qualify_test_allocation.py" --trial-root "$TRIAL_ROOT" \
+    --slurm-overlap
 ```
 
 This communication gate does not require ReFrame. Before the subsequent package
@@ -685,8 +686,16 @@ Both participating nodes need at least two allocated core/slot resources for
 the local check. A launch/slot/binding failure stops the sequence; inspect the
 evidence rather than adding oversubscription to a measurement run. Each compile
 or launch is bounded to 90 seconds by default. Slurm's resource-holding
-interactive step can affect nested launches; this is why placement and launch
-behavior are qualified in this actual allocation first. See the
+interactive step can affect nested launches. The `--slurm-overlap` option above
+adds `--overlap` to Open MPI's actual `srun` launch steps through
+`--mca plm_slurm_args`, preserving any existing custom Slurm arguments.
+This permits sharing the interactive shell's step resources; it is separate
+from Open MPI rank-slot oversubscription. Rank binding and
+`--nooversubscribe` remain in effect. Omit `--slurm-overlap` in an ordinary batch
+shell with no resource-holding interactive step. This option changes only this
+qualification process, not saved MPI settings or later campaign launches.
+This is why placement and launch behavior are qualified in this actual
+allocation first. See the
 [Slurm interactive-step guidance](https://slurm.schedmd.com/faq.html) and
 [UCX transport selection](https://openucx.readthedocs.io/en/master/faq.html#selecting-networks-and-transports).
 
