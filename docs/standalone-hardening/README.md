@@ -835,7 +835,7 @@ conditions, rather than one pooled average. Choose its runtime budget using
 the pilot's recorded durations. Skip to step 4 below only when testing one
 package independently.
 
-## After the pilot: implement production-density workloads
+## After the pilot: run production-density workloads
 
 The low-rank package pilot establishes runnable full/reference comparisons.
 The next assessment must also exercise the cores allocated to a production job,
@@ -844,13 +844,143 @@ a long-lived process. The existing one-/four-rank layouts and small datasets
 are screening cases; increasing only their node count does not provide that
 coverage.
 
-Follow [14 — production workload implementation plan](14-production-workload-plan.md)
-for the next implementation phase. It specifies capacity discovery, new matched
-full/reference callers, sustained FFT and HDF5 cases, an iteration/checkpoint
-mini-application, a bounded dense-rank campaign and measured whole-job impact.
-It is a plan: the new workloads and full-core runner are not implemented by the
-current `trial test all` command. Existing pilot artifacts and results remain
-unchanged.
+Use **`trial production`** for this stage. It reuses the completed libraries and
+compiles two new matched callers under separate identities. It does not rebuild
+packages or replace the existing pilot callers. Package pilots still use
+ReFrame; the production controller launches its sustained callers directly with
+the private `mpirun` and exports CSV/JSON plus an offline HTML dashboard.
+
+Wait for the current trial command to finish, then update the installed driver:
+
+```bash
+export TRIAL_ROOT="$HOME/COMPILER_HARDENING"
+export RUNBOOK_REPO="$TRIAL_ROOT/compiler-hardening-trial"
+git -C "$RUNBOOK_REPO" pull --ff-only
+python3 "$RUNBOOK_REPO/scripts/install_driver.py" --trial-root "$TRIAL_ROOT"
+```
+
+First audit the **existing allocation**; no package build or measurement runs:
+
+```bash
+"$TRIAL_ROOT/runner/trial" production --audit-only \
+  --nodes 2,4,8 --ranks-per-node 16,32,all --slurm-overlap
+```
+
+`--nodes` lists the scales to test, not a new allocation request. On another
+allocation choose scales that fit. The audit checks every allocated host by
+default. It discovers the job's effective CPU grant, physical-core topology and
+WEKA's narrow cgroup masks and/or documented `weka local resources` core table.
+It excludes reserved cores and their SMT siblings and uses one hardware thread
+per core. It also checks Slurm CPU/task capacity separately. With 96 physical
+cores and 92 allocated slots, `all` can mean 92 **only if** 92 safe cores are
+actually granted. If the job's 92-CPU mask still includes four WEKA cores,
+`all` means 88; the other hardware cores cannot be reclaimed outside the grant.
+Each group uses the smallest verified per-node capacity for an equal layout.
+
+If WEKA's reservation cannot be resolved, the audit stops and retains its log.
+Inspect the local client resource assignments and effective cgroup masks; do not
+send the full system inventory or assume the tentative 19–22 range. After
+verifying **OS CPU IDs** on every selected node, use `--reserved-cpus VERIFIED_LIST`
+for an identical reservation, or `--reservations /absolute/private/reservations.json`
+for a JSON object mapping each short hostname to its CPU-list string. Supply
+the same option to both the audit and measurement commands. `--reserved-cpus none`
+is an explicit assertion for systems with no service-core reservation.
+[WEKA allocation guidance](https://docs.weka.io/best-practice-guides/weka-and-slurm-integration/avoid-conflicting-cpu-allocations)
+
+After the audit passes, keep your existing **`IO_DIR`** pointing at the dedicated
+shared trial directory on the filesystem to measure. Run the first dense stage:
+
+```bash
+: "${IO_DIR:?Keep IO_DIR set to the existing shared trial I/O directory}"
+"$TRIAL_ROOT/runner/trial" production --nodes 2 --ranks-per-node 16 \
+  --pairs 10 --target-seconds 30 --budget-minutes 90 --slurm-overlap
+```
+
+This runs four conditions: sustained forward/operator/inverse FFT with reused
+plans; repeated collective HDF5 checkpoints; repeated independent HDF5
+checkpoints; and an FFT loop with a checkpoint every four iterations. Both
+stacks first pass communication qualification at the requested density. Each
+condition preflights FFT slab sizes, memory and storage, calibrates both arms,
+freezes equal iteration counts and uses balanced randomized full/reference
+process-pair order. All numerical libraries and OpenMP use one thread per rank.
+
+MPI uses `mpirun --nooversubscribe`; a rank wrapper applies the explicit per-host
+OS CPU binding and verifies it before executing the caller. Open MPI's own
+binding is disabled to avoid mixing its logical indexes with OS CPU IDs.
+`--slurm-overlap` reaches Open MPI's internal Slurm launch, as in the qualified
+interactive session. The one-task-per-node inventory uses `srun --overlap` too.
+Neither enables MPI rank/core sharing. Any rejected binding stops the run.
+
+The default data target is 8 MiB per FFT rank, rounded up to balanced slab
+geometry, and 8 MiB per rank per standalone HDF5 checkpoint. These can be raised
+with `--fft-mib-per-rank` and `--io-mib-per-rank`. The default loop cap is 512
+iterations; achieved times can be shorter than the calibration target at that
+cap or the I/O budget cap. The controller shares its remaining logical-write
+allowance across remaining I/O conditions and freezes any resulting lower step
+count equally for both arms. Default memory use is limited to 25% of observed available/job memory,
+including a 256 MiB/rank planning/runtime reserve; peak RSS is checked too.
+One checkpoint is retained per active invocation, capped at 8 GiB, with a
+1 TiB cumulative logical-write budget including calibration. Increase those
+explicit budgets only when the intended filesystem/workload can support them.
+The timed I/O includes global flush and close; a final warm restart read checks
+correctness outside timing. This does not measure cold reads or certify
+physical-media durability.
+
+If the first dense stage passes, increase density on two nodes:
+
+```bash
+"$TRIAL_ROOT/runner/trial" production --nodes 2 --ranks-per-node 32,all \
+  --pairs 10 --target-seconds 30 --budget-minutes 120 --slurm-overlap
+```
+
+Then, if the remaining allocation time and observed memory/I/O costs permit:
+
+```bash
+"$TRIAL_ROOT/runner/trial" production --nodes 4,8 --ranks-per-node all \
+  --pairs 10 --target-seconds 30 --budget-minutes 120 --slurm-overlap
+```
+
+The controller stops at its walltime budget or the Slurm time remaining minus
+a two-minute cleanup margin. Unfinished conditions/pairs stay explicitly
+partial; a timeout or correctness/placement failure stops further conditions.
+It does not resume an old campaign silently. Inspect the saved status before
+deciding which new command to run. Logical-write budget exhaustion also retains
+partial results; no further I/O is launched.
+
+Use `--groups-per-scale 2` for up to two rotated host groups at each scale, or
+`--hosts` for an ordered allocation subset. Host-group results remain separate;
+the default uses the first group only. Default FFT geometry scales volume with
+rank count; standalone HDF5 holds bytes per rank constant. For a separate
+strong-scaling FFT experiment use the same `--shape NX,NY,NZ` at every scale;
+both slab distributions must be balanced and fit every selected layout.
+
+The printed `results/production/TIMESTAMP/` contains:
+
+- **`report.html`**: offline quick-look graph and table, with percent change and
+  paired 95% bootstrap intervals. Positive means full is slower.
+- **`summary.csv` / `summary.json`**: completed-pair means, variation, absolute
+  seconds and percent differences. Incomplete pairs are excluded from estimates.
+- **`pairs.csv`, `iterations.csv`, `io-modes.csv`**: raw process/loop timing,
+  iteration/checkpoint trends, peak RSS and actual HDF5 mode/fallback causes on
+  every rank. Mode values are HDF5 enums, not the requested mode alone.
+- **`manifest.json`, layouts, inventory and per-launch folders**: private system
+  evidence, exact inputs, effective profile/build identities, frozen core maps,
+  launch logs, observed affinities and raw caller JSON. Keep these local.
+- **`shareable-inventory.json`**: per-node aliases and CPU/core capacity counts,
+  without hostnames, CPU IDs, hardware model or private paths.
+
+CSV and HTML omit hostnames and installation paths. Rebuild analysis without
+Slurm or rerunning measurements with
+`trial production --report /absolute/path/to/results/production/TIMESTAMP`.
+Whole-loop walltime is measured directly; process elapsed time also includes
+launch, guards, planning and validation. Per-iteration maxima are descriptive,
+and must not be summed into a purported observed job critical path. Ten pairs
+are a pilot; confirmation still needs a predeclared meaningful threshold,
+adequate precision and independent allocations. This mini-application does not
+replace a representative CFD/application run.
+
+The [implementation and acceptance plan](14-production-workload-plan.md) records
+the broader assessment and later application-confirmation gate.
 
 The current scope stays **complete hardened stack versus complete reference**.
 Individual compiler-flag removals and package/component attribution are deferred

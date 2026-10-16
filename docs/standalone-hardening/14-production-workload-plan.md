@@ -1,6 +1,8 @@
 # Production workload comparison: implementation plan
 
-Status: planned; this document does not add runnable benchmark commands.
+Status: the first production runner and sustained callers are implemented;
+target Slurm/WEKA/fabric qualification and production measurements remain to run.
+Use the [runnable workflow](README.md#after-the-pilot-run-production-density-workloads).
 Scope agreed: 2026-10-16; complete-profile production assessment before attribution.
 The existing package pilot is a screening and qualification stage. The next stage
 will compare the complete hardened stack with its complete reference using dense
@@ -26,8 +28,9 @@ performance measurements alone cannot decide whether a protection is worthwhile.
 
 ## 2. P0: remove limits before increasing rank density
 
-The current [MPI callers](05-parallel.md) and [driver](13-driver.md) are insufficient
-for a production-density campaign:
+The screening [MPI callers](05-parallel.md) and `trial test` retain their original
+limits. The separate `trial production` command addresses these gaps without
+changing those completed build identities:
 
 | Current behavior | Required change |
 |---|---|
@@ -62,8 +65,8 @@ hardware resources and supports explicit mapping/binding and binding reports.
 
 For the first density progression, use **16, then 32, then all eligible physical
 cores per node**, subject to allocation capacity, FFT geometry, memory and run
-budget. These are planned layouts; the current driver still accepts only one or
-four ranks per node. The primary dense lane should eventually use the production
+budget. `trial production` accepts these counts and `all`; the screening
+`trial test` command still accepts only one or four. The primary dense lane uses the production
 core budget rather than stop at 16 ranks. If 92 physical cores are already usable
 by the job after reservations, the final target is 92 ranks per node. If 92 is the
 hardware count before reservations, determine the smaller eligible count first.

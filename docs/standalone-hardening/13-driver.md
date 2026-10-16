@@ -4,6 +4,10 @@ Install this driver using the [README](README.md). It needs Python 3.10 or newer
 
 The public commands are `setup`, `refresh-tests`, `prepare-mpi [--from-dir DIR | --check]`, `prepare-tests [--wheelhouse DIR | --check]`, `build PACKAGE [--mpi] [--retry]`, `test PACKAGE [--mpi] [--nodes N] [--ranks-per-node 1|4] [--pairs N] [--slurm-overlap]`, `status`, and `logs`. `build all` includes the three serial packages and both MPI packages. `test all` runs a sequential five-session package pilot and exports its completed timing phases to CSV. 08/10 provide the larger host/scale campaigns. Run MPI builds in a Slurm allocation because upstream correctness tests launch MPI processes.
 
+`production` adds the [audited dense MPI workflow](README.md#after-the-pilot-run-production-density-workloads),
+including sustained callers, service-core exclusions and CSV/HTML analysis.
+Run `trial production --help` for its separate placement, workload and budget options.
+
 `setup` generates profiles, probes C/C++/Fortran, checks emitted PIE/RELRO/NOW/non-executable-stack properties, checks mixed shared/tool linking, and generates measurement files. Every shell command runs in a separate strict Bash process; sourcing the saved environment no longer changes an interactive shell’s options. The driver prints progress every 30 seconds during long steps and the last 25 log lines on failure.
 
 Compatibility adjustment is automatic during compiler qualification. Only a diagnostic identifying a rejected requested control, or the explicit FORTIFY implementation check, authorizes a retry with that control disabled for the affected language. PIE compile/link settings move together. A rejected negative option is also recorded. Other failures stop. Artifact checks must still pass. No security certification is implied by accepting flags.
@@ -618,11 +622,16 @@ def test(args):
     if not complete: raise RuntimeError('Pilot workload coverage is incomplete; inspect pilot.json and ReFrame reports.')
 
 def main():
+    if len(sys.argv)>1 and sys.argv[1]=='production':
+        sys.path.insert(0,str(HERE/'production'))
+        from campaign import main as production_main
+        return production_main(sys.modules[__name__],sys.argv[2:])
     if len(sys.argv)>1 and sys.argv[1]=='--effective-flags':
         for key,value in effective().items(): print('export '+key+'='+shlex.quote(value))
         return
     parser = argparse.ArgumentParser(description='Standalone GCC hardening setup, independent package builds and ReFrame pilots.')
     subs = parser.add_subparsers(dest='command',required=True)
+    subs.add_parser('production',help='Audited dense MPI sustained-work comparisons; production --help for options.')
     subs.add_parser('setup'); subs.add_parser('refresh-tests'); subs.add_parser('status'); subs.add_parser('logs')
     mpi_prep = subs.add_parser('prepare-mpi',help='Stage verified MPI/UCX archives on a login node; builds use local archives only.')
     mpi_mode = mpi_prep.add_mutually_exclusive_group()

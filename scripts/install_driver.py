@@ -26,6 +26,12 @@ def install(root, repo):
         recipes.mkdir(exist_ok=True)
         for path in source.glob("*.md"):
             shutil.copy2(path, recipes / path.name)
+        production = runner / "production"
+        production.mkdir(exist_ok=True)
+        for path in (repo / "production").iterdir():
+            if path.suffix in (".py", ".c"):
+                shutil.copy2(path, production / path.name)
+        shutil.copy2(repo / "scripts/collect_mpi_diagnostics.py", production / "collect_mpi_diagnostics.py")
         for name, content in {
             "trial.py": code + "\n",
             "trial": "#!/bin/bash\nexec " + shlex.quote(sys.executable) + " "
