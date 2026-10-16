@@ -835,6 +835,27 @@ conditions, rather than one pooled average. Choose its runtime budget using
 the pilot's recorded durations. Skip to step 4 below only when testing one
 package independently.
 
+## After the pilot: implement production-density workloads
+
+The low-rank package pilot establishes runnable full/reference comparisons.
+The next assessment must also exercise the cores allocated to a production job,
+sustained FFT communication, distributed checkpoint I/O and repeated work inside
+a long-lived process. The existing one-/four-rank layouts and small datasets
+are screening cases; increasing only their node count does not provide that
+coverage.
+
+Follow [14 — production workload implementation plan](14-production-workload-plan.md)
+for the next implementation phase. It specifies capacity discovery, new matched
+full/reference callers, sustained FFT and HDF5 cases, an iteration/checkpoint
+mini-application, a bounded dense-rank campaign and measured whole-job impact.
+It is a plan: the new workloads and full-core runner are not implemented by the
+current `trial test all` command. Existing pilot artifacts and results remain
+unchanged.
+
+The current scope stays **complete hardened stack versus complete reference**.
+Individual compiler-flag removals and package/component attribution are deferred
+until representative job-level costs and their uncertainty have been assessed.
+
 ## 4. Test one package when it is ready
 
 For a Mellanox/RDMA system, first qualify the

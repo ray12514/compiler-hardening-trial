@@ -9,6 +9,13 @@
 
 The trial measures the incremental cost of compiler hardening on FFT, I/O, and numerical software. Published measurements and their limits are recorded in [the companion evidence note](standalone_compiler_hardening_performance_evidence_v1.md).
 
+**Current assessment scope:** complete hardened stack versus complete reference,
+first through package pilots and then through
+[production-density sustained workloads](standalone-hardening/14-production-workload-plan.md).
+The next implementation must measure repeated compute/communication and
+checkpoint costs at realistic allocated-core counts. The removal/attribution
+contrasts discussed below remain deferred until that job-level assessment.
+
 The executable procedures are in the [standalone runbooks](standalone-hardening/README.md), including GCC bootstrap when 12.5 is absent, package builds, fixed callers, MPI/UCX qualification, and [ReFrame execution/reporting](standalone-hardening/06-reframe.md). The [Slurm campaign](standalone-hardening/08-slurm-campaign.md) specifies hypotheses, complex serial/threaded/MPI FFTs, small-dataset and bulk HDF5 I/O, LU solve, short process/PIE comparisons, and 1/2/4/8-node runs. Real FFTs, QR/eigensolvers, compressed I/O and full application cases remain later coverage extensions.
 
 ## Package and compiler selection

@@ -4,6 +4,13 @@
 
 This is the primary experiment agreed for the standalone trial: build and qualify the complete supplied profile first, compare it with a matched reference, and investigate selected controls only afterward. ReFrame runs prebuilt artifacts inside operator-controlled Slurm allocations; this campaign is outside CI.
 
+The next assessment after the package pilot is the
+[production-density and sustained-workload plan](14-production-workload-plan.md):
+allocated-core MPI layouts, repeated FFT work and distributed checkpoint I/O,
+then a measured job-level comparison. The primary scope remains full versus
+reference throughout. Package/component and individual-flag attribution are
+later investigations; they are not prerequisites or extra axes of this campaign.
+
 ## 1. Build scope and sequence
 
 The primary scope contains the **trial-owned** FFTW, serial/parallel HDF5, LAPACK plus its reference-implementation BLAS, Open MPI/its bundled dependencies, UCX, and benchmark callers. GCC 12.5, binutils, CMake, Python/ReFrame, the OS, Slurm, fabric drivers and approved site libraries stay fixed. This is not a rebuild of every library on the machine. Record those fixed dependencies as part of the experiment's boundary. From the documentation checkout, set `export TRIAL_PROCEDURE_COMMIT=$(git rev-parse HEAD)` before the campaign; retain source checksums and actual compile/link commands with it.
@@ -12,9 +19,10 @@ The primary scope contains the **trial-owned** FFTW, serial/parallel HDF5, LAPAC
 |---|---|---|
 | Qualification | Full flags on each applicable language/output; upstream tests, artifact inspection and two-node transport checks | Did the proposed configuration build and work? |
 | Primary screen | Matching full/reference callers, packages, BLAS and MPI/UCX; initial serial/threaded and 1/2-node cases | What is the combined performance effect of the supplied profile in this trial scope? |
+| Production assessment | Matching full/reference stacks at allocated-core density, sustained compute/communication and checkpoint cadence; selected 2/4/8-node groups | What is the elapsed-time, throughput and resource cost for representative repeated job work? |
 | Package attribution | One full caller and full dependency stack; switch only the package library | Which package rebuild helps explain an observed change? |
 | Control attribution | Full versus one independently removed control for a selected package/workload | What changes when this control is absent, with the other controls retained? |
-| Extended follow-up | Selected MPI/UCX component rebuilds, 4/8-node cases or denser ranks | Does an unresolved effect depend on the communication stack or scale? |
+| Extended attribution | Selected MPI/UCX component rebuilds after the production assessment | Which dependency rebuild helps explain a reproducible combined effect? |
 
 The reference explicitly disables the variable controls; optimization, CPU target, PIC for shared libraries, warnings and non-executable stack stay fixed. `full` denotes all applicable controls in the recorded supplied list, not every GCC option or an independent certification of STIG compliance. The per-control hypotheses are in [08](08-slurm-campaign.md#1-hypotheses-and-comparisons). Write hypotheses before running; do not add removal percentages together.
 
