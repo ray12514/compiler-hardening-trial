@@ -702,7 +702,32 @@ allocation first. See the
 The final path is `results/diagnostics/mpi-allocation-*/report.json`.
 Each arm's `local/` and `inter-node/` directories retain `communication.log`
 (including bindings and UCX information) and a `rank-N.json` for each rank.
-Share the report and inter-node logs before starting the long campaign.
+Keep those detailed system records local. To print a summary suitable for
+sharing, including for a report produced by an older helper, run:
+
+```bash
+python3 "$RUNBOOK_REPO/scripts/qualify_test_allocation.py" \
+    --trial-root "$TRIAL_ROOT" --summary
+```
+
+This reads the latest saved qualification report and prints only fixed status
+fields, counts, return codes, timeout flags and recognized rank stage markers.
+It does not launch MPI, change state, or print hostnames, job IDs, addresses,
+installation paths, commands or raw errors/log text. `--summary /path/to/report.json`
+selects a specific report. Share only that summary before the long campaign.
+
+For new runs, stage markers are flushed before dependency commands, before/after
+`MPI_Init`, after data exchange/reduction, and around `MPI_Finalize`. The helper
+also prints the safe summary automatically when a run completes or fails.
+An empty old log with `no_rank_start_observed` means there is no rank startup
+evidence; it does not establish a UCX or compiler failure. A negative return code
+after `timed_out: true` can be from the helper terminating the launcher.
+If the original run omitted overlap and timed out with no rank startup evidence,
+try the same qualification once with `--slurm-overlap` and compare summaries.
+Keep hosts, rank counts and fabric settings unchanged. If overlap does not change
+progress, use the recorded rank stages to locate the stall rather than repeatedly
+rebuilding packages or extending timeouts.
+
 A PASS covers only these hosts/layouts and communication checks; it is neither
 an overhead estimate nor qualification of the other six hosts.
 

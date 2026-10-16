@@ -21,10 +21,17 @@ from probe_mpi_startup import run_logged
 SOURCE = r'''#include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
+static void stage(int rank, const char *name) {
+    fprintf(stderr,"QUALIFICATION_STAGE rank=%d stage=%s\n",rank,name);
+    fflush(stderr);
+}
 int main(int argc, char **argv) {
     int rank, size, n; char host[MPI_MAX_PROCESSOR_NAME];
+    const char *launch_rank=getenv("OMPI_COMM_WORLD_RANK");
+    stage(launch_rank ? atoi(launch_rank) : -1,"before-mpi-init");
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank); MPI_Comm_size(MPI_COMM_WORLD, &size);
+    stage(rank,"mpi-initialized");
     MPI_Get_processor_name(host, &n);
     const int count=131072; /* 512 KiB: exercise more than startup/control messages */
     int *send=malloc(count*sizeof(int)), *recv=malloc(count*sizeof(int));
@@ -33,16 +40,84 @@ int main(int argc, char **argv) {
     int previous=(rank+size-1)%size, next=(rank+1)%size;
     MPI_Sendrecv(send,count,MPI_INT,next,42,recv,count,MPI_INT,previous,42,
                  MPI_COMM_WORLD,MPI_STATUS_IGNORE);
+    stage(rank,"data-exchange-complete");
     int good=1, total;
     for (int i=0; i<count; i++) if (recv[i]!=previous+i) good=0;
     MPI_Allreduce(&good,&total,1,MPI_INT,MPI_SUM,MPI_COMM_WORLD);
     if (total!=size) MPI_Abort(MPI_COMM_WORLD, 1);
+    stage(rank,"reduction-complete");
     free(send); free(recv);
     printf("QUALIFICATION rank=%d size=%d host=%s PASS\n",rank,size,host);
     fflush(stdout);
-    MPI_Finalize(); return 0;
+    stage(rank,"before-mpi-finalize");
+    MPI_Finalize();
+    stage(rank,"mpi-finalized"); return 0;
 }
 '''
+
+
+STAGES = ('rank-wrapper-start', 'caller_libraries', 'launcher_libraries',
+          'pml_libraries', 'ucx_devices', 'dependency-checks-passed',
+          'before-mpi-init', 'mpi-initialized', 'data-exchange-complete',
+          'reduction-complete', 'before-mpi-finalize', 'mpi-finalized')
+
+
+def safe_summary(path):
+    """Build a shareable allow-list, never copying commands, hosts, paths or errors."""
+    report = json.loads(path.read_text())
+    number = lambda value: value if type(value) is int else None
+    boolean = lambda value: value if type(value) is bool else None
+    summary = {'passed': boolean(report.get('passed')),
+               'selected_node_count': len(report.get('hosts', [])),
+               'ranks_per_node': number(report.get('ranks_per_node')),
+               'slurm_overlap_requested': boolean(report.get('slurm_overlap_requested')),
+               'arms': {}}
+    for arm in ('full', 'reference'):
+        data = report.get('arms', {}).get(arm)
+        if not isinstance(data, dict):
+            continue
+        compile_result = data.get('compile', {})
+        result = {'compile_returncode': number(compile_result.get('returncode')),
+                  'compile_timed_out': boolean(compile_result.get('timed_out')), 'cases': {}}
+        summary['arms'][arm] = result
+        for label, case in zip(('local', 'inter-node'), data.get('cases', [])):
+            folder = path.parent / arm / label
+            log = folder / 'communication.log'
+            # Resolve beneath the report directory; do not follow report-provided
+            # absolute paths or a symlink outside that evidence directory.
+            contained = log.resolve().is_relative_to(path.parent.resolve())
+            text = log.read_text(errors='replace') if contained and log.is_file() else ''
+            stages = {}
+            for rank, stage in re.findall(r'^QUALIFICATION_STAGE rank=(\d{1,6}) stage=([a-z_-]+)$', text, re.M):
+                if stage in STAGES:
+                    stages[rank] = stage
+            inventories = len([p for p in folder.glob('rank-*.json') if re.fullmatch(r'rank-\d+\.json', p.name)])
+            if stages:
+                progress = 'rank_progress_recorded'
+            elif inventories:
+                progress = 'rank_checks_finished_stage_unknown'
+            elif not contained or not log.is_file():
+                progress = 'log_missing'
+            elif not text:
+                progress = 'no_rank_start_observed'
+            else:
+                progress = 'log_present_no_stage_markers'
+            result['cases'][label] = {'returncode': number(case.get('returncode')),
+                                     'timed_out': boolean(case.get('timed_out')),
+                                     'log_empty': not bool(text), 'progress': progress,
+                                     'rank_inventory_count': inventories, 'rank_stages': stages}
+    return summary
+
+
+def print_safe_summary(path):
+    summary = safe_summary(path)
+    print('Shareable status summary (no hostnames, paths, job IDs, commands or raw log text):', flush=True)
+    print(json.dumps(summary, indent=2), flush=True)
+    return summary
+
+
+def rank_stage(rank, stage):
+    print(f'QUALIFICATION_STAGE rank={int(rank)} stage={stage}', file=sys.stderr, flush=True)
 
 
 def require_libraries(output, family, prefix):
@@ -54,6 +129,7 @@ def require_libraries(output, family, prefix):
 def rank_check(binary, destination, hosts):
     """Executed on every rank before MPI_Init; then replace Python with the caller."""
     rank = os.environ['OMPI_COMM_WORLD_RANK']
+    rank_stage(rank, 'rank-wrapper-start')
     mpi, ucx = Path(os.environ['TRIAL_MPI_PREFIX']), Path(os.environ['TRIAL_UCX_PREFIX'])
     host = socket.gethostname()
     if host.split('.')[0] not in {h.split('.')[0] for h in hosts.split(',')}:
@@ -68,6 +144,7 @@ def rank_check(binary, destination, hosts):
         ('pml_libraries', ['ldd', str(mpi / 'lib/openmpi/mca_pml_ucx.so')]),
         ('ucx_devices', [str(ucx / 'bin/ucx_info'), '-d']),
     ):
+        rank_stage(rank, label)
         result = run(command, env=os.environ.copy())
         evidence['commands'][label] = result
         if result['returncode'] != 0:
@@ -78,6 +155,7 @@ def rank_check(binary, destination, hosts):
     if not re.search(r'Transport:\s*rc_(?:mlx5|verbs)\b', evidence['commands']['ucx_devices']['stdout']):
         raise RuntimeError('No RC transport available on this rank; RDMA qualification cannot pass')
     (destination / f'rank-{rank}.json').write_text(json.dumps(evidence, indent=2) + '\n')
+    rank_stage(rank, 'dependency-checks-passed')
     os.execve(str(binary), [str(binary)], os.environ.copy())
 
 
@@ -182,6 +260,7 @@ def qualify(root, hosts, ranks_per_node, timeout, slurm_overlap=False):
     finally:
         (out / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
         print(f'Report: {out / "report.json"}', flush=True)
+        print_safe_summary(out / 'report.json')
     return out
 
 
@@ -197,11 +276,23 @@ def main():
     parser.add_argument('--slurm-overlap', action='store_true',
                         help="Pass --overlap to Open MPI's srun steps when an interactive shell holds resources")
     parser.add_argument('--timeout', type=int, default=90, help='Seconds per compile/launch, 1-300')
+    parser.add_argument('--summary', nargs='?', const='latest', metavar='REPORT_JSON',
+                        help='Print only shareable status fields; default is the latest saved report, no MPI launch')
     args = parser.parse_args()
     try:
         if not 1 <= args.timeout <= 300:
             raise RuntimeError('Choose --timeout between 1 and 300 seconds')
         root = args.trial_root.expanduser().resolve()
+        if args.summary:
+            if args.summary == 'latest':
+                reports = list((root / 'results/diagnostics').glob('mpi-allocation-*/report.json'))
+                if not reports:
+                    raise RuntimeError('No allocation qualification report found')
+                path = max(reports, key=lambda p: p.stat().st_mtime_ns)
+            else:
+                path = Path(args.summary).expanduser().resolve()
+            print_safe_summary(path)
+            return
         if not os.environ.get('SLURM_JOB_ID') or not os.environ.get('SLURM_JOB_NODELIST'):
             raise RuntimeError('Run in the existing Slurm allocation; no new allocation will be requested')
         hosts = subprocess.check_output(['scontrol', 'show', 'hostnames', os.environ['SLURM_JOB_NODELIST']],

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -110,6 +111,69 @@ CODE
             self.assertFalse(report['passed'])
             self.assertNotIn('reference', report['arms'])
             self.assertIn('injected launch failure', Path(report['arms']['full']['cases'][0]['log']).read_text())
+
+    def test_empty_inter_node_timeout_has_a_safe_actionable_summary(self):
+        with tempfile.TemporaryDirectory(prefix='private-install-') as tmp:
+            root = Path(tmp)
+            envs = self.fixture(root)
+            launcher = root / 'full/bin/mpirun'
+            launcher.write_text(launcher.read_text().replace('test -z', '''case " $* " in
+*' --host node2:1,node7:1 '*) sleep 60; exit 1;;
+esac
+test -z''', 1))
+            with patch.dict(os.environ, {'SLURM_JOB_ID': 'private-job-id'}), \
+                 patch.object(qualification, 'activated_env', side_effect=lambda root, arm: (envs[arm].copy(), 'saved')), \
+                 contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+                qualification.qualify(root, ['node2', 'node7'], 1, 2)
+            path = next(root.glob('results/diagnostics/*/report.json'))
+            self.assertEqual((path.parent / 'full/inter-node/communication.log').read_text(), '')
+            summary = qualification.safe_summary(path)
+            case = summary['arms']['full']['cases']['inter-node']
+            self.assertTrue(case['timed_out'])
+            self.assertEqual(case['progress'], 'no_rank_start_observed')
+            text = json.dumps(summary)
+            for private in (str(root), 'node2', 'node7', 'private-job-id', 'MPI_PREFIX', 'command'):
+                self.assertNotIn(private, text)
+
+    def test_safe_summary_only_outputs_known_stage_names_and_numbers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / 'report.json'
+            path.write_text(json.dumps({'hosts': ['private-host'], 'passed': False,
+                'arms': {'full': {'cases': [{'returncode': 1, 'timed_out': False,
+                                            'log': '/private/do-not-read-this'}]}}}))
+            folder = root / 'full/local'
+            folder.mkdir(parents=True)
+            (folder / 'communication.log').write_text(
+                'private-host /private/path private-address\n'
+                'QUALIFICATION_STAGE rank=0 stage=before-mpi-init\n'
+                'QUALIFICATION_STAGE rank=1 stage=private-secret\n')
+            summary = qualification.safe_summary(path)
+            stages = summary['arms']['full']['cases']['local']['rank_stages']
+            self.assertEqual(stages, {'0': 'before-mpi-init'})
+            self.assertNotIn('private', json.dumps(summary))
+            process = subprocess.run([sys.executable, str(REPO / 'scripts/qualify_test_allocation.py'),
+                                      '--trial-root', str(root), '--summary', str(path)],
+                                     env={k: v for k, v in os.environ.items() if not k.startswith('SLURM_')},
+                                     capture_output=True, text=True, timeout=10)
+            self.assertEqual(process.returncode, 0, process.stderr)
+            self.assertNotIn('private', process.stdout)
+            self.assertNotIn(str(root), process.stdout)
+
+    def test_wrapper_reports_progress_before_a_stalled_dependency_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {'OMPI_COMM_WORLD_RANK': '1', 'TRIAL_MPI_PREFIX': '/private/mpi',
+                   'TRIAL_UCX_PREFIX': '/private/ucx'}
+            output = io.StringIO()
+            with patch.dict(os.environ, env, clear=True), \
+                 patch.object(qualification.socket, 'gethostname', return_value='node7'), \
+                 patch.object(qualification.os, 'sched_getaffinity', return_value={4}, create=True), \
+                 patch.object(qualification, 'run', side_effect=RuntimeError('stalled dependency check')), \
+                 contextlib.redirect_stderr(output), self.assertRaisesRegex(RuntimeError, 'stalled dependency'):
+                qualification.rank_check(Path('/private/communication'), Path(tmp), 'node2,node7')
+            self.assertEqual(output.getvalue().splitlines(), [
+                'QUALIFICATION_STAGE rank=1 stage=rank-wrapper-start',
+                'QUALIFICATION_STAGE rank=1 stage=caller_libraries'])
 
     def test_tcp_fallback_and_mixed_dependencies_cannot_pass(self):
         for tls in ('', 'all', 'tcp,sm,self', 'rc,tcp,sm,self', '^tcp'):
