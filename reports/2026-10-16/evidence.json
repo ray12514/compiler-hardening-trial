@@ -1,0 +1,130 @@
+{
+  "date": "2026-10-16",
+  "status": "provisional screenshot transcription",
+  "production_workload_order": [
+    "FFT loop",
+    "HDF5 collective",
+    "HDF5 independent",
+    "Integrated loop"
+  ],
+  "production": [
+    {
+      "layout": "2 nodes / 16 ranks per node",
+      "pairs": 10,
+      "effects_percent": [
+        0.222,
+        -1.077,
+        -0.003,
+        -2.589
+      ]
+    },
+    {
+      "layout": "2 nodes / 92 ranks per node",
+      "pairs": 10,
+      "effects_percent": [
+        0.398,
+        0.33,
+        0.907,
+        0.022
+      ]
+    },
+    {
+      "layout": "4 nodes / full eligible-core layout",
+      "pairs": 10,
+      "effects_percent": [
+        -1.288,
+        -0.448,
+        1.323,
+        -2.597
+      ]
+    },
+    {
+      "layout": "8 nodes / full eligible-core layout",
+      "pairs": 4,
+      "effects_percent": [
+        -1.555,
+        null,
+        null,
+        null
+      ],
+      "status": "budget_exhausted_partial"
+    }
+  ],
+  "latest_pilot": [
+    {
+      "workload": "FFTW / large",
+      "change_percent": 0.377
+    },
+    {
+      "workload": "FFTW / planning",
+      "change_percent": -0.216
+    },
+    {
+      "workload": "FFTW / small",
+      "change_percent": 0.311
+    },
+    {
+      "workload": "FFTW / startup",
+      "change_percent": 4.189
+    },
+    {
+      "workload": "HDF5 / chunked",
+      "change_percent": -0.083
+    },
+    {
+      "workload": "HDF5 / contiguous",
+      "change_percent": -2.718
+    },
+    {
+      "workload": "HDF5 / startup",
+      "change_percent": 4.479
+    },
+    {
+      "workload": "LAPACK / large",
+      "change_percent": 0.809
+    },
+    {
+      "workload": "LAPACK / small",
+      "change_percent": 5.027
+    },
+    {
+      "workload": "LAPACK / startup",
+      "change_percent": 2.064
+    },
+    {
+      "workload": "FFTW MPI / loop",
+      "change_percent": -0.27
+    },
+    {
+      "workload": "FFTW MPI / planning",
+      "change_percent": -0.368
+    },
+    {
+      "workload": "FFTW MPI / small",
+      "change_percent": -0.311
+    },
+    {
+      "workload": "HDF5 MPI / collective",
+      "change_percent": -0.372
+    },
+    {
+      "workload": "HDF5 MPI / independent",
+      "change_percent": -0.823
+    },
+    {
+      "workload": "HDF5 MPI / small",
+      "change_percent": -4.93
+    }
+  ],
+  "provenance": {
+    "latest_pilot": "operator screenshot D12F901B",
+    "two_node_16": "operator screenshot ABAA5002",
+    "two_node_92": "operator screenshot 53A9552C (summary printed twice)",
+    "four_and_eight_node": "operator screenshot 493E372C"
+  },
+  "limits": [
+    "Original manifests and pair-level results not yet reviewed.",
+    "Production confidence bounds omitted from chart: final photo is clipped.",
+    "No missing measurements or error bars have been imputed."
+  ]
+}

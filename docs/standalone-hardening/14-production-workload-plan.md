@@ -278,3 +278,83 @@ fit implementation, qualification and a defensible run budget, retain the pilot
 data and schedule the dense campaign later rather than launching an unvalidated
 full-core sweep. A threshold-compatible result supports only the tested workload,
 scale and environment; report uncertainty when a decision remains unresolved.
+
+## 8. Session handoff — 2026-10-16
+
+Testing stopped at the operator's request; resume the assessment next session.
+No additional benchmark runs or individual-flag experiments are requested now.
+The current runner includes Slurm affinity-only allocation discovery and WEKA
+reservation checks. Preserve the existing trial root and completed package
+installations, configuration, build records and results.
+The [three-page session report](../../output/pdf/compiler-hardening-session-report-2026-10-16.pdf)
+plots the screenshot-derived pilot and dense MPI estimates; its
+[transcribed evidence](../../reports/2026-10-16/evidence.json) is kept separately
+from original campaign exports.
+
+### Evidence received so far
+
+These are rounded transcriptions from operator-supplied screenshots, not an
+analysis of the original raw results. Positive change means full was slower.
+Keep each layout, host group and allocation separate in the analysis.
+
+| Layout | Completed paired coverage | Observed runtime changes |
+|---|---|---|
+| 2 nodes, 16 ranks/node | 10/10 pairs for all four production conditions | FFT +0.22%; collective HDF5 -1.08%; independent HDF5 approximately 0%; integrated loop -2.59% |
+| 2 nodes, 92 ranks/node | 10/10 pairs for all four conditions | FFT +0.40%; collective HDF5 +0.33%; independent HDF5 +0.91%; integrated loop +0.02% |
+| 4 nodes, full eligible-core layout | 10/10 pairs for all four conditions | FFT -1.29%; collective HDF5 -0.45%; independent HDF5 +1.32%; integrated loop -2.60% |
+| 8 nodes, full eligible-core layout | FFT 4/10 pairs; campaign budget exhausted | FFT -1.56%; no completed paired HDF5 or integrated-loop results shown |
+
+The earlier all-package screening pilot also reported complete coverage. The
+defensible provisional finding is **no consistent performance penalty detected
+in the completed tested conditions**. Small negative estimates do not establish
+that hardening improves performance. The eight-node result is preliminary, and
+the final screenshot does not expose every confidence-interval bound clearly.
+Do not pool the partial eight-node data with completed smaller layouts or count
+reprinted copies of one summary as independent repetitions.
+
+### Deployment question raised by the operator
+
+The supplied libraries may be hardened while user applications retain their
+ordinary compiler flags. The current production comparison changes both the
+caller and its matching library/dependency stack between full and reference.
+It therefore does not isolate this exact deployment combination, and a near-zero
+combined effect does not bound every individual contribution.
+
+Plan a **fixed reference caller with switched complete library/dependency
+stacks**: use the same ordinarily compiled executable against the reference
+libraries and against the hardened libraries, with the same work, binding and
+runtime policy. Keep MPI/UCX consistent with the selected library stack and
+verify actual loaded paths on every rank. Preserve ABI/toolchain compatibility
+and account for compile-time header/inlined code in the fixed caller. This
+comparison is not yet implemented by `trial production`; its existing `stack`
+results must keep their original scope. It requires no individual flag removals.
+
+Hardening compiled into a shared library does not automatically apply those
+compiler options to an application's own code. Some checks, including fortified
+libc call sites, depend on how the calling source was compiled; the scope must
+be recorded explicitly.
+[GCC instrumentation](https://gcc.gnu.org/onlinedocs/gcc-12.5.0/gcc/Instrumentation-Options.html),
+[glibc source fortification](https://sourceware.org/glibc/manual/latest/html_node/Source-Fortification.html)
+
+### Next-session order
+
+1. Obtain the original result folders, including `manifest.json`, layouts,
+   qualification/build identities, raw per-launch JSON, `pairs.csv`,
+   `iterations.csv`, `io-modes.csv` and summaries. Keep private system evidence
+   local; share the metric-only exports for analysis.
+2. Confirm the effective flags and compiled artifacts for both arms, loaded
+   libraries, observed bindings, equal work within pairs, completed coverage,
+   achieved durations, budget caps and actual HDF5 I/O modes. Separate loop
+   walltime from whole-process launch/guard/planning/validation time.
+3. Inspect paired timing variation and order effects, especially variable
+   reference integrated-loop timings and independent I/O. Retain slow samples;
+   do not remove them because they change the conclusion. Regenerate intervals
+   from complete pairs, with incomplete pairs and conditions explicitly marked.
+4. Use the recorded eight-node work definition to choose the next frozen run;
+   complete the missing eight-node evidence, then repeat selected conditions
+   in an independent allocation. Do not silently combine different iteration
+   counts, geometries or I/O-budget caps as one experiment.
+5. Implement the fixed-caller deployment comparison above and select a
+   representative site application with realistic inputs and checkpoint cadence.
+   Agree on a practically meaningful overhead threshold and required precision
+   before confirmation sampling. Individual-flag attribution remains deferred.

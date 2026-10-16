@@ -31,10 +31,16 @@ to keep the same environment, build state and results while switching sources.
 - [Run dense MPI workloads with WEKA core exclusions and CSV/HTML analysis](docs/standalone-hardening/README.md#after-the-pilot-run-production-density-workloads)
 - [Production workload assessment and acceptance plan](docs/standalone-hardening/14-production-workload-plan.md)
 
-Target-system GCC/package builds and campaign qualification remain outstanding.
-The included reporting figures use illustrative data. Record the procedure
+The [16 October 2026 session report](output/pdf/compiler-hardening-session-report-2026-10-16.pdf)
+summarizes operator-reported build/qualification progress, the package pilot and
+dense MPI measurements. Its figures use provisional screenshot transcriptions;
+the original result archives still need review, and the eight-node campaign is
+incomplete. The [transcribed evidence](reports/2026-10-16/evidence.json) and
+[report generator](reports/2026-10-16/build_report.py) accompany the report.
+The older reporting examples use illustrative data. Record the procedure
 commit, source checksums, exact build identities and allocation conditions with
-every actual result.
+every actual result. The [session handoff](docs/standalone-hardening/14-production-workload-plan.md#8-session-handoff--2026-10-16)
+records the next analysis and deployment-comparison steps.
 
 For the UCX optional Go-binding build failure, see the
 [update and retry instructions](docs/standalone-hardening/README.md#if-ucx-stops-while-building-go-bindings).
