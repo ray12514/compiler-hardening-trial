@@ -444,10 +444,28 @@ OSU's repeated internal operations are not independent observations; fresh
 process pairs provide the paired samples. A later `osu_mbw_mr` can examine
 simultaneous pairs if two-rank bandwidth does not explain dense behavior.
 
-The OSU adapter is planned, not shipped in this update. Prepare its source and
-offline build outside the timed allocation when adopted. It is not a dependency
-of the new driver/ReFrame workflow and cannot substitute for FFTW/HDF5 evidence.
-Do not install MVAPICH just to obtain OSU; its MPI benchmarks can use Open MPI.
+The adapter is implemented through `trial osu prepare`, `trial osu build` and
+`trial osu test --reframe`. Stage the pinned OSU 7.5.2 archive on the login node
+first; download, transferred-archive import and offline verification all enforce
+the recorded SHA-256. Build only the four ordinary C MPI callers, offline on the
+login or a representative compute node, without launching benchmarks or
+rebuilding MPI/UCX. No PAPI/GPU toolkit or MVAPICH installation is needed.
+
+Run the next fixed-caller FFTW/HDF5 workflow **before** OSU measurements.
+`--after-production DIR` requires a completed deployment-scope result and matching
+MPI/UCX build identities. OSU then reuses the audited physical-core/WEKA map,
+interactive overlap policy, private launchers, RC/shared-memory UCX selection,
+rank hash/library guards and serial ReFrame adapter. Point-to-point tests always
+use exactly two ranks; collectives use the requested density. Validation precedes
+timed process pairs. Native units, balanced pairing, memory/walltime limits and
+partial evidence are preserved; ReFrame does not pass an incomplete campaign.
+
+The initial automated byte matrix is 1/1024/65536 for latency,
+1024/65536/1048576 for bandwidth, 16/1024/65536 for allreduce and 16/1024/4096
+for all-to-all. This follow-up measures reference versus hardened Open MPI/UCX
+of the same versions; it does not yet isolate MPI, compare MPI implementations,
+or attribute individual compiler flags. It is not a prerequisite of FFTW/HDF5.
+[Automated preparation, offline build, run and report commands](12-osu-screen.md)
 [Official benchmark descriptions and release list](https://mvapich.cse.ohio-state.edu/benchmarks/)
 
 The copy-and-paste run sequence, result paths and new options are in the
@@ -463,3 +481,13 @@ both planning policies and all four workload modes; numerical/restart checks,
 per-rank/per-field I/O records and file cleanup passed. These are functional
 checks using a network-disabled container, not Slurm/RDMA or performance
 qualification on the target cluster. No new target-system campaign was launched.
+
+The OSU adapter update passed all 77 automated checks, including source/import
+verification, fixed-caller identity, paired native-metric reporting, partial
+budget handling and real ReFrame 4.10.4 report generation. The actual adapter
+built all four pinned OSU targets offline in a network-disabled Linux container;
+eight local MPI runs exercised each benchmark with validation both off and on,
+using two ranks for point-to-point and four for collectives. The native-output
+parser accepted those real outputs. Cached system MPI supplied this functional
+check, with fixture driver state; it does not qualify the target hardened stacks,
+Slurm placement, WEKA exclusions, RDMA or benchmark performance.

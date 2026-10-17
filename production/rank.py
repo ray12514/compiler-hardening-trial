@@ -82,7 +82,11 @@ def main():
                                         env=env, text=True, timeout=15)
     loaded_paths = libraries(loaded, r'lib(?:mpi|open-rte|open-pal)', mpi)
     loaded_paths += libraries(component, r'lib(?:ucp|uct|ucs|ucm)', ucx)
-    for family, package in ((r'libfftw3', 'fftw-mpi'), (r'libhdf5', 'hdf5-mpi')):
+    payload = env.get('TRIAL_PRODUCTION_PAYLOAD','workflow')
+    if payload not in ('workflow','osu'):
+        raise RuntimeError('Unknown production payload')
+    packages = ((r'libfftw3','fftw-mpi'),(r'libhdf5','hdf5-mpi')) if payload=='workflow' else ()
+    for family, package in packages:
         loaded_paths += libraries(loaded, family, Path(env['TRIAL_ROOT'])/'install'/package/env['TRIAL_PRODUCTION_ARM'])
     if env.get('TRIAL_PRODUCTION_QUALIFY') == '1':
         output = subprocess.check_output([str(ucx/'bin/ucx_info'), '-d'], env=env, text=True, timeout=20)

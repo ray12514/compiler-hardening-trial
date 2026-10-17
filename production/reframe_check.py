@@ -34,9 +34,13 @@ class LibraryWorkflow(rfm.RunOnlyRegressionTest):
         self._summary = json.loads((out/'summary.json').read_text())
         # Keep one figure per condition and metric; never pool node layouts.
         for row in self._summary['summaries']:
-            for metric, unit in (('full_mean_seconds','s'),('reference_mean_seconds','s'),
+            metrics = (('full_mean',row['unit']),('reference_mean',row['unit']),
+                       ('deterioration_percent','%'),('interval_low_percent','%'),
+                       ('interval_high_percent','%'),('pairs','pairs')) if 'unit' in row else (
+                                 ('full_mean_seconds','s'),('reference_mean_seconds','s'),
                                  ('delta_seconds','s'),('runtime_increase_percent','%'),
-                                 ('interval_low_percent','%'),('interval_high_percent','%'),('pairs','pairs')):
+                                 ('interval_low_percent','%'),('interval_high_percent','%'),('pairs','pairs'))
+            for metric, unit in metrics:
                 if row[metric] is not None:
                     self.perf_variables[row['condition']+'/'+metric] = sn.make_performance_function(
                         lambda value=row[metric]: value, unit)

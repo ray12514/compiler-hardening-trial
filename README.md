@@ -17,6 +17,9 @@ Continuing after the 16 October campaign? Use the
 [fixed-caller workflow and next-session plan](docs/standalone-hardening/README.md#next-session-fixed-caller-application-pattern-assessment).
 It reuses the completed libraries, supports ReFrame, and keeps the optional OSU
 baseline separate from FFTW/HDF5 measurements.
+The [automated OSU follow-up](docs/standalone-hardening/12-osu-screen.md) stages
+sources on the login node, supports offline compute-node builds, and runs after
+that next workflow completes.
 
 **Builds complete and MPI qualification passed?** Run the
 [all-package pilot and CSV export](docs/standalone-hardening/README.md#builds-complete-and-mpi-qualified-run-the-package-pilot)

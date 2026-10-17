@@ -973,10 +973,15 @@ binding and loaded libraries, and bound collective buffers against rank count
 and available memory. Report bandwidth in its original units (higher is better)
 and latency separately (lower is better); do not label bandwidth change as
 runtime overhead. No MVAPICH installation is required to use the MPI benchmarks
-with Open MPI. This is an **optional planned adapter**, not implemented by
-`trial production` in this update; it does not block the commands above or
-replace FFTW/HDF5 evidence. Download/build preparation belongs outside the timed
-allocation, with source checksum and offline handoff recorded first.
+with Open MPI. The automated adapter is now available as `trial osu prepare`,
+`trial osu build` and `trial osu test --reframe`. Download or import the
+hash-pinned source on the login node first; the four ordinary callers can then
+be built offline on the login or a compute node. **Finish the next fixed-caller
+FFTW/HDF5 test first**, then pass its completed production result directory to
+OSU with `--after-production`. Matching MPI/UCX build identities are checked.
+It remains a separate follow-up and does not block or replace FFTW/HDF5.
+Use the [automated OSU run sequence](12-osu-screen.md) for copy-and-paste commands,
+matrix settings and exports.
 [Official OSU benchmark descriptions](https://mvapich.cse.ohio-state.edu/benchmarks/)
 
 ## After the pilot: run production-density workloads

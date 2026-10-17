@@ -283,11 +283,12 @@ def inspect_artifacts(driver, envs, out, deadline=None):
     return evidence
 
 
-def launch(env, binary, layout_path, arguments, folder, args, deadline, qualify=False):
+def launch_process(env, binary, layout_path, arguments, folder, args, deadline, qualify=False, payload='workflow'):
     layout = json.loads(layout_path.read_text())
     rpn = layout['ranks_per_node']
     hosts = list(layout['hosts'])
     child = env.copy()
+    child['TRIAL_PRODUCTION_PAYLOAD'] = payload
     child['TRIAL_PRODUCTION_CALLER_SHA256'] = hashlib.sha256(Path(binary).read_bytes()).hexdigest()
     child['TRIAL_PRODUCTION_QUALIFY'] = '1' if qualify else '0'
     if qualify:
@@ -302,14 +303,6 @@ def launch(env, binary, layout_path, arguments, folder, args, deadline, qualify=
             command += ['--mca',name,child['OMPI_MCA_'+name]]
     command += [sys.executable,str(HERE/'rank.py'),str(layout_path),str(folder),binary,*map(str,arguments)]
     result, text = run(command,child,folder,args.timeout,deadline)
-    matches = re.findall(r'^PRODUCTION_RESULT (.+)$',text,re.M)
-    if len(matches) != 1:
-        raise RuntimeError(f'Missing/duplicate workload result; inspect {folder}/command.log')
-    value = json.loads(matches[0])
-    if qualify and value.get('qualification_passed') is not True:
-        raise RuntimeError('Communication qualification did not pass')
-    if 'loop_seconds' in value and (not math.isfinite(value['loop_seconds']) or value['loop_seconds']<=0):
-        raise RuntimeError('Workload returned an invalid loop duration')
     for rank in range(len(hosts)*rpn):
         info = json.loads((folder/f'rank-{rank}.json').read_text())
         row = layout['hosts'][info['host']]
@@ -318,6 +311,19 @@ def launch(env, binary, layout_path, arguments, folder, args, deadline, qualify=
     observed = [json.loads(path.read_text()) for path in folder.glob('rank-*.json')]
     if len(observed)!=len(hosts)*rpn or len({(v['host'],v['local_rank']) for v in observed})!=len(observed):
         raise RuntimeError('Missing/duplicate local rank placement evidence')
+    return result, text
+
+
+def launch(env, binary, layout_path, arguments, folder, args, deadline, qualify=False):
+    result, text = launch_process(env,binary,layout_path,arguments,folder,args,deadline,qualify)
+    matches = re.findall(r'^PRODUCTION_RESULT (.+)$',text,re.M)
+    if len(matches) != 1:
+        raise RuntimeError(f'Missing/duplicate workload result; inspect {folder}/command.log')
+    value = json.loads(matches[0])
+    if qualify and value.get('qualification_passed') is not True:
+        raise RuntimeError('Communication qualification did not pass')
+    if 'loop_seconds' in value and (not math.isfinite(value['loop_seconds']) or value['loop_seconds']<=0):
+        raise RuntimeError('Workload returned an invalid loop duration')
     value['process_elapsed_seconds'] = result['process_elapsed_seconds']
     save(folder/'result.json',value)
     return value
@@ -651,14 +657,14 @@ def campaign(driver, args):
         print(f'Campaign status: {manifest["status"]}; evidence retained at {out}',flush=True)
 
 
-def run_reframe(driver, argv, args):
+def run_reframe(driver, argv, args, command_name='production'):
     """One serial ReFrame check runs this controller in the same allocation."""
     reframe = driver.check_reframe()
-    parent = driver.ROOT/'results/production-reframe'
+    parent = driver.ROOT/('results/'+command_name+'-reframe')
     parent.mkdir(parents=True,exist_ok=True)
     out = Path(tempfile.mkdtemp(prefix=datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ-'),dir=parent))
     child_args = [value for value in argv if value!='--reframe']
-    command = [sys.executable,str(driver.HERE/'trial.py'),'production',*child_args,
+    command = [sys.executable,str(driver.HERE/'trial.py'),command_name,*child_args,
                '--result-pointer',str(out/'campaign.json')]
     save(out/'invocation.json',{'command':command})
     env = os.environ.copy()

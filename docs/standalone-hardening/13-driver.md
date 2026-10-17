@@ -14,6 +14,13 @@ runs through ReFrame in the current allocation. `--fields`, `--fft-plan`,
 remains `stack` for existing commands. See the
 [next-session commands](README.md#next-session-fixed-caller-application-pattern-assessment).
 
+The OSU follow-up uses `osu prepare [--from-dir DIR | --check]`,
+`osu build [--jobs N] [--check] [--retry]`, `osu test --after-production DIR
+[--reframe]` and `osu report DIR`. Prepare sources on the connected login node;
+build/test never download. Callers can be built on a compute node after staging.
+Complete the next deployment-scope production test before starting OSU timing.
+See [12 - automated OSU](12-osu-screen.md).
+
 `setup` generates profiles, probes C/C++/Fortran, checks emitted PIE/RELRO/NOW/non-executable-stack properties, checks mixed shared/tool linking, and generates measurement files. Every shell command runs in a separate strict Bash process; sourcing the saved environment no longer changes an interactive shell’s options. The driver prints progress every 30 seconds during long steps and the last 25 log lines on failure.
 
 Compatibility adjustment is automatic during compiler qualification. Only a diagnostic identifying a rejected requested control, or the explicit FORTIFY implementation check, authorizes a retry with that control disabled for the affected language. PIE compile/link settings move together. A rejected negative option is also recorded. Other failures stop. Artifact checks must still pass. No security certification is implied by accepting flags.
@@ -628,6 +635,10 @@ def test(args):
     if not complete: raise RuntimeError('Pilot workload coverage is incomplete; inspect pilot.json and ReFrame reports.')
 
 def main():
+    if len(sys.argv)>1 and sys.argv[1]=='osu':
+        sys.path.insert(0,str(HERE/'production'))
+        from osu import main as osu_main
+        return osu_main(sys.modules[__name__],sys.argv[2:])
     if len(sys.argv)>1 and sys.argv[1]=='production':
         sys.path.insert(0,str(HERE/'production'))
         from campaign import main as production_main
@@ -638,6 +649,7 @@ def main():
     parser = argparse.ArgumentParser(description='Standalone GCC hardening setup, independent package builds and ReFrame pilots.')
     subs = parser.add_subparsers(dest='command',required=True)
     subs.add_parser('production',help='Audited dense MPI sustained-work comparisons; production --help for options.')
+    subs.add_parser('osu',help='Pinned source preparation, offline fixed-caller build and paired MPI/UCX tests; osu --help for options.')
     subs.add_parser('setup'); subs.add_parser('refresh-tests'); subs.add_parser('status'); subs.add_parser('logs')
     mpi_prep = subs.add_parser('prepare-mpi',help='Stage verified MPI/UCX archives on a login node; builds use local archives only.')
     mpi_mode = mpi_prep.add_mutually_exclusive_group()
