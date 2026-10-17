@@ -127,6 +127,8 @@ def runtime(root, arm, overlap):
     env.update(TRIAL_ROOT=str(root), TRIAL_MPI_PREFIX=env['MPI_PREFIX'],
                TRIAL_UCX_PREFIX=env.pop('UCX_PREFIX'), TRIAL_PRODUCTION_ARM=arm,
                OMPI_MCA_pml='ucx')
+    library_dirs = [str(root/'install'/package/arm/'lib') for package in ('fftw-mpi','hdf5-mpi')]
+    env['LD_LIBRARY_PATH'] = ':'.join(library_dirs+[env.get('LD_LIBRARY_PATH','')]).rstrip(':')
     env.pop('UCX_LOG_LEVEL',None)
     if overlap:
         args = shlex.split(env.get('OMPI_MCA_plm_slurm_args',''))
@@ -209,7 +211,10 @@ def host_groups(hosts, nodes, requested):
 def compile_callers(driver, envs, out, args, deadline):
     source = (HERE/'workload.c').read_bytes()
     identities = {}
-    for arm, env in envs.items():
+    scope = getattr(args,'scope','stack')
+    builds = ('reference',) if scope=='deployment' else tuple(envs)
+    for arm in builds:
+        env = envs[arm]
         flags = driver.get_flags(arm)
         state = {p: driver.verify_state(p+'-'+arm) for p in ('fftw-mpi','hdf5-mpi','openmpi','ucx')}
         identity = hashlib.sha256(source+json.dumps([flags,state],sort_keys=True).encode()).hexdigest()
@@ -233,7 +238,49 @@ def compile_callers(driver, envs, out, args, deadline):
         if hashlib.sha256(binary.read_bytes()).hexdigest() != saved['binary_sha256']:
             raise RuntimeError('Production caller changed after compilation')
         identities[arm] = {'binary':str(binary),'identity':identity,**saved}
+    if scope=='deployment':
+        # One executable, compiled once against reference headers/libraries.
+        # Each arm's LD_LIBRARY_PATH selects its compatible dependency stack.
+        identities['full'] = dict(identities['reference'])
     return identities
+
+
+def inspect_artifacts(driver, envs, out, deadline=None):
+    """Retain ELF observations alongside the verified build-state identities.
+
+    Symbol absence is not failed hardening: optimization and function coverage
+    determine whether a particular DSO contains canary or fortified calls.
+    """
+    evidence = {}
+    for arm, env in envs.items():
+        flags = driver.get_flags(arm)
+        records = []
+        prefixes = [driver.ROOT/'install'/p/arm for p in ('fftw-mpi','hdf5-mpi')]
+        prefixes += [Path(env['MPI_PREFIX']),Path(env['TRIAL_UCX_PREFIX'])]
+        for prefix in prefixes:
+            for path in sorted({p.resolve() for p in (prefix/'lib').glob('*.so*') if p.is_file()}):
+                remaining = deadline-time.monotonic() if deadline is not None else 30
+                if remaining<5:
+                    raise BudgetExhausted('Budget exhausted during artifact inspection; no timings started')
+                result = subprocess.run(['readelf','-W','-l','-d','-s',str(path)],
+                    env=env,capture_output=True,text=True,timeout=min(30,remaining))
+                if result.returncode:
+                    raise RuntimeError(f'Cannot inspect built library {path}: {result.stderr}')
+                value = result.stdout
+                row = {'path':str(path),'gnu_relro':'GNU_RELRO' in value,
+                       'bind_now':bool(re.search(r'BIND_NOW|FLAGS[^\n]*\bNOW\b',value)),
+                       'stack_canary_symbol':'__stack_chk_fail' in value,
+                       'fortified_symbols':sorted(set(re.findall(r'\b(__\w+_chk)\b',value)))}
+                requested = flags['SHARED_LDFLAGS']
+                if ('-z,relro' in requested and not row['gnu_relro'] or
+                    '-z,now' in requested and not row['bind_now']):
+                    raise RuntimeError(f'Requested RELRO/NOW protection is missing from {path}')
+                records.append(row)
+        if not records:
+            raise RuntimeError(f'No shared library artifacts inspected for {arm}')
+        evidence[arm] = {'flags':flags,'libraries':records}
+    save(out/'artifact-evidence.json',evidence)
+    return evidence
 
 
 def launch(env, binary, layout_path, arguments, folder, args, deadline, qualify=False):
@@ -241,6 +288,7 @@ def launch(env, binary, layout_path, arguments, folder, args, deadline, qualify=
     rpn = layout['ranks_per_node']
     hosts = list(layout['hosts'])
     child = env.copy()
+    child['TRIAL_PRODUCTION_CALLER_SHA256'] = hashlib.sha256(Path(binary).read_bytes()).hexdigest()
     child['TRIAL_PRODUCTION_QUALIFY'] = '1' if qualify else '0'
     if qualify:
         child['UCX_LOG_LEVEL'] = 'info'
@@ -277,7 +325,8 @@ def launch(env, binary, layout_path, arguments, folder, args, deadline, qualify=
 
 def caller_args(mode, shape, steps, args, path, preflight=False):
     cadence = min(steps,args.checkpoint_every) if mode=='integrated' else 1
-    return [mode,*shape,steps,cadence,int(args.io_mib_per_rank*1024*1024)//8,path,int(preflight)]
+    return [mode,*shape,steps,cadence,int(args.io_mib_per_rank*1024*1024)//8,path,int(preflight),
+            getattr(args,'fields',1),getattr(args,'fft_plan','estimate')]
 
 
 def interval(full, reference, seed):
@@ -293,19 +342,24 @@ def interval(full, reference, seed):
 
 def report(out):
     manifest = json.loads((out/'manifest.json').read_text())
+    scope = manifest.get('scope','stack')
+    limit = manifest.get('arguments',{}).get('overhead_limit_percent')
     rows, summaries, details = [], [], []
     for condition in manifest.get('conditions',[]):
         records = condition.get('pairs',[])
         full, reference = [], []
         for record in records:
             for arm, value in record.get('results',{}).items():
-                row = {'condition':condition['name'],'pair':record['pair'],'arm':arm,
+                row = {'condition':condition['name'],'scope':scope,'pair':record['pair'],'arm':arm,
                        'nodes':condition['nodes'],'ranks_per_node':condition['ranks_per_node'],
                        'steps':condition.get('steps'),'loop_seconds':value['loop_seconds'],
                        'process_elapsed_seconds':value['process_elapsed_seconds'],
                        'planning_seconds':value['planning_seconds'],'checkpoints':value['checkpoints'],
                        'checkpoint_bytes':value['checkpoint_bytes'],'max_rank_rss_bytes':value['max_rank_rss_bytes'],
-                       'error':value['error'],'complete_pair':record.get('status')=='passed'}
+                       'error':value['error'],'complete_pair':record.get('status')=='passed',
+                       'fields':condition.get('fields',1),'fft_plan':condition.get('fft_plan','estimate'),
+                       'seconds_per_step':value['loop_seconds']/value.get('steps',condition.get('steps',1)),
+                       'fft_transforms_per_run':2*condition.get('fields',1)*value.get('steps',condition.get('steps',1)) if condition.get('mode') in ('fft','integrated') else 0}
                 rows.append(row)
                 details.append(({k:row[k] for k in ('condition','pair','arm')},value))
             if record.get('status')=='passed':
@@ -313,21 +367,28 @@ def report(out):
                 reference.append(record['results']['reference']['loop_seconds'])
         if full:
             lo,hi = interval(full,reference,manifest['seed'])
-            summaries.append({'condition':condition['name'],'pairs':len(full),
+            complete = condition['status']=='passed' and len(full)==manifest['requested_pairs']
+            assessment = 'incomplete' if not complete else 'not_declared' if limit is None else (
+                'within_limit' if hi is not None and hi<=limit else
+                'above_limit' if lo is not None and lo>limit else 'unresolved')
+            summaries.append({'condition':condition['name'],'scope':scope,'pairs':len(full),
                 'requested_pairs':manifest['requested_pairs'],'status':condition['status'],
                 'full_mean_seconds':statistics.mean(full),'reference_mean_seconds':statistics.mean(reference),
                 'full_stdev_seconds':statistics.stdev(full) if len(full)>1 else None,
                 'reference_stdev_seconds':statistics.stdev(reference) if len(reference)>1 else None,
                 'delta_seconds':statistics.mean([f-r for f,r in zip(full,reference)]),
                 'runtime_increase_percent':100*(statistics.mean(full)/statistics.mean(reference)-1),
-                'interval_low_percent':lo,'interval_high_percent':hi})
+                'interval_low_percent':lo,'interval_high_percent':hi,
+                'overhead_limit_percent':limit,'assessment':assessment})
     fields = {
-        'pairs.csv': ['condition','pair','arm','nodes','ranks_per_node','steps','loop_seconds',
-            'process_elapsed_seconds','planning_seconds','checkpoints','checkpoint_bytes','max_rank_rss_bytes','error','complete_pair'],
+        'pairs.csv': ['condition','scope','pair','arm','nodes','ranks_per_node','steps','loop_seconds',
+            'process_elapsed_seconds','planning_seconds','checkpoints','checkpoint_bytes','max_rank_rss_bytes','error','complete_pair',
+            'fields','fft_plan','seconds_per_step','fft_transforms_per_run'],
         'iterations.csv': ['condition','pair','arm','step','compute_maxrank_seconds','write_maxrank_seconds'],
-        'io-modes.csv': ['condition','pair','arm','rank','step','actual_mode','local_cause','global_cause'],
-        'summary.csv': ['condition','pairs','requested_pairs','status','full_mean_seconds','reference_mean_seconds',
-            'full_stdev_seconds','reference_stdev_seconds','delta_seconds','runtime_increase_percent','interval_low_percent','interval_high_percent'],
+        'io-modes.csv': ['condition','pair','arm','rank','step','field','actual_mode','local_cause','global_cause'],
+        'summary.csv': ['condition','scope','pairs','requested_pairs','status','full_mean_seconds','reference_mean_seconds',
+            'full_stdev_seconds','reference_stdev_seconds','delta_seconds','runtime_increase_percent','interval_low_percent','interval_high_percent',
+            'overhead_limit_percent','assessment'],
     }
     for name, data in (('pairs.csv',rows),('iterations.csv',None),('io-modes.csv',None),('summary.csv',summaries)):
         with (out/name).open('w',newline='') as stream:
@@ -344,19 +405,23 @@ def report(out):
                         raw = json.loads(path.read_text())
                     key = 'iterations' if name=='iterations.csv' else 'io_modes'
                     writer.writerows({**prefix,**entry} for entry in raw.get(key,[]))
-    save(out/'summary.json',{'schema_version':1,'status':manifest['status'],'summaries':summaries,
-         'scope':'Complete matched stack; measured mini-application loops, not application-wide/security conclusions.',
+    description = ('One fixed ordinarily compiled caller; switched complete library/dependency stacks.' if scope=='deployment'
+                   else 'Complete matched stack including caller compilation.')
+    save(out/'summary.json',{'schema_version':2,'status':manifest['status'],'summaries':summaries,
+         'scope':scope,'scope_description':description,
          'uncertainty':'95% percentile bootstrap of fresh process pairs; iterations/ranks are not independent samples.'})
     # Standalone quick-look dashboard, no network or Python plotting dependency.
     # Data in this HTML contains only condition labels and aggregate measurements.
     table = ''.join('<tr>'+''.join('<td>'+html.escape(str(row[key]))+'</td>' for key in
-        ('condition','pairs','delta_seconds','runtime_increase_percent','interval_low_percent','interval_high_percent'))+'</tr>'
+        ('condition','status','pairs','requested_pairs','delta_seconds','runtime_increase_percent','interval_low_percent','interval_high_percent','assessment'))+'</tr>'
         for row in summaries)
     payload = json.dumps(summaries).replace('<','\\u003c')
+    status = html.escape(manifest['status'])
+    unmeasured = ', '.join(c['name'] for c in manifest.get('conditions',[]) if not any(p.get('status')=='passed' for p in c.get('pairs',[])))
     (out/'report.html').write_text('''<!doctype html><meta charset="utf-8"><title>Production comparison</title>
 <style>body{font:16px system-ui;max-width:1100px;margin:2em auto;padding:1em}td,th{padding:.5em;text-align:left}table{border-collapse:collapse}tr{border-bottom:1px solid #ddd}canvas{width:100%}</style>
-<h1>Complete-stack runtime comparison</h1><p>Positive change means full is slower. Bars show paired mean runtime change; lines show 95% bootstrap intervals. Partial results are retained. Passing correctness does not establish acceptable overhead.</p>
-<canvas id="chart"></canvas><table><tr><th>Condition</th><th>Pairs</th><th>Delta seconds</th><th>Change %</th><th>Low %</th><th>High %</th></tr>'''+table+'''</table>
+<h1>Library workflow runtime comparison</h1><p>'''+description+'''</p><p>Campaign status: <b>'''+status+'''</b>. Conditions without complete pairs: '''+html.escape(unmeasured or 'none')+'''.</p><p>Positive change means full is slower. Bars show paired mean runtime change; lines show 95% bootstrap intervals. Partial results are retained. Passing correctness does not establish acceptable overhead. Assessment uses the declared overhead limit; within_limit applies to this condition and does not replace independent-allocation confirmation.</p>
+<canvas id="chart"></canvas><table><tr><th>Condition</th><th>Status</th><th>Pairs</th><th>Requested</th><th>Delta seconds</th><th>Change %</th><th>Low %</th><th>High %</th><th>Assessment</th></tr>'''+table+'''</table>
 <p>Use pairs.csv, iterations.csv and io-modes.csv for further analysis. Loop walltime is measured directly; do not sum per-phase maxima or multiply a percentage by the iteration count.</p>
 <script>
 const rows='''+payload+''';const c=document.getElementById('chart');c.width=1050;c.height=Math.max(100,rows.length*40+40);const x=c.getContext('2d');x.font='13px system-ui';
@@ -389,11 +454,14 @@ def campaign(driver, args):
         fields = list(map(int,clock.split(':')))
         seconds = int(day)*86400 + sum(v*60**i for i,v in enumerate(reversed(fields)))
         deadline = min(deadline,started+seconds-120)
-    manifest = {'schema_version':1,'status':'inventory','requested_pairs':args.pairs,'seed':args.seed,
-                'job_id':os.environ['SLURM_JOB_ID'],'hosts':selected,'arguments':vars(args),
+    scope = getattr(args,'scope','stack')
+    manifest = {'schema_version':2,'status':'inventory','requested_pairs':args.pairs,'seed':args.seed,
+                'job_id':os.environ['SLURM_JOB_ID'],'hosts':selected,
+                'arguments':{key:str(value) if isinstance(value,Path) else value for key,value in vars(args).items()},
                 'procedure_commit':(driver.HERE/'procedure.txt').read_text().strip(),
                 'effective_profile':driver.read(driver.HERE/'qualification.json'),
-                'scope':'stack','conditions':[],'logical_write_bytes_reserved':0,
+                'scope':scope,'caller_policy':'one fixed reference executable' if scope=='deployment' else 'matched callers per stack',
+                'conditions':[],'logical_write_bytes_reserved':0,
                 'budget_seconds':max(0,deadline-started),'scaling':'explicit fixed global FFT shape' if args.shape else 'volume per rank; rounded balanced slab shape',
                 'completion':'HDF5 global flush and close; final restart read is outside loop timing; no physical-durability or cold-cache claim'}
     manifest['workflow_sha256'] = {p.name:hashlib.sha256(p.read_bytes()).hexdigest()
@@ -441,7 +509,8 @@ def campaign(driver, args):
             print(f'{name}: {rpn} verified physical cores/node selected; safe capacities {capacities}; FFT shape {shape}',flush=True)
             for mode in args.workloads:
                 manifest['conditions'].append({'name':name+'-'+mode,'layout':path.name,'nodes':nodes,
-                    'ranks_per_node':rpn,'host_group':group_index,'shape':shape,'mode':mode,'status':'pending','pairs':[]})
+                    'ranks_per_node':rpn,'host_group':group_index,'shape':shape,'mode':mode,'status':'pending','pairs':[],
+                    'fields':getattr(args,'fields',1),'fft_plan':getattr(args,'fft_plan','estimate')})
         if args.audit_only:
             manifest['status'] = 'audit_passed_no_measurements'
             return out
@@ -454,11 +523,17 @@ def campaign(driver, args):
         for package in ('fftw-mpi','hdf5-mpi'):
             for arm in ('full','reference'):
                 driver.verify_test_tree(package,arm)
+        manifest['library_stacks'] = {arm:{package:driver.verify_state(package+'-'+arm)
+            for package in ('fftw-mpi','hdf5-mpi','openmpi','ucx')} for arm in ('full','reference')}
         envs = {arm:runtime(driver.ROOT,arm,args.slurm_overlap) for arm in ('full','reference')}
         if selected_env(envs['full']) != selected_env(envs['reference']):
             raise RuntimeError('Full/reference runtime settings differ; resolve before comparisons')
         manifest['runtime_settings'] = selected_env(envs['full'])
+        inspect_artifacts(driver,envs,out,deadline)
         identities = compile_callers(driver,envs,out,args,deadline)
+        if scope=='deployment' and (identities['full']['binary']!=identities['reference']['binary'] or
+                identities['full']['binary_sha256']!=identities['reference']['binary_sha256']):
+            raise RuntimeError('Deployment scope requires the identical caller executable in both arms')
         manifest['callers'] = identities
         manifest['status'] = 'running'; save(out/'manifest.json',manifest)
         rng = random.Random(args.seed)
@@ -510,8 +585,8 @@ def campaign(driver, args):
             initial_steps = args.checkpoint_every if mode=='integrated' else 1
             calibrations = {arm:execute(arm,initial_steps,arm+'-calibration') for arm in ('full','reference')}
             seconds = max(value['loop_seconds'] for value in calibrations.values())
-            steps = max(initial_steps,min(args.max_steps,math.ceil(initial_steps*args.target_seconds/max(seconds,1e-6))))
-            if mode=='integrated':
+            steps = getattr(args,'steps',None) or max(initial_steps,min(args.max_steps,math.ceil(initial_steps*args.target_seconds/max(seconds,1e-6))))
+            if mode=='integrated' and not getattr(args,'steps',None):
                 steps = min(args.max_steps,(math.ceil(steps/args.checkpoint_every))*args.checkpoint_every)
             if size:
                 remaining_io = sum(c['mode']!='fft' and c['status']!='passed' for c in manifest['conditions'])
@@ -523,6 +598,8 @@ def campaign(driver, args):
                     raise BudgetExhausted('Not enough logical-write budget to sample remaining I/O conditions')
                 budget_steps = checkpoints_per_run*(args.checkpoint_every if mode=='integrated' else 1)
                 if steps>budget_steps:
+                    if getattr(args,'steps',None):
+                        raise BudgetExhausted('Fixed --steps cannot fit the logical-write budget; no work silently reduced')
                     steps = budget_steps
                     condition['io_budget_step_cap'] = steps
                     print(f'{name}: {steps} iterations fit the shared I/O budget; target duration may be shorter',flush=True)
@@ -574,6 +651,29 @@ def campaign(driver, args):
         print(f'Campaign status: {manifest["status"]}; evidence retained at {out}',flush=True)
 
 
+def run_reframe(driver, argv, args):
+    """One serial ReFrame check runs this controller in the same allocation."""
+    reframe = driver.check_reframe()
+    parent = driver.ROOT/'results/production-reframe'
+    parent.mkdir(parents=True,exist_ok=True)
+    out = Path(tempfile.mkdtemp(prefix=datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ-'),dir=parent))
+    child_args = [value for value in argv if value!='--reframe']
+    command = [sys.executable,str(driver.HERE/'trial.py'),'production',*child_args,
+               '--result-pointer',str(out/'campaign.json')]
+    save(out/'invocation.json',{'command':command})
+    env = os.environ.copy()
+    env.update(TRIAL_PRODUCTION_COMMAND=json.dumps(command),TRIAL_PRODUCTION_POINTER=str(out/'campaign.json'),
+               TRIAL_ROOT=str(driver.ROOT))
+    cmd = [str(reframe),'-C',str(HERE/'reframe_settings.py'),'-c',str(HERE/'reframe_check.py'),
+           '-r','--exec-policy=serial','--performance-report','--prefix='+str(out/'rfm'),
+           '--report-file='+str(out/'report.json')]
+    print(f'ReFrame report: {out}/report.json',flush=True)
+    result = subprocess.run(cmd,env=env)
+    if result.returncode:
+        raise RuntimeError(f'ReFrame campaign incomplete or failed; inspect {out}/report.json and retained campaign evidence')
+    return out
+
+
 def main(driver, argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--nodes',default='2',help='Comma-separated node scales, e.g. 2,4,8')
@@ -581,6 +681,13 @@ def main(driver, argv):
     parser.add_argument('--hosts',help='Optional ordered subset of allocation hosts')
     parser.add_argument('--groups-per-scale',type=int,default=1,help='Bounded rotated host groups per node scale')
     parser.add_argument('--workloads',default=','.join(MODES))
+    parser.add_argument('--scope',choices=('stack','deployment'),default='stack',
+                        help='stack: matched callers; deployment: one ordinary/reference caller, switched complete library stacks')
+    parser.add_argument('--reframe',action='store_true',help='Run this campaign through the prepared ReFrame, in the current allocation')
+    parser.add_argument('--fields',type=int,default=1,help='Persistent fields per iteration/checkpoint (1..16); FFT volume is per field')
+    parser.add_argument('--fft-plan',choices=('estimate','measure'),default='estimate',help='Reused FFTW plan policy; planning is recorded separately')
+    parser.add_argument('--steps',type=int,help='Freeze iteration count across selected layouts; do not calibrate work to duration')
+    parser.add_argument('--overhead-limit-percent',type=float,help='Predeclared practical limit; assessed against the interval, never just the point estimate')
     parser.add_argument('--shape',help='Fixed global FFT dimensions nx,ny,nz; default balanced volume/rank')
     parser.add_argument('--fft-mib-per-rank',type=float,default=8)
     parser.add_argument('--io-mib-per-rank',type=float,default=8)
@@ -600,6 +707,7 @@ def main(driver, argv):
     group.add_argument('--reservations',help='Private JSON mapping each short hostname to verified OS CPU reservation')
     parser.add_argument('--audit-only',action='store_true')
     parser.add_argument('--report',type=Path,help='Regenerate CSV/HTML locally; no scheduler or build required')
+    parser.add_argument('--result-pointer',type=Path,help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.report:
         report(args.report.expanduser().resolve()); return
@@ -610,7 +718,7 @@ def main(driver, argv):
         args.shape = list(map(int,args.shape.split(','))) if args.shape else None
         if min(args.nodes)<1 or args.groups_per_scale<1 or any(v!='all' and int(v)<1 for v in args.ranks_per_node):
             raise ValueError('Node/rank counts must be positive')
-        if not set(args.workloads)<=set(MODES):
+        if not args.workloads or not set(args.workloads)<=set(MODES):
             raise ValueError('Unknown workload')
         if args.shape and (len(args.shape)!=3 or min(args.shape)<2):
             raise ValueError('Shape needs three dimensions of at least two')
@@ -618,6 +726,12 @@ def main(driver, argv):
             raise ValueError('I/O volume must contain at least one double per rank')
         if args.pairs<2 or args.pairs%2 or not 1<=args.checkpoint_every<=args.max_steps<=10000:
             raise ValueError('Use an even pair count >=2 and 1 <= checkpoint-every <= max-steps <=10000')
+        if not 1<=args.fields<=16 or args.steps is not None and not 1<=args.steps<=args.max_steps:
+            raise ValueError('Use 1..16 fields and a fixed step count in 1..max-steps')
+        if args.overhead_limit_percent is not None and (not math.isfinite(args.overhead_limit_percent) or args.overhead_limit_percent<0):
+            raise ValueError('Overhead limit must be finite and nonnegative')
+        if args.reframe and args.audit_only:
+            raise ValueError('Run --audit-only directly before the ReFrame measurements')
         if not 0<args.memory_fraction<=.75 or not 5<=args.timeout<=3600:
             raise ValueError('Memory fraction must be (0,.75]; timeout must be 5..3600 seconds')
         for value in (args.fft_mib_per_rank,args.io_mib_per_rank,args.target_seconds,args.budget_minutes,
@@ -626,9 +740,14 @@ def main(driver, argv):
                 raise ValueError('Sizes, duration and storage budgets must be finite and positive')
     except ValueError as error:
         parser.error(str(error))
+    if args.reframe:
+        return run_reframe(driver,argv,args)
     with (driver.HERE/'lock').open('a') as lock:
         try:
             fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError('A trial command is active; start production after it finishes') from None
-        campaign(driver,args)
+        out = campaign(driver,args)
+        if args.result_pointer:
+            save(args.result_pointer,{'campaign':str(out)})
+        return out

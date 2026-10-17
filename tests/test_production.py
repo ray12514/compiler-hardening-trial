@@ -5,6 +5,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -238,6 +239,7 @@ class CampaignTests(unittest.TestCase):
         self.assertNotIn('UCX_PREFIX',result)
         self.assertNotIn('UCX_LOG_LEVEL',result)
         self.assertEqual(result['TRIAL_UCX_PREFIX'],'/private/ucx')
+        self.assertTrue(result['LD_LIBRARY_PATH'].startswith('/private/trial/install/fftw-mpi/reference/lib:/private/trial/install/hdf5-mpi/reference/lib'))
         self.assertEqual(result['OMPI_MCA_plm_slurm_args'],'--kill-on-bad-exit=1 --overlap')
         self.assertEqual(result['OMP_NUM_THREADS'],'1')
         for tls in ('all','tcp,sm,self','rc,tcp,sm,self'):
@@ -249,13 +251,13 @@ class CampaignTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); runner=root/'runner'; runner.mkdir(); (runner/'procedure.txt').write_text('test-commit')
             driver=types.SimpleNamespace(ROOT=root,HERE=runner,require_setup=lambda **kw:None,
-                verify_test_tree=lambda *a:None, read=lambda *a:{'identity':'complete-test'})
+                verify_test_tree=lambda *a:None, verify_state=lambda name:{'identity':name},read=lambda *a:{'identity':'complete-test'})
             observed=[]
             def launch(env,binary,layout_path,arguments,folder,*rest,**kwargs):
                 layout=json.loads(layout_path.read_text())
                 if arguments==['qualify']: return {'qualification_passed':True}
                 mode=arguments[0]; steps=int(arguments[4])
-                if arguments[-1]==1:
+                if arguments[8]==1:
                     return {'preflight_passed':True,'estimated_rank_bytes':4096,'local_slabs_min':1,
                             'local_slabs_max':1,'checkpoint_bytes':0 if mode=='fft' else 1024}
                 observed.append((env['arm'],str(layout_path),tuple(arguments[:7]),folder.name))
@@ -269,6 +271,7 @@ class CampaignTests(unittest.TestCase):
                  patch.object(campaign.subprocess,'check_output',return_value='06:00:00'), \
                  patch.object(campaign,'audit',return_value={'a':inventory(),'b':inventory('b')}), \
                  patch.object(campaign,'runtime',side_effect=lambda root,arm,overlap:{'arm':arm}), \
+                 patch.object(campaign,'inspect_artifacts'), \
                  patch.object(campaign,'compile_callers',return_value={arm:{'binary':'/test/'+arm} for arm in ('full','reference')}), \
                  patch.object(campaign,'launch',side_effect=launch), contextlib.redirect_stdout(io.StringIO()):
                 out=campaign.campaign(driver,args(max_written_gib=100*1024/1024**3))
@@ -292,6 +295,92 @@ class CampaignTests(unittest.TestCase):
             for a,b in zip(observed[2::2],observed[3::2]):
                 # Pair launch placement/work must not depend on the arm.
                 self.assertEqual(a[1:3],b[1:3])
+
+    def test_deployment_compiles_one_reference_caller_and_reuses_its_exact_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); calls=[]; profiles=[]
+            def flags(arm):
+                profiles.append(arm)
+                return {'EXE_CFLAGS':'-O3 -fno-stack-protector','EXE_LDFLAGS':'-no-pie'}
+            driver=types.SimpleNamespace(ROOT=root,get_flags=flags,verify_state=lambda name:{'identity':name})
+            envs={arm:{'MPI_PREFIX':'/'+arm+'/mpi'} for arm in ('full','reference')}
+            def compile_run(command,*rest):
+                calls.append(command)
+                Path(command[-1]).write_bytes(b'fixed ordinary executable')
+            with patch.object(campaign,'run',side_effect=compile_run):
+                identities=campaign.compile_callers(driver,envs,root,args(scope='deployment'),100)
+            self.assertEqual(profiles,['reference'])
+            self.assertEqual(len(calls),1)
+            self.assertEqual(calls[0][0],'/reference/mpi/bin/mpicc')
+            self.assertEqual(identities['full'],identities['reference'])
+            self.assertEqual(identities['full']['binary_sha256'],hashlib.sha256(b'fixed ordinary executable').hexdigest())
+
+    def test_fixed_step_work_is_not_silently_reduced_to_fit_io_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); runner=root/'runner'; runner.mkdir(); (runner/'procedure.txt').write_text('test')
+            driver=types.SimpleNamespace(ROOT=root,HERE=runner,require_setup=lambda **kw:None,
+                verify_test_tree=lambda *a:None,verify_state=lambda name:{'identity':name},read=lambda *a:{})
+            launches=[]
+            def launch(env,binary,layout_path,arguments,folder,*rest,**kw):
+                if arguments==['qualify']: return {'qualification_passed':True}
+                if arguments[8]:
+                    return dict(preflight_passed=True,estimated_rank_bytes=4096,local_slabs_min=1,
+                                local_slabs_max=1,checkpoint_bytes=1024)
+                launches.append(folder.name)
+                return dict(loop_seconds=.05,process_elapsed_seconds=.1,planning_seconds=0,
+                    steps=arguments[4],checkpoints=1,checkpoint_bytes=1024,max_rank_rss_bytes=1024,error=0,
+                    iterations=[],io_modes=[])
+            with patch.dict(os.environ,{'SLURM_JOB_ID':'123','IO_DIR':str(root/'io')}), \
+                 patch.object(campaign,'allocation',return_value=(['a'],{'a':92},92,'')), \
+                 patch.object(campaign.subprocess,'check_output',return_value='06:00:00'), \
+                 patch.object(campaign,'audit',return_value={'a':inventory()}), \
+                 patch.object(campaign,'runtime',return_value={}),patch.object(campaign,'inspect_artifacts'), \
+                 patch.object(campaign,'compile_callers',return_value={arm:{'binary':'/loop'} for arm in ('full','reference')}), \
+                 patch.object(campaign,'launch',side_effect=launch),contextlib.redirect_stdout(io.StringIO()):
+                out=campaign.campaign(driver,args(nodes=[1],workloads=['collective'],steps=8,
+                    result_pointer=root/'pointer.json',max_written_gib=10*1024/1024**3))
+            manifest=json.loads((out/'manifest.json').read_text())
+            self.assertEqual(manifest['status'],'budget_exhausted_partial')
+            self.assertEqual(manifest['arguments']['steps'],8)
+            self.assertEqual(launches,['full-calibration','reference-calibration'])
+            self.assertFalse(manifest['conditions'][0]['pairs'])
+
+    def test_artifact_inspection_requires_requested_linker_protections_not_every_symbol(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            envs={'full':{'MPI_PREFIX':str(root/'mpi'),'TRIAL_UCX_PREFIX':str(root/'ucx')}}
+            for prefix in (root/'install/fftw-mpi/full',root/'install/hdf5-mpi/full',root/'mpi',root/'ucx'):
+                (prefix/'lib').mkdir(parents=True)
+                (prefix/'lib/libexample.so').write_bytes(b'ELF')
+            driver=types.SimpleNamespace(ROOT=root,get_flags=lambda arm:{'SHARED_LDFLAGS':'-Wl,-z,relro -Wl,-z,now'})
+            with patch.object(campaign.subprocess,'run',return_value=types.SimpleNamespace(returncode=0,stdout='GNU_RELRO\nFLAGS BIND_NOW',stderr='')):
+                rows=campaign.inspect_artifacts(driver,envs,root)['full']['libraries']
+            self.assertEqual(len(rows),4)
+            self.assertTrue(all(not r['stack_canary_symbol'] and not r['fortified_symbols'] for r in rows))
+            with patch.object(campaign.subprocess,'run',return_value=types.SimpleNamespace(returncode=0,stdout='GNU_RELRO',stderr='')), \
+                 self.assertRaisesRegex(RuntimeError,'RELRO/NOW'):
+                campaign.inspect_artifacts(driver,envs,root)
+
+    def test_report_separates_scope_threshold_decision_and_partial_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out=Path(tmp)
+            value={'loop_seconds':1,'process_elapsed_seconds':2,'planning_seconds':.1,'steps':4,'checkpoints':2,
+                   'checkpoint_bytes':8,'max_rank_rss_bytes':1024,'error':0,'iterations':[],
+                   'io_modes':[{'rank':0,'step':2,'field':2,'actual_mode':4,'local_cause':0,'global_cause':0}]}
+            conditions=[]
+            for name,status,full in [('equal','passed',1),('slower','passed',1.1),('unfinished','budget_exhausted_partial',1)]:
+                conditions.append({'name':name,'mode':'integrated','nodes':1,'ranks_per_node':16,'steps':4,'fields':3,
+                    'fft_plan':'measure','status':status,'pairs':[{'pair':p,'status':'passed','results':
+                    {'full':dict(value,loop_seconds=full),'reference':value}} for p in range(4)]})
+            campaign.save(out/'manifest.json',{'scope':'deployment','status':'budget_exhausted_partial','seed':1,
+                'requested_pairs':4,'arguments':{'overhead_limit_percent':1},'conditions':conditions})
+            with contextlib.redirect_stdout(io.StringIO()):
+                rows=campaign.report(out)
+            self.assertEqual([r['assessment'] for r in rows],['within_limit','above_limit','incomplete'])
+            self.assertTrue(all(r['scope']=='deployment' for r in rows))
+            self.assertIn('one fixed', (out/'report.html').read_text().lower())
+            self.assertIn('seconds_per_step',(out/'pairs.csv').read_text())
+            self.assertIn('field',(out/'io-modes.csv').read_text())
 
     def test_failed_and_unpaired_results_are_retained_but_not_in_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -331,17 +420,19 @@ class RankGuardTests(unittest.TestCase):
     def test_guard_applies_exact_os_cpu_and_keeps_threads_on_one_core(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); layout=root/'layout.json'
+            binary=root/'loop'; binary.write_bytes(b'fixed-caller')
             layout.write_text(json.dumps({'ranks_per_node':1,'hosts':{'a':{'cpus':[7],
                 'excluded_cpus':[19,20,21,22],'reservation_evidence':[],
                 'memory_budget_bytes':1024**3}}}))
             env={'OMPI_COMM_WORLD_RANK':'0','OMPI_COMM_WORLD_LOCAL_RANK':'0',
                 'OMPI_COMM_WORLD_LOCAL_SIZE':'1','SLURM_JOB_ID':'123','TRIAL_MPI_PREFIX':'/mpi',
                 'TRIAL_UCX_PREFIX':'/ucx','TRIAL_ROOT':str(root),'TRIAL_PRODUCTION_ARM':'full',
+                'TRIAL_PRODUCTION_CALLER_SHA256':hashlib.sha256(binary.read_bytes()).hexdigest(),
                 'OMP_NUM_THREADS':'92'}
             loaded='libmpi.so => /mpi/lib/libmpi.so\n'
             loaded+=f'libfftw3.so => {root}/install/fftw-mpi/full/lib/libfftw3.so\n'
             loaded+=f'libhdf5.so => {root}/install/hdf5-mpi/full/lib/libhdf5.so\n'
-            with patch.object(sys,'argv',['rank.py',str(layout),str(root),'/loop','qualify']), \
+            with patch.object(sys,'argv',['rank.py',str(layout),str(root),str(binary),'qualify']), \
                  patch.dict(os.environ,env,clear=True), patch.object(production_rank.socket,'gethostname',return_value='a'), \
                  patch.object(production_rank,'job_cgroup',return_value=(root,{7,19},root)), \
                  patch.object(production_rank.os,'sched_setaffinity',create=True) as pin, \
@@ -352,6 +443,7 @@ class RankGuardTests(unittest.TestCase):
             pin.assert_called_once_with(0,{7})
             self.assertEqual(execute.call_args.args[2]['OMP_NUM_THREADS'],'1')
             self.assertEqual(json.loads((root/'rank-0.json').read_text())['cpus'],[7])
+            self.assertEqual(json.loads((root/'rank-0.json').read_text())['binary_sha256'],env['TRIAL_PRODUCTION_CALLER_SHA256'])
 
     def test_guard_rejects_mixed_libraries(self):
         with self.assertRaisesRegex(RuntimeError,'Missing/mixed'):

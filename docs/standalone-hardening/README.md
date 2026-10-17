@@ -835,6 +835,150 @@ conditions, rather than one pooled average. Choose its runtime budget using
 the pilot's recorded durations. Skip to step 4 below only when testing one
 package independently.
 
+## Next session: fixed-caller application-pattern assessment
+
+Today's package pilots and dense results remain valid records of the matched
+caller-and-stack comparison. The [session report](../../output/pdf/compiler-hardening-session-report-2026-10-16.pdf)
+is provisional until the original paired data have been reviewed. The next
+question is deployment: **does an ordinarily compiled caller change performance
+when it uses our hardened libraries?** This phase uses the existing FFTW/HDF5
+harness; it does not require building a complete application or adding an
+unrelated package.
+
+1. Preserve the original result directories. Review paired timings, intervals,
+   work sizes, actual I/O modes and build records; keep different allocations,
+   layouts and partial conditions separate.
+2. Pull and reinstall the driver using the commands below. Keep the completed
+   full/reference packages. The new workload source gets a new caller identity;
+   it does not overwrite old callers or rerun package builds. Existing profile
+   and package recipe blocks are unchanged; `refresh-tests` is not needed for
+   this production-only update.
+3. In the next compute allocation, audit its usable physical cores and service
+   reservations. Run a short, fixed-work deployment pilot through ReFrame.
+4. Review correctness, actual bindings/library paths, achieved timing precision
+   and memory/I/O cost. Then increase density and scale in bounded runs. Agree
+   on the meaningful overhead limit before confirmation sampling; repeat
+   selected conditions in an independent allocation.
+
+```bash
+export TRIAL_ROOT="$HOME/COMPILER_HARDENING"
+export RUNBOOK_REPO="$TRIAL_ROOT/compiler-hardening-trial"
+git -C "$RUNBOOK_REPO" pull --ff-only
+python3 "$RUNBOOK_REPO/scripts/install_driver.py" --trial-root "$TRIAL_ROOT"
+"$TRIAL_ROOT/runner/trial" prepare-tests --check
+```
+
+Inside the allocation, keep the existing shared `IO_DIR`. The first candidate
+uses three persistent fields, reused measured plans, 32 iterations, and a
+checkpoint every eight iterations. These are explicit starting parameters, not
+a claim to reproduce an identified CFD or LAMMPS input. Change them to match the
+chosen site's transform sizes, field count and checkpoint cadence before the
+confirmation run.
+
+```bash
+: "${IO_DIR:?Keep IO_DIR set to the dedicated shared trial I/O directory}"
+"$TRIAL_ROOT/runner/trial" production --audit-only \
+  --nodes 1,2 --ranks-per-node 16 --slurm-overlap
+
+"$TRIAL_ROOT/runner/trial" production --scope deployment --reframe \
+  --nodes 1,2 --ranks-per-node 16 --shape 256,256,256 \
+  --fields 3 --fft-plan measure --steps 32 --checkpoint-every 8 \
+  --pairs 4 --budget-minutes 60 --slurm-overlap
+```
+
+Use node scales that actually fit the allocation. In the interactive session
+that required overlap, retain `--slurm-overlap`: this reaches Open MPI's
+internal Slurm launch and the inventory `srun`. It is not MPI oversubscription.
+The audited WEKA exclusions, one rank per selected physical core and no TCP
+data fallback remain enforced. Add an operator-verified reservation override
+only if discovery needs it, using the same override on both commands.
+
+`--scope deployment` compiles **one reference caller once** and uses that exact
+executable and SHA-256 for both arms. The selected complete FFTW/HDF5/MPI/UCX
+stack changes through its runtime library paths. Every rank checks the caller
+hash and intended loaded-library paths. The same source versions and compatible
+interfaces are required. Header/inlined code remains that of the reference
+caller. `--scope stack` preserves the original matched-callers comparison.
+
+The driver verifies completed package artifact hashes and writes
+`artifact-evidence.json`: effective profile vectors, observed RELRO/NOW and
+canary/fortified-call symbols in installed DSOs. Requested linker protections
+must be present. A DSO without a fortified or canary symbol is not automatically
+unhardened: compiler decisions and function coverage can legitimately leave
+none. This evidence does not measure protection coverage of every function.
+
+`--fields` applies to FFT and standalone I/O: each persistent field has its own
+forward/inverse plans, and each checkpoint writes one dataset per field. FFT
+volumes and standalone I/O MiB targets are **per field, per rank**; memory and
+checkpoint/write budgets count all fields. The three-field example performs
+six global transforms per iteration; ranks are not extra independent samples.
+Measured planning is recorded separately and plans are reused during timing.
+Final numerical checks and checkpoint read-back remain outside loop timing.
+Dataset layout is still contiguous and checkpoints replace a single file; this
+does not cover chunked/compressed output, retained-file history, cold reads or
+every application I/O pattern.
+
+ReFrame runs one allocation-local controller check with serial execution,
+retaining the controller's CSV/JSON/HTML plus per-condition performance values
+in `results/production-reframe/TIMESTAMP/report.json`. Its `campaign.json`
+points to the underlying `results/production/` directory. There is no second
+timing harness. A budget-partial campaign is retained and **does not pass** the
+ReFrame completion check. Direct `production` runs still retain partial data
+without treating budget exhaustion as a numerical failure.
+ReFrame JSON/job output may contain private host information; use the
+controller's metric-only CSV/HTML for sharing.
+
+After reviewing that pilot, a candidate density run is:
+
+```bash
+"$TRIAL_ROOT/runner/trial" production --scope deployment --reframe \
+  --nodes 1,2 --ranks-per-node all --fields 3 --fft-plan measure \
+  --fft-mib-per-rank 2 --io-mib-per-rank 2 \
+  --steps 32 --checkpoint-every 8 --pairs 10 \
+  --budget-minutes 90 --slurm-overlap
+```
+
+This second command uses volume per rank rather than the first command's fixed
+global shape. Keep those experiments separate. After its costs are known,
+run `--nodes 4` and `--nodes 8` separately with the chosen frozen work definition;
+do not place the largest, still-missing condition last behind a broad sweep.
+Explicit shapes must satisfy the supported balanced slab constraints at every
+requested rank count. This distributed complex-FFT harness is a controlled
+application-pattern proxy, not LAMMPS PPPM's complete local-FFT/remap workflow.
+
+For confirmation, select an even pair count such as `--pairs 20` and set
+`--overhead-limit-percent` to the agreed limit. No acceptance limit is guessed
+by default. Reports distinguish `within_limit` (upper interval bound at or below
+the limit), `above_limit` (lower bound above it), `unresolved`, `incomplete` and
+`not_declared`. A within-limit result applies only to that completed condition;
+independent-allocation confirmation and deployment scope still matter. Fixed
+`--steps` is never silently reduced to fit a write budget; insufficient budget
+retains an explicitly partial campaign. Do not multiply a percent effect by
+node or iteration counts. CSV includes seconds per iteration and transform
+counts as well as observed whole-loop and whole-launch times.
+
+### Optional OSU baseline
+
+Include a small CPU-only OSU Micro-Benchmarks baseline to separate MPI behavior
+from the FFT/I/O workflow: `osu_latency` and `osu_bw` with exactly two ranks
+(one per node), then `osu_alltoall` and `osu_allreduce` at the qualified workload
+density. A two-rank point-to-point test is not a dense-network saturation test;
+`osu_mbw_mr` can be a later bounded addition if concurrent-pair behavior needs
+explanation. OSU's internal iterations are not independent process pairs.
+
+Use a pinned released OSU version, one ordinarily compiled executable per
+benchmark, and the compatible full/reference Open MPI/UCX stacks. Keep message
+sizes and OSU warmup/iteration settings identical, record version/build identity,
+binding and loaded libraries, and bound collective buffers against rank count
+and available memory. Report bandwidth in its original units (higher is better)
+and latency separately (lower is better); do not label bandwidth change as
+runtime overhead. No MVAPICH installation is required to use the MPI benchmarks
+with Open MPI. This is an **optional planned adapter**, not implemented by
+`trial production` in this update; it does not block the commands above or
+replace FFTW/HDF5 evidence. Download/build preparation belongs outside the timed
+allocation, with source checksum and offline handoff recorded first.
+[Official OSU benchmark descriptions](https://mvapich.cse.ohio-state.edu/benchmarks/)
+
 ## After the pilot: run production-density workloads
 
 The low-rank package pilot establishes runnable full/reference comparisons.
@@ -845,10 +989,13 @@ are screening cases; increasing only their node count does not provide that
 coverage.
 
 Use **`trial production`** for this stage. It reuses the completed libraries and
-compiles two new matched callers under separate identities. It does not rebuild
+compiles new callers under separate identities. Its default `--scope stack`
+uses matched callers; `--scope deployment` uses one fixed reference caller.
+It does not rebuild
 packages or replace the existing pilot callers. Package pilots still use
-ReFrame; the production controller launches its sustained callers directly with
-the private `mpirun` and exports CSV/JSON plus an offline HTML dashboard.
+ReFrame; the production controller launches sustained callers with the private
+`mpirun` and exports CSV/JSON plus an offline HTML dashboard. Add `--reframe` to
+run that same controller through ReFrame, as in the next-session workflow above.
 
 Wait for the current trial command to finish, then update the installed driver:
 
@@ -1009,7 +1156,8 @@ replace a representative CFD/application run.
 The [implementation and acceptance plan](14-production-workload-plan.md) records
 the broader assessment and later application-confirmation gate.
 
-The current scope stays **complete hardened stack versus complete reference**.
+Choose and retain the scope: **matched caller/stack** or **fixed ordinary caller
+with switched complete library stacks**. Earlier stack results keep their scope.
 Individual compiler-flag removals and package/component attribution are deferred
 until representative job-level costs and their uncertainty have been assessed.
 

@@ -286,3 +286,26 @@ mkdir -p "$TRIAL_ROOT/results/reframe/$RUN_ID"
 `IO_DIR` must be shared between those nodes. Rank binding is handled by Open MPI. Timed UCX logging stays off. To examine removals, install the selected variants first and change `COMPARATORS`, then run a new session with identical workloads and placement. A missing variant is a failed prerequisite, not a zero measurement.
 
 This starter uses allocation-local execution deliberately. A later site configuration can use ReFrame's Slurm scheduler and MPI launcher directly, but paired arms must still share a controlled allocation/placement. Do not submit independent full/reference jobs to unrelated node types and treat their difference as compiler overhead.
+
+## 6. Sustained fixed-caller workflows through ReFrame
+
+Use `trial production --scope deployment --reframe` for the
+[next-session application-pattern workflow](README.md#next-session-fixed-caller-application-pattern-assessment).
+The installer copies `production/reframe_check.py` and its allocation-local
+configuration alongside the controller. This adapter runs the existing
+controller once; it does not duplicate pairing, calibration, qualification,
+CPU/WEKA guards or reporting. It uses the prepared ReFrame 4.10.4 environment.
+No new pip install or package build happens in the timed allocation.
+
+The new result tree is `results/production-reframe/TIMESTAMP/`: ReFrame's
+`report.json`, job output, configuration evidence and `campaign.json`, which
+points at the original controller manifest and CSV/HTML exports. Each condition
+has separate full/reference seconds, absolute delta, percent change, interval
+endpoints and completed-pair count in the ReFrame performance report. A partial
+or failed campaign fails completion sanity while retaining its original data;
+passing sanity is not an overhead acceptance decision. The controller report
+assesses any explicitly declared `--overhead-limit-percent` against its interval.
+No threshold is chosen by default. Old package-pilot definitions and old result
+interpretations retain their existing meanings.
+
+[ReFrame performance and run-only checks](https://reframe-hpc.readthedocs.io/en/stable/tutorial.html)

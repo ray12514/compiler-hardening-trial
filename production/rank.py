@@ -1,6 +1,7 @@
 """Pin a rank to its audited OS CPU, verify libraries, then exec the caller."""
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -16,6 +17,7 @@ def libraries(text, family, prefix):
     paths = re.findall(family + r'\S*\s+=>\s+(\S+)', text)
     if 'not found' in text or not paths or any(not p.startswith(str(prefix)+'/lib/') for p in paths):
         raise RuntimeError(f'Missing/mixed {family} dependency; expected {prefix}/lib')
+    return paths
 
 
 def allowed_cpus(layout, row):
@@ -72,13 +74,16 @@ def main():
                  'BLIS_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS', 'NUMEXPR_NUM_THREADS'):
         env[name] = '1'
     mpi, ucx = Path(env['TRIAL_MPI_PREFIX']), Path(env['TRIAL_UCX_PREFIX'])
+    binary_hash = hashlib.sha256(Path(binary).read_bytes()).hexdigest()
+    if env.get('TRIAL_PRODUCTION_CALLER_SHA256') != binary_hash:
+        raise RuntimeError('Caller executable changed between controller and rank startup')
     loaded = subprocess.check_output(['ldd', binary], env=env, text=True, timeout=15)
     component = subprocess.check_output(['ldd', str(mpi/'lib/openmpi/mca_pml_ucx.so')],
                                         env=env, text=True, timeout=15)
-    libraries(loaded, r'lib(?:mpi|open-rte|open-pal)', mpi)
-    libraries(component, r'lib(?:ucp|uct|ucs|ucm)', ucx)
+    loaded_paths = libraries(loaded, r'lib(?:mpi|open-rte|open-pal)', mpi)
+    loaded_paths += libraries(component, r'lib(?:ucp|uct|ucs|ucm)', ucx)
     for family, package in ((r'libfftw3', 'fftw-mpi'), (r'libhdf5', 'hdf5-mpi')):
-        libraries(loaded, family, Path(env['TRIAL_ROOT'])/'install'/package/env['TRIAL_PRODUCTION_ARM'])
+        loaded_paths += libraries(loaded, family, Path(env['TRIAL_ROOT'])/'install'/package/env['TRIAL_PRODUCTION_ARM'])
     if env.get('TRIAL_PRODUCTION_QUALIFY') == '1':
         output = subprocess.check_output([str(ucx/'bin/ucx_info'), '-d'], env=env, text=True, timeout=20)
         if not re.search(r'Transport:\s*rc_(?:mlx5|verbs)\b', output):
@@ -87,6 +92,7 @@ def main():
     info = {'rank': rank, 'local_rank': local, 'host': host, 'cpus': observed,
             'allocation_source':row.get('allocation_source','slurm-job-cgroup'),
             'mpi_prefix': str(mpi), 'ucx_prefix': str(ucx),
+            'binary_sha256':binary_hash,'loaded_library_paths':loaded_paths,
             'memlock_bytes': resource.getrlimit(resource.RLIMIT_MEMLOCK)}
     (Path(evidence_path)/f'rank-{rank}.json').write_text(json.dumps(info)+'\n')
     env['TRIAL_PRODUCTION_MEMORY_BYTES'] = str(layout['hosts'][host]['memory_budget_bytes']//layout['ranks_per_node'])

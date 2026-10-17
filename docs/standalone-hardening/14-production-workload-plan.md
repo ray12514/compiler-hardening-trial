@@ -326,8 +326,9 @@ libraries and against the hardened libraries, with the same work, binding and
 runtime policy. Keep MPI/UCX consistent with the selected library stack and
 verify actual loaded paths on every rank. Preserve ABI/toolchain compatibility
 and account for compile-time header/inlined code in the fixed caller. This
-comparison is not yet implemented by `trial production`; its existing `stack`
-results must keep their original scope. It requires no individual flag removals.
+comparison was not yet implemented at the handoff. The follow-up below now
+provides it through `--scope deployment`; existing `stack` results retain their
+original scope. It requires no individual flag removals.
 
 Hardening compiled into a shared library does not automatically apply those
 compiler options to an application's own code. Some checks, including fortified
@@ -354,7 +355,111 @@ be recorded explicitly.
    complete the missing eight-node evidence, then repeat selected conditions
    in an independent allocation. Do not silently combine different iteration
    counts, geometries or I/O-budget caps as one experiment.
-5. Implement the fixed-caller deployment comparison above and select a
+5. Use the implemented fixed-caller deployment comparison below and select a
    representative site application with realistic inputs and checkpoint cadence.
    Agree on a practically meaningful overhead threshold and required precision
    before confirmation sampling. Individual-flag attribution remains deferred.
+
+## 9. Next phase: executable workflow assessment
+
+The purpose is to assess supplied libraries with an ordinarily compiled caller,
+using a controlled representation of the site's workload. A complete CFD or
+LAMMPS build is optional later confirmation; it is not required to make this
+measurement useful. Do not expand into unrelated software to force a slowdown.
+Do not reinterpret small negative estimates as a demonstrated speed benefit.
+
+### Implemented interfaces
+
+| Interface | Behavior |
+|---|---|
+| `trial production --scope deployment` | Compile one reference caller, run its identical binary/hash with the two compatible complete library stacks; retain both library build identities |
+| `--scope stack` | Retain matched full/reference callers for the earlier whole-stack question; this remains the backward-compatible default |
+| `--reframe` | Use one serial, allocation-local ReFrame check to run the existing controller; record per-condition performance metrics and original result location |
+| `--fields 3 --fft-plan measure` | Three independently persistent fields with reused measured forward/inverse plans; each checkpoint contains a dataset per field |
+| `--steps N` | Freeze the iteration count rather than calibrating different counts by layout; stop partial if declared write allowance cannot fit, without silently reducing work |
+| `--overhead-limit-percent P` | Compare the paired interval with a predeclared practical limit; unresolved and incomplete are explicit outcomes; no limit is guessed by default |
+
+The installer copies these sources and the new ReFrame adapter. It does not
+change completed package builds, old callers, old results, profile vectors or
+numbered build/measurement recipe blocks. New source hashes produce new caller
+identities. `--report` can still regenerate old production exports without MPI,
+Slurm or new measurements; old scope and field-count defaults remain readable.
+
+### Ordered work and gates
+
+1. **Evidence review and artifact verification.** Retain today's original result
+   folders and examine raw complete pairs and uncertainty. The next driver run
+   verifies completed artifact hashes, records both stack identities and
+   effective flag vectors, and inspects installed ELF libraries for RELRO/NOW
+   and canary/fortified-call symbols. Requested linker protections must be
+   present. Symbol observations alone do not quantify hardening coverage.
+2. **Existing-allocation audit.** Reuse the physical-core/WEKA and memory checks.
+   Keep the interactive Slurm overlap setting that qualified on the site, with
+   private launchers, RC/shared-memory UCX policy and no rank oversubscription.
+   Each rank records its actual binding, caller SHA-256 and loaded library paths.
+3. **Short fixed-caller workflow pilot.** Start at one and two nodes, 16 physical
+   cores per node, four process pairs, three fields and a fixed global shape.
+   Use the README's bounded command. Check both ordinary FFT loops and
+   integrated checkpoints plus the standalone collective/independent I/O cases.
+   Four pairs establish runnable settings, not an acceptance conclusion.
+4. **Representative work definition.** Record the intended transform dimensions,
+   field count, real/complex requirements, plan reuse and checkpoint pattern.
+   The implemented baseline is complex-to-complex distributed 3D FFTW with
+   sequential fields, a simple spectral multiplier, contiguous per-field HDF5
+   datasets, one replacing checkpoint file and a final warm read-back. It is
+   not a fluid solver and does not implement LAMMPS's complete local-FFT/remap
+   path. Real transforms, batched local transforms, chunked/compressed output
+   or retained checkpoint history require explicit future extensions if the
+   selected site's workflow needs them; do not label them covered now.
+5. **Density and scale.** Use all audited eligible physical cores on one/two
+   nodes with bounded per-field memory and I/O. Run four and eight nodes
+   separately after costs are known so the missing large condition is not
+   starved by earlier cases. Keep fixed-global-shape and per-rank-volume
+   experiments separate. Never combine today's matched-caller results with
+   the new deployment scope as one estimate.
+6. **Confirmation and interpretation.** Agree on the practical overhead limit,
+   sampling precision and workload first. Use balanced fresh-process pairs
+   (20 is a starting sample count, not a guarantee of precision) and selected
+   repeats in independent allocations. Keep partial conditions visible.
+   ReFrame completion is not performance acceptance. The reporting assessment
+   applies to an individual completed condition and does not replace deployment
+   evidence or independent repeats. It does not measure the security benefit.
+
+### Optional OSU communication baseline
+
+Bring in a small CPU-only OSU subset as a supplementary MPI diagnostic:
+
+| Benchmark | Initial placement | Question |
+|---|---|---|
+| `osu_latency` | Exactly two ranks, one per selected node | Does small-message point-to-point latency differ? |
+| `osu_bw` | Exactly two ranks, one per selected node | Does sustained point-to-point bandwidth differ? |
+| `osu_alltoall` | The qualified workload density | Does collective data exchange differ at that rank count? |
+| `osu_allreduce` | The same density | Does reduction/synchronization latency differ? |
+
+Use one fixed ordinary caller per benchmark, a pinned released OSU version and
+the compatible reference/full MPI/UCX runtimes. Match message sizes, warmups and
+iterations; record binding, versions and loaded paths; bound all-to-all memory
+against communicator size. Preserve latency and bandwidth units and directions.
+OSU's repeated internal operations are not independent observations; fresh
+process pairs provide the paired samples. A later `osu_mbw_mr` can examine
+simultaneous pairs if two-rank bandwidth does not explain dense behavior.
+
+The OSU adapter is planned, not shipped in this update. Prepare its source and
+offline build outside the timed allocation when adopted. It is not a dependency
+of the new driver/ReFrame workflow and cannot substitute for FFTW/HDF5 evidence.
+Do not install MVAPICH just to obtain OSU; its MPI benchmarks can use Open MPI.
+[Official benchmark descriptions and release list](https://mvapich.cse.ohio-state.edu/benchmarks/)
+
+The copy-and-paste run sequence, result paths and new options are in the
+[next-session workflow](README.md#next-session-fixed-caller-application-pattern-assessment).
+
+### Implementation validation
+
+The follow-up passed 68 automated checks, including real ReFrame 4.10.4
+completion/partial-result checks with synthetic fixtures. The updated C caller
+compiled with `-Wall -Wextra -Werror` against cached Linux MPI/FFTW/HDF5 libraries.
+Twenty-four isolated local MPI runs exercised one/two/four ranks, three fields,
+both planning policies and all four workload modes; numerical/restart checks,
+per-rank/per-field I/O records and file cleanup passed. These are functional
+checks using a network-disabled container, not Slurm/RDMA or performance
+qualification on the target cluster. No new target-system campaign was launched.

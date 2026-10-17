@@ -7,6 +7,12 @@ The public commands are `setup`, `refresh-tests`, `prepare-mpi [--from-dir DIR |
 `production` adds the [audited dense MPI workflow](README.md#after-the-pilot-run-production-density-workloads),
 including sustained callers, service-core exclusions and CSV/HTML analysis.
 Run `trial production --help` for its separate placement, workload and budget options.
+For the next phase, use `--scope deployment --reframe`: one ordinarily compiled
+caller is reused with both complete library stacks, and the existing controller
+runs through ReFrame in the current allocation. `--fields`, `--fft-plan`,
+`--steps` and `--checkpoint-every` define the repeated work. The default scope
+remains `stack` for existing commands. See the
+[next-session commands](README.md#next-session-fixed-caller-application-pattern-assessment).
 
 `setup` generates profiles, probes C/C++/Fortran, checks emitted PIE/RELRO/NOW/non-executable-stack properties, checks mixed shared/tool linking, and generates measurement files. Every shell command runs in a separate strict Bash process; sourcing the saved environment no longer changes an interactive shell’s options. The driver prints progress every 30 seconds during long steps and the last 25 log lines on failure.
 

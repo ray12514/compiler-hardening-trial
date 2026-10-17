@@ -13,6 +13,11 @@ Start with the [installation and trial workflow](docs/standalone-hardening/READM
 Keep the checkout inside the trial working root as described there; build
 artifacts and results live beside the checkout.
 
+Continuing after the 16 October campaign? Use the
+[fixed-caller workflow and next-session plan](docs/standalone-hardening/README.md#next-session-fixed-caller-application-pattern-assessment).
+It reuses the completed libraries, supports ReFrame, and keeps the optional OSU
+baseline separate from FFTW/HDF5 measurements.
+
 **Builds complete and MPI qualification passed?** Run the
 [all-package pilot and CSV export](docs/standalone-hardening/README.md#builds-complete-and-mpi-qualified-run-the-package-pilot)
 next, using the existing allocation.
