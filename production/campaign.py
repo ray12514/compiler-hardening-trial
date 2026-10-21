@@ -675,6 +675,9 @@ def run_reframe(driver, argv, args, command_name='production'):
            '--report-file='+str(out/'report.json')]
     print(f'ReFrame report: {out}/report.json',flush=True)
     result = subprocess.run(cmd,env=env)
+    pointer = getattr(args,'result_pointer',None)
+    if pointer and (out/'campaign.json').is_file():
+        save(pointer,json.loads((out/'campaign.json').read_text()))
     if result.returncode:
         raise RuntimeError(f'ReFrame campaign incomplete or failed; inspect {out}/report.json and retained campaign evidence')
     return out

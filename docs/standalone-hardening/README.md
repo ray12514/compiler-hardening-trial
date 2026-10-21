@@ -1,5 +1,8 @@
 # Standalone compiler hardening trial
 
+Continuing after the October trials? Start with [build verification, the 20-node
+batch job and an updateable team summary](15-verification-and-batch.md).
+
 Use private GCC 12.5.0 to compare the supplied hardening controls with a matched reference for FFTW, HDF5 and LAPACK. The normal workflow is now **prepare downloads on a login node → setup → build → test**. The driver handles profiles, flag qualification, prerequisites, callers and measurement files. The numbered runbooks contain the recipes it runs; you do not need to jump through their sections.
 
 If you are continuing a trial from the earlier Planning checkout, use the

@@ -635,6 +635,14 @@ def test(args):
     if not complete: raise RuntimeError('Pilot workload coverage is incomplete; inspect pilot.json and ReFrame reports.')
 
 def main():
+    if len(sys.argv)>1 and sys.argv[1]=='summary':
+        sys.path.insert(0,str(HERE/'production'))
+        from team_summary import main as summary_main
+        return summary_main(sys.argv[2:])
+    if len(sys.argv)>1 and sys.argv[1]=='audit':
+        sys.path.insert(0,str(HERE/'production'))
+        from build_audit import main as audit_main
+        return audit_main(sys.modules[__name__],sys.argv[2:])
     if len(sys.argv)>1 and sys.argv[1]=='osu':
         sys.path.insert(0,str(HERE/'production'))
         from osu import main as osu_main
@@ -649,6 +657,8 @@ def main():
     parser = argparse.ArgumentParser(description='Standalone GCC hardening setup, independent package builds and ReFrame pilots.')
     subs = parser.add_subparsers(dest='command',required=True)
     subs.add_parser('production',help='Audited dense MPI sustained-work comparisons; production --help for options.')
+    subs.add_parser('audit',help='Read-only build, compile-command and ELF verification; audit --help for options.')
+    subs.add_parser('summary',help='Shareable one-page production results; summary --help for options.')
     subs.add_parser('osu',help='Pinned source preparation, offline fixed-caller build and paired MPI/UCX tests; osu --help for options.')
     subs.add_parser('setup'); subs.add_parser('refresh-tests'); subs.add_parser('status'); subs.add_parser('logs')
     mpi_prep = subs.add_parser('prepare-mpi',help='Stage verified MPI/UCX archives on a login node; builds use local archives only.')

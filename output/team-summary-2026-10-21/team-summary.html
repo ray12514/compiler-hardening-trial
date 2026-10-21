@@ -1,0 +1,80 @@
+<!doctype html><meta charset="utf-8"><title>Compiler hardening results</title><style>body{margin:0}svg{width:100%;height:auto}@page{size:16in 9in;margin:0}</style><svg xmlns="http://www.w3.org/2000/svg" width="1536" height="864" viewBox="0 0 1536 864">
+<rect width="1536" height="864" fill="white"/>
+<style>text{font-family:Arial,sans-serif;fill:#163247} .muted{fill:#536673}</style>
+<text x="56" y="72" font-size="44" font-weight="bold" text-anchor="start">Compiler hardening: results so far</text>
+<text x="56" y="116" font-size="28" text-anchor="start">Completed point estimates: -2.60% to +1.32%</text>
+<text x="56" y="163" font-size="23" text-anchor="start">Full versus ordinary reference. Negative = faster. Positive = slower. 0% = unchanged.</text>
+<text x="56" y="208" font-size="25" font-weight="bold" text-anchor="start">Runtime change (%) by workload and layout</text>
+<line x1="555.0" x2="555.0" y1="238" y2="687" stroke="#e6edf1"/>
+<text x="555.0" y="717" font-size="21" text-anchor="middle">-3%</text>
+<line x1="665.0" x2="665.0" y1="238" y2="687" stroke="#e6edf1"/>
+<text x="665.0" y="717" font-size="21" text-anchor="middle">-1.5%</text>
+<line x1="775.0" x2="775.0" y1="238" y2="687" stroke="#94a3ad"/>
+<text x="775.0" y="717" font-size="21" text-anchor="middle">0%</text>
+<line x1="885.0" x2="885.0" y1="238" y2="687" stroke="#e6edf1"/>
+<text x="885.0" y="717" font-size="21" text-anchor="middle">+1.5%</text>
+<line x1="995.0" x2="995.0" y1="238" y2="687" stroke="#e6edf1"/>
+<text x="995.0" y="717" font-size="21" text-anchor="middle">+3%</text>
+<text x="56" y="256.0" font-size="23" font-weight="bold" text-anchor="start">FFT loop</text>
+<text x="282" y="256.0" font-size="20" text-anchor="start">2 nodes / 16 ranks/node</text>
+<circle cx="791.28" cy="249.0" r="5" fill="#167d8d" stroke="#167d8d" stroke-width="2"/>
+<text x="1095" y="256.0" font-size="20" text-anchor="end">+0.222%</text>
+<text x="282" y="282.375" font-size="20" text-anchor="start">2 nodes / 92 ranks/node</text>
+<circle cx="804.1866666666667" cy="275.375" r="5" fill="#476bb3" stroke="#476bb3" stroke-width="2"/>
+<text x="1095" y="282.375" font-size="20" text-anchor="end">+0.398%</text>
+<text x="282" y="308.75" font-size="20" text-anchor="start">4 nodes / all eligible cores*</text>
+<circle cx="680.5466666666666" cy="301.75" r="5" fill="#b8702d" stroke="#b8702d" stroke-width="2"/>
+<text x="1095" y="308.75" font-size="20" text-anchor="end">-1.288%</text>
+<text x="282" y="335.125" font-size="20" text-anchor="start">8 nodes / all eligible cores*</text>
+<circle cx="660.9666666666667" cy="328.125" r="5" fill="white" stroke="#6d7582" stroke-width="2"/>
+<text x="1095" y="335.125" font-size="20" text-anchor="end">-1.555%</text>
+<text x="56" y="361.5" font-size="23" font-weight="bold" text-anchor="start">HDF5 collective</text>
+<text x="282" y="361.5" font-size="20" text-anchor="start">2 nodes / 16 ranks/node</text>
+<circle cx="696.02" cy="354.5" r="5" fill="#167d8d" stroke="#167d8d" stroke-width="2"/>
+<text x="1095" y="361.5" font-size="20" text-anchor="end">-1.077%</text>
+<text x="282" y="387.875" font-size="20" text-anchor="start">2 nodes / 92 ranks/node</text>
+<circle cx="799.2" cy="380.875" r="5" fill="#476bb3" stroke="#476bb3" stroke-width="2"/>
+<text x="1095" y="387.875" font-size="20" text-anchor="end">+0.330%</text>
+<text x="282" y="414.25" font-size="20" text-anchor="start">4 nodes / all eligible cores*</text>
+<circle cx="742.1466666666666" cy="407.25" r="5" fill="#b8702d" stroke="#b8702d" stroke-width="2"/>
+<text x="1095" y="414.25" font-size="20" text-anchor="end">-0.448%</text>
+<text x="282" y="440.625" font-size="20" text-anchor="start">8 nodes / all eligible cores*</text>
+<text x="1045" y="440.625" font-size="18" style="fill:#6d7582" text-anchor="end">not measured</text>
+<text x="56" y="467.0" font-size="23" font-weight="bold" text-anchor="start">HDF5 independent</text>
+<text x="282" y="467.0" font-size="20" text-anchor="start">2 nodes / 16 ranks/node</text>
+<circle cx="774.78" cy="460.0" r="5" fill="#167d8d" stroke="#167d8d" stroke-width="2"/>
+<text x="1095" y="467.0" font-size="20" text-anchor="end">-0.003%</text>
+<text x="282" y="493.375" font-size="20" text-anchor="start">2 nodes / 92 ranks/node</text>
+<circle cx="841.5133333333333" cy="486.375" r="5" fill="#476bb3" stroke="#476bb3" stroke-width="2"/>
+<text x="1095" y="493.375" font-size="20" text-anchor="end">+0.907%</text>
+<text x="282" y="519.75" font-size="20" text-anchor="start">4 nodes / all eligible cores*</text>
+<circle cx="872.02" cy="512.75" r="5" fill="#b8702d" stroke="#b8702d" stroke-width="2"/>
+<text x="1095" y="519.75" font-size="20" text-anchor="end">+1.323%</text>
+<text x="282" y="546.125" font-size="20" text-anchor="start">8 nodes / all eligible cores*</text>
+<text x="1045" y="546.125" font-size="18" style="fill:#6d7582" text-anchor="end">not measured</text>
+<text x="56" y="572.5" font-size="23" font-weight="bold" text-anchor="start">Integrated loop</text>
+<text x="282" y="572.5" font-size="20" text-anchor="start">2 nodes / 16 ranks/node</text>
+<circle cx="585.14" cy="565.5" r="5" fill="#167d8d" stroke="#167d8d" stroke-width="2"/>
+<text x="1095" y="572.5" font-size="20" text-anchor="end">-2.589%</text>
+<text x="282" y="598.875" font-size="20" text-anchor="start">2 nodes / 92 ranks/node</text>
+<circle cx="776.6133333333333" cy="591.875" r="5" fill="#476bb3" stroke="#476bb3" stroke-width="2"/>
+<text x="1095" y="598.875" font-size="20" text-anchor="end">+0.022%</text>
+<text x="282" y="625.25" font-size="20" text-anchor="start">4 nodes / all eligible cores*</text>
+<circle cx="584.5533333333333" cy="618.25" r="5" fill="#b8702d" stroke="#b8702d" stroke-width="2"/>
+<text x="1095" y="625.25" font-size="20" text-anchor="end">-2.597%</text>
+<text x="282" y="651.625" font-size="20" text-anchor="start">8 nodes / all eligible cores*</text>
+<text x="1045" y="651.625" font-size="18" style="fill:#6d7582" text-anchor="end">not measured</text>
+<text x="1150" y="244" font-size="27" font-weight="bold" text-anchor="start">Coverage</text>
+<text x="1150" y="282" font-size="23" text-anchor="start">12 complete conditions</text>
+<text x="1150" y="316" font-size="23" text-anchor="start">1 partial</text>
+<text x="1150" y="350" font-size="23" text-anchor="start">3 not measured</text>
+<text x="1150" y="412" font-size="27" font-weight="bold" text-anchor="start">Sample counts</text>
+<text x="1150" y="450" font-size="21" text-anchor="start">10 pairs per complete case</text>
+<text x="1150" y="479" font-size="21" text-anchor="start">(20 process runs)</text>
+<text x="1150" y="526" font-size="21" text-anchor="start">Partial: 4/10 pairs</text>
+<text x="1150" y="593" font-size="21" text-anchor="start">One pair = full + reference</text>
+<text x="1150" y="644" font-size="21" text-anchor="start">Completed point estimates</text>
+<text x="1150" y="679" font-size="25" font-weight="bold" text-anchor="start">-2.60% to +1.32%</text>
+<text x="56" y="764" font-size="21" text-anchor="start">Provisional screenshot transcription, 16 Oct 2026. Error bars unavailable. Original build verification pending.</text>
+<text x="56" y="800" font-size="21" text-anchor="start">Matched callers and complete library stacks change together. Layouts may use different work. This is not a scaling curve.</text>
+<text x="56" y="834" font-size="21" text-anchor="start">Small point estimates do not prove zero overhead. *The photos do not expose the exact 4-/8-node core counts.</text></svg>

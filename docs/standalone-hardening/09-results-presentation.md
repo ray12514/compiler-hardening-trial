@@ -1,5 +1,9 @@
 # Presenting the ReFrame hardening results
 
+For the actual October results, use the [updateable one-page team summary and
+build-verification workflow](15-verification-and-batch.md). The older example
+figures below remain illustrative and must not be shown as measurements.
+
 For driver-managed builds, retain `effective_profile_ids` from the collected CSV and the exact vectors/compatibility decisions in each summary’s `managed_builds`. A `compatible-HASH` result measures that reduced set. Keep different effective identities in separate comparisons; do not present them as measurements of the complete supplied list.
 
 Date: 2026-10-09. Use this plan after collecting the campaign in [08](08-slurm-campaign.md). The audience needs to understand which workloads were tested, how much their runtime changed, how certain the comparison is, and which cases remain unresolved. Start with a portable PDF and plots from the campaign's paired summaries. Add a live dashboard when repeated monitoring becomes useful.

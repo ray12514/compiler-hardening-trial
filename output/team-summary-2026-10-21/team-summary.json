@@ -1,0 +1,182 @@
+{
+  "schema_version": 1,
+  "scope": "stack",
+  "provisional": true,
+  "sources": [
+    "Operator screenshots, 2026-10-16"
+  ],
+  "build_verification": "Pending original build records",
+  "conditions": [
+    {
+      "layout": "2 nodes / 16 ranks per node",
+      "workload": "FFT loop",
+      "change": 0.222,
+      "pairs": 10,
+      "requested": 10,
+      "status": "complete",
+      "low": null,
+      "high": null
+    },
+    {
+      "layout": "2 nodes / 16 ranks per node",
+      "workload": "HDF5 collective",
+      "change": -1.077,
+      "pairs": 10,
+      "requested": 10,
+      "status": "complete",
+      "low": null,
+      "high": null
+    },
+    {
+      "layout": "2 nodes / 16 ranks per node",
+      "workload": "HDF5 independent",
+      "change": -0.003,
+      "pairs": 10,
+      "requested": 10,
+      "status": "complete",
+      "low": null,
+      "high": null
+    },
+    {
+      "layout": "2 nodes / 16 ranks per node",
+      "workload": "Integrated loop",
+      "change": -2.589,
+      "pairs": 10,
+      "requested": 10,
+      "status": "complete",
+      "low": null,
+      "high": null
+    },
+    {
+      "layout": "2 nodes / 92 ranks per node",
+      "workload": "FFT loop",
+      "change": 0.398,
+      "pairs": 10,
+      "requested": 10,
+      "status": "complete",
+      "low": null,
+      "high": null
+    },
+    {
+      "layout": "2 nodes / 92 ranks per node",
+      "workload": "HDF5 collective",
+      "change": 0.33,
+      "pairs": 10,
+      "requested": 10,
+      "status": "complete",
+      "low": null,
+      "high": null
+    },
+    {
+      "layout": "2 nodes / 92 ranks per node",
+      "workload": "HDF5 independent",
+      "change": 0.907,
+      "pairs": 10,
+      "requested": 10,
+      "status": "complete",
+      "low": null,
+      "high": null
+    },
+    {
+      "layout": "2 nodes / 92 ranks per node",
+      "workload": "Integrated loop",
+      "change": 0.022,
+      "pairs": 10,
+      "requested": 10,
+      "status": "complete",
+      "low": null,
+      "high": null
+    },
+    {
+      "layout": "4 nodes / full eligible-core layout",
+      "workload": "FFT loop",
+      "change": -1.288,
+      "pairs": 10,
+      "requested": 10,
+      "status": "complete",
+      "low": null,
+      "high": null
+    },
+    {
+      "layout": "4 nodes / full eligible-core layout",
+      "workload": "HDF5 collective",
+      "change": -0.448,
+      "pairs": 10,
+      "requested": 10,
+      "status": "complete",
+      "low": null,
+      "high": null
+    },
+    {
+      "layout": "4 nodes / full eligible-core layout",
+      "workload": "HDF5 independent",
+      "change": 1.323,
+      "pairs": 10,
+      "requested": 10,
+      "status": "complete",
+      "low": null,
+      "high": null
+    },
+    {
+      "layout": "4 nodes / full eligible-core layout",
+      "workload": "Integrated loop",
+      "change": -2.597,
+      "pairs": 10,
+      "requested": 10,
+      "status": "complete",
+      "low": null,
+      "high": null
+    },
+    {
+      "layout": "8 nodes / full eligible-core layout",
+      "workload": "FFT loop",
+      "change": -1.555,
+      "pairs": 4,
+      "requested": 10,
+      "status": "partial",
+      "low": null,
+      "high": null
+    },
+    {
+      "layout": "8 nodes / full eligible-core layout",
+      "workload": "HDF5 collective",
+      "change": null,
+      "pairs": 0,
+      "requested": 10,
+      "status": "not measured",
+      "low": null,
+      "high": null
+    },
+    {
+      "layout": "8 nodes / full eligible-core layout",
+      "workload": "HDF5 independent",
+      "change": null,
+      "pairs": 0,
+      "requested": 10,
+      "status": "not measured",
+      "low": null,
+      "high": null
+    },
+    {
+      "layout": "8 nodes / full eligible-core layout",
+      "workload": "Integrated loop",
+      "change": null,
+      "pairs": 0,
+      "requested": 10,
+      "status": "not measured",
+      "low": null,
+      "high": null
+    }
+  ],
+  "complete": 12,
+  "partial": 1,
+  "not_measured": 3,
+  "range": [
+    -2.597,
+    1.323
+  ],
+  "loop_seconds_range": null,
+  "paired_comparisons": 124,
+  "definition": "Runtime change = 100 x (mean full / mean reference - 1). One pair is one full run and one reference run.",
+  "limitation": "Point estimates alone cannot establish zero overhead, a speedup, or an acceptable overhead limit."
+}
