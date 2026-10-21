@@ -5,8 +5,9 @@ screenshot transcription in `reports/2026-10-16/evidence.json`. This is
 provisional evidence. Original paired records and build logs have not been
 reviewed locally. No confidence bounds or missing measurements were imputed.
 
-- `compiler-hardening-briefing.pdf`: two pages covering results, test definitions, time interpretation and follow-up coverage.
-- `compiler-hardening-briefing.pptx`: the editable two-slide briefing, with a native chart and workload table.
+- `compiler-hardening-briefing-3slides.pdf`: current briefing, with separate pages for results, test design, and time interpretation with next tests.
+- `compiler-hardening-briefing-3slides.pptx`: current editable three-slide briefing, with a native chart and workload table.
+- `compiler-hardening-briefing.pdf`, `.pptx`: earlier compact two-slide edition, retained for reference.
 - `compiler-hardening-results-so-far.pdf`: the original one-page result view.
 - `compiler-hardening-results-so-far.pptx`: one editable slide, including a native chart and embedded chart data.
 - `compiler-hardening-results-so-far.png`: slide preview.
@@ -22,5 +23,5 @@ The [runbook](../../docs/standalone-hardening/15-verification-and-batch.md)
 documents build verification, automatic batch report generation and the next
 20-node deployment comparison. Cluster-side `trial summary` regenerates
 HTML/SVG/JSON from original paired records. `reports/build_team_slide.mjs`
-exports an editable slide from the sanitized JSON in a prepared desktop
+exports an editable three-slide briefing from the sanitized JSON in a prepared desktop
 presentation runtime. PDFs are the validated slides exported with LibreOffice.

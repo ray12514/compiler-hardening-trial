@@ -24,7 +24,7 @@ that next workflow completes.
 Start the next session with [build verification, the 20-node batch job and an
 updateable team summary](docs/standalone-hardening/15-verification-and-batch.md).
 The submission script regenerates a shareable one-page summary from paired records.
-The [two-slide team briefing](output/team-summary-2026-10-21/compiler-hardening-briefing.pdf)
+The [three-slide team briefing](output/team-summary-2026-10-21/compiler-hardening-briefing-3slides.pdf)
 shows the provisional results, test definitions, time interpretation and coverage follow-up.
 
 **Builds complete and MPI qualification passed?** Run the

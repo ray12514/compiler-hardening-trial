@@ -141,8 +141,8 @@ zero. No pooled overall effect, speedup or zero-overhead claim is generated.
 `team-summary.html` works offline. Its SVG and metric-only JSON omit hostnames,
 job IDs, installation paths and logs. These files can be shared. The current
 briefing is in `output/team-summary-2026-10-21/`. Its first slide shows results
-and coverage. Its second defines the constructed tests, pairing, time
-interpretation and follow-up coverage. The original one-page result view is
+and coverage. Its second defines the constructed tests and pairing. Its third
+explains time interpretation and follow-up coverage. The original one-page result view is
 retained alongside it. The editable slide
 exporter is [reports/build_team_slide.mjs](../../reports/build_team_slide.mjs)
 for a prepared desktop presentation runtime. Cluster-side HTML/SVG generation
@@ -209,6 +209,6 @@ All 87 automated checks passed, including real ReFrame 4.10.4 reporting,
 build-evidence omissions/overrides, compiler selection, paired summaries and
 complete/partial batch execution with a recording driver. Four real Linux ELF
 fixtures exercised full/reference shared-library and executable controls in a
-network-disabled container. The two-slide briefing passed structural/native
+network-disabled container. The three-slide briefing passed structural/native
 chart/table checks and visual review. These checks validate the implementation;
 they do not verify the cluster's installed artifacts or qualify a 20-node run.
