@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 3 (2026-10-22).
+"""CSE Miniforge certificate maintenance, revision 4 (2026-10-22).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -10,9 +10,11 @@ Python 3.8+, standard library. Run as a maintenance account, not root.
 
 No test-site connections, connectivity probes, remote execution or OS writes.
 Preview is local-only: inventory, CA inspection, ownership and permissions.
-Apply uses existing configured channels/mirrors (and PyPI for pip-managed tools).
+Apply enforces conda-forge with --override-channels and strict channel priority.
+There is no PyPI/pip-install fallback. External conda plugins are disabled for
+maintenance subprocesses so conda-pypi cannot introduce a PyPI source.
 --offline forbids network package retrieval; required packages must be cached or
-available in configured file:// channels. No installer replacement is required.
+available in the configured conda-forge mirror/cache. No installer replacement is required.
 Run once per distinct shared installation on each system; it does not SSH to hosts.
 
 Discovery: CONDA_EXE, conda on PATH, or explicit positional path. Uses that conda's
@@ -23,13 +25,18 @@ unregistered prefixes under a site-owned software root. Repeated --exclude PREFI
 also excludes its descendants. All selected eligible prefixes are treated as shared.
 
 Default package targets: existing ca-certificates>=2026.10.19 (conda-forge),
-certifi>=2026.10.19, pip>=26.2.2, uv>=0.13.4. --upgrade-conda also requests
+certifi>=2026.10.19, pip>=26.2.2, uv>=0.13.4, and sigstore>=4.5.1 where
+installed through conda. --upgrade-conda also requests
 conda>=26.9.4 where installed. Related mamba/solver packages are requested together
 when installed. Python and non-management packages are pinned to version+build.
 If pins or the mirror block the remediation, report failure instead of upgrading
 Python/scientific packages. --freeze-installed and the classic solver are used.
 Python <3.11 with conda-forge certifi may need a reviewed backport or replacement
 prefix. Existing conda may be retained per the conda maintainers' CA-only guidance.
+Outdated pip-managed tools are reported for reviewed migration to conda-forge,
+without automatically overwriting pip-owned files. If sigstore is installed,
+an offline `python -I -m sigstore --help` smoke check reports startup failures.
+A fixed package version does not establish that an unrelated crash is resolved.
 
 A CSE-owned bundle at BASE/etc/cse-trust/ca-bundle.pem is built locally from the
 selected existing site bundle, preserving all certificates except four exact
@@ -101,10 +108,9 @@ import subprocess
 import sys
 import tempfile
 import traceback
-import urllib.request
 
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
-           'pip':'26.2.2', 'uv':'0.13.4'}
+           'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 ROOTS = {
  '7DD78D5F4F13459A83DFF9ABBBA62EDBAF6F2D102BF257FD712F4D9F2746ED8D': 'emSign Root TLS CA - G3',
  'F2EDAAFF3D9B701FB4D14C9F285F8C0BAD90FC3BCC1FA07D47F4718EDABA34A5': 'emSign Root CS CA - G3',
@@ -121,9 +127,13 @@ MANAGEMENT_DEPS = MANAGERS | {'conda','conda-self','conda-package-handling',
  'msgpack-python','nlohmann_json','openssl','packaging','pcre2','platformdirs',
  'pluggy','pycosat','pycparser','pysocks','python_abi','reproc','reproc-cpp',
  'requests','ruamel.yaml','ruamel.yaml.clib','simdjson','tqdm','truststore',
- 'typing_extensions','urllib3','yaml-cpp','zstandard','zstd'}
-PIP_WHEEL = 'https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl'
-PIP_HASH = 'fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70'
+ 'typing_extensions','urllib3','yaml-cpp','zstandard','zstd',
+ 'annotated-types','betterproto','email-validator','exceptiongroup','id',
+ 'dnspython','httpcore','httpx','h11','anyio','sniffio','pydantic','pydantic-core',
+ 'pyjwt','pyopenssl','rich','markdown-it-py','mdurl','pygments','rfc3161-client',
+ 'securesystemslib','sigstore-models','sigstore-protobuf-specs','sigstore-rekor-types',
+ 'tuf','typing-inspection','importlib-metadata','zipp'}
+CHANNEL_ARGS = ['--override-channels','--channel','conda-forge','--strict-channel-priority']
 MAINTENANCE_GROUP = 'cse'
 
 SECRETS = {'.condarc','.netrc','.pypirc','.ssh','.aws','.azure','.config','.git',
@@ -319,6 +329,8 @@ def safe_environment():
         env.pop(k, None)
     env['CONDA_OFFLINE'] = 'true'
     env['PIP_DISABLE_PIP_VERSION_CHECK'] = '1'
+    env['PIP_NO_INDEX'] = '1'
+    env['CONDA_NO_PLUGINS'] = 'true'
     return env
 
 
@@ -415,6 +427,19 @@ def verify_chains(openssl, bundle, chains, env, run):
             raise RuntimeError('INCONCLUSIVE local chain check: ' + p.name)
 
 
+def sigstore_startup(py, env, log):
+    try:
+        r = subprocess.run([str(py),'-I','-m','sigstore','--help'], env=env,
+                           text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=30)
+    except subprocess.TimeoutExpired:
+        return 'sigstore startup timed out after 30 seconds'
+    log.write(r.stdout+r.stderr)
+    if r.returncode:
+        return 'sigstore startup failed (exit %d); see run.log for traceback/signal' % r.returncode
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('miniforge', nargs='?', type=Path)
@@ -447,6 +472,7 @@ def main():
     log = open(str(logdir/'run.log'),'w',buffering=1)
     def say(s): print(s,flush=True);log.write(s+'\n')
     say('Mode: '+('APPLY' if args.apply else 'LOCAL PREVIEW; no network operations'))
+    say('Package source: conda-forge ONLY; external plugins disabled; no PyPI fallback')
     say('Base: '+str(base)); say('Source CA: '+str(source));say('Private logs: '+str(logdir))
     say('Current UID/groups: %s / %s' % (os.geteuid(),','.join(map(str,sorted(groups())))))
     say('Shared permissions target: cse (GID %d); directories 2775, files 0664, executables 0775' % cse_gid)
@@ -501,6 +527,9 @@ def main():
             if 'python' in meta:
                 audit = runjson([py,'-I','-c',AUDIT])
                 (logdir/('%03d-before-audit.json'%i)).write_text(json.dumps(audit,indent=2))
+                unmanaged={n for n in MINIMUM if n in audit['packages'] and n not in meta and version(audit['packages'][n]) < version(MINIMUM[n])}
+                if unmanaged:
+                    row['issues'].append('Outdated non-conda tools require reviewed conda-forge migration: '+', '.join(sorted(unmanaged)))
                 if 'pip' in audit['packages'] and audit['python'] < [3,10] and version(audit['packages']['pip']) < version(MINIMUM['pip']):
                     row['issues'].append('Old pip on Python <3.10 needs a reviewed compatible remediation')
             if args.apply:
@@ -510,7 +539,7 @@ def main():
                 (logdir/('%03d-before-explicit.txt'%i)).write_text(run([conda,'list','-p',prefix,'--explicit']).stdout)
                 if row['issues']: raise RuntimeError('Unsupported old pip; prefix left unchanged')
                 if targets:
-                    cmd=[conda,'install','-p',prefix,'--solver','classic','--freeze-installed','--json']+specs
+                    cmd=[conda,'install','-p',prefix,'--solver','classic','--freeze-installed','--json']+CHANNEL_ARGS+specs
                     if args.offline: cmd.append('--offline')
                     plan=runjson(cmd+['--dry-run'])
                     (logdir/('%03d-plan.json'%i)).write_text(json.dumps(plan,indent=2))
@@ -521,22 +550,9 @@ def main():
                         final[r['name']]=(r['version'],r.get('build_string') or r.get('build'))
                     if any(not b for v,b in final.values()):raise RuntimeError('Plan omitted build identifiers')
                     exact=[n+'='+v+'='+b for n,(v,b) in sorted(final.items())]
-                    execution=[conda,'install','-p',prefix,'--solver','classic','--freeze-installed','--json','--yes']+exact
+                    execution=[conda,'install','-p',prefix,'--solver','classic','--freeze-installed','--json','--yes']+CHANNEL_ARGS+exact
                     if args.offline: execution.append('--offline')
                     runjson(execution)
-                pip_targets={n for n in ('pip','certifi','uv') if n in audit['packages'] and n not in meta and version(audit['packages'][n]) < version(MINIMUM[n])}
-                if pip_targets:
-                    if args.offline: raise RuntimeError('pip-managed updates need online approved PyPI route; offline prefix requires local wheel remediation')
-                    # Bootstrap pip via the advisory's hash-pinned wheel if not conda-managed.
-                    if 'pip' not in meta:
-                        wheel=logdir/'pip-26.2.2-py3-none-any.whl'
-                        context=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT);context.load_verify_locations(cafile=str(bundle))
-                        with urllib.request.urlopen(PIP_WHEEL,context=context,timeout=30) as response: wheel.write_bytes(response.read())
-                        if hashlib.sha256(wheel.read_bytes()).hexdigest()!=PIP_HASH:raise RuntimeError('pip wheel checksum mismatch')
-                        run([py,'-I','-m','pip','--isolated','install','--no-index','--no-deps','--upgrade',wheel])
-                    for n in sorted(pip_targets-{'pip'}):
-                        run([py,'-I','-m','pip','--isolated','--cert',bundle,'install','--index-url','https://pypi.org/simple',
-                             '--no-deps','--upgrade',n+'>='+MINIMUM[n]])
                 run([conda,'config','--file',prefix/'.condarc','--set','ssl_verify',bundle])
                 run([conda,'env','config','vars','set','-p',prefix]+[k+'='+v for k,v in values.items()])
                 after_meta=records(prefix)
@@ -546,13 +562,16 @@ def main():
                     if version(after_meta[n]['version'])<version(MINIMUM[n]):raise RuntimeError('Package still below minimum: '+n)
                 if 'python' in meta:
                     after=runjson([py,'-I','-c',AUDIT])
-                    for n in ('pip','certifi','uv'):
+                    for n in ('pip','certifi','uv','sigstore'):
                         if n in after['packages'] and version(after['packages'][n])<version(MINIMUM[n]):raise RuntimeError('Runtime package below minimum: '+n)
                     # Check actual embedded bundles in addition to selected CSE bundle.
                     for label,path in after['bundles'].items():
                         if path and Path(path).is_file():
                             present={h for h,pem in pem_entries(Path(path).read_text())}&set(ROOTS)
                             if present:row['issues'].append('Known incident roots remain in '+label+': '+path)
+                if 'sigstore' in after_meta and 'python' in meta:
+                    failure = sigstore_startup(py,env,log)
+                    if failure: row['issues'].append(failure)
                 for rel in ('ssl/cacert.pem','ssl/cert.pem'):
                     candidate=prefix/rel
                     if candidate.is_file() and {h for h,pem in pem_entries(candidate.read_text())}&set(ROOTS):
@@ -563,7 +582,7 @@ def main():
                 for n,minimum in MINIMUM.items():
                     if n in meta:say('%s: %s; requested minimum %s'%(n,meta[n]['version'],minimum))
                 say('Would configure conda/activation to use: '+str(bundle))
-            for n in ('sigstore','pixi'):
+            for n in ('pixi',):
                 if n in meta or n in audit['packages']:row['issues'].append(n+' needs separate embedded-tool/dependency review')
             row['issues']+=public_permissions(prefix,base,args.apply,say)
             row['status']='incomplete' if row['issues'] else ('updated' if args.apply else 'previewed')
