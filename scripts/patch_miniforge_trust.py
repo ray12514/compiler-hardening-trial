@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 5 (2026-10-22).
+"""CSE Miniforge certificate maintenance, revision 6 (2026-10-22).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -29,7 +29,10 @@ Hidden directories are not skipped merely for being hidden. --exclude also prune
 nested paths from permission traversal. Access/ownership/ACL skips alone are
 nonfatal warnings (exit 0); real package/check failures remain incomplete (exit 2).
 summary.json distinguishes updated-with-skips from fully updated; skipped-paths.txt
-and skipped-paths.json list full paths, stages and reasons. A skip is not protection.
+and skipped-paths.json list full paths, owners, groups, stages and reasons.
+Default output is concise; --verbose shows path details. Full details are logged.
+Final summaries always repeat package requests, permission counts and failure reasons.
+Per-owner skip reports are private review aids. A skip is not protection.
 
 Default package targets: existing ca-certificates>=2026.10.19 (conda-forge),
 certifi>=2026.10.19, pip>=26.2.2, uv>=0.13.4, and sigstore>=4.5.1 where
@@ -105,6 +108,7 @@ import grp
 import hashlib
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import shlex
@@ -196,17 +200,19 @@ def secret(p):
     return p.name in SECRETS or p.name.endswith(('.key', '.p12', '.pfx'))
 
 
-def public_permissions(prefix, base, apply, say, skipped=None, excludes=()):
+def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stats=None):
     problems, changed = [], 0
+    if stats is None: stats = {}
+    stats.update(planned=0, changed=0, group_changes=0, mode_changes=0, parent_warnings=0)
     shared_gid = maintenance_gid()
     exclusions = [Path(os.path.abspath(os.path.expanduser(str(p)))) for p in excludes]
     def excluded(p):
         return any(p == x or x in p.parents for x in exclusions)
-    def note(p, reason):
+    def note(p, reason, stage='permissions'):
         message = str(p) + ': ' + str(reason)
         problems.append(message)
         if skipped is not None:
-            skipped.append({'path':str(p),'stage':'permissions','reason':str(reason),
+            skipped.append({'path':str(p),'stage':stage,'reason':str(reason),
                             'prefix':str(prefix)})
         say('SKIP PATH: ' + message)
     def visit(p):
@@ -225,7 +231,10 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=()):
         if old == new and shared_gid == st.st_gid:return
         if st.st_uid != os.geteuid():
             note(p,'Owner must set group cse and required permissions');return
-        changed += 1
+        stats['planned'] += 1
+        stats['group_changes'] += int(shared_gid != st.st_gid)
+        stats['mode_changes'] += int(old != new)
+        say('PERMISSION: %s | group %s -> cse | mode %04o -> %04o' % (p,st.st_gid,old,new))
         if not apply:return
         if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
             fd,tmp=tempfile.mkstemp(prefix='.trust-mode-',dir=str(p.parent));os.close(fd)
@@ -237,6 +246,8 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=()):
         else:
             if shared_gid != st.st_gid:os.chown(str(p),-1,shared_gid)
             os.chmod(str(p),new)
+        changed += 1
+        stats['changed'] = changed
     def safe_visit(p):
         try:visit(p)
         except OSError as exc:note(p,exc)
@@ -273,9 +284,10 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=()):
     for p in prefix.parents:
         try:
             if not p.stat().st_mode & stat.S_IXOTH:
-                note(p,'Parent lacks other-traverse bit (ACL may differ); left unchanged')
+                stats['parent_warnings'] += 1
+                note(p,'Parent lacks other-traverse bit; group/ACL access may still allow some users. Owner/admin must review outside-group access; parent left unchanged','parent-access')
         except OSError as exc:note(p,exc)
-    say('Permissions %s: %d paths' % ('changed' if apply else 'would change',changed))
+    say('Permissions %s: %d paths' % ('changed' if apply else 'would change',changed if apply else stats['planned']))
     return problems
 
 
@@ -507,10 +519,79 @@ def sigstore_startup(py, env, log):
     return None
 
 
+def path_owner(path):
+    """Report the actual path owner only; never infer ownership from a parent."""
+    result = {'owner':'unknown','uid':None,'group':'unknown','gid':None}
+    try:
+        st = Path(path).lstat()
+    except OSError:
+        return result
+    result.update(uid=st.st_uid,gid=st.st_gid)
+    try: result['owner'] = pwd.getpwuid(st.st_uid).pw_name
+    except (KeyError,OSError): result['owner'] = 'uid:%d' % st.st_uid
+    try: result['group'] = grp.getgrgid(st.st_gid).gr_name
+    except (KeyError,OSError): result['group'] = 'gid:%d' % st.st_gid
+    return result
+
+
+def write_skip_reports(logdir, skipped_paths):
+    # One path can affect multiple prefixes; keep that association without duplicates.
+    merged = {}
+    for item in skipped_paths:
+        key = (item['path'],item['stage'],item['reason'])
+        if key not in merged:
+            merged[key] = dict(item,**path_owner(item['path']))
+            merged[key]['prefixes'] = []
+        if item.get('prefix') and item['prefix'] not in merged[key]['prefixes']:
+            merged[key]['prefixes'].append(item['prefix'])
+    rows = list(merged.values())
+    def line(r):
+        return '%s | owner=%s uid=%s group=%s | %s | environments=%s | %s\n' % (
+            r['stage'],r['owner'],r['uid'],r['group'],r['path'],
+            ', '.join(r['prefixes']) or 'not established',r['reason'])
+    (logdir/'skipped-paths.json').write_text(json.dumps(rows,indent=2))
+    (logdir/'skipped-paths.txt').write_text(''.join(map(line,rows)))
+    by_owner = {}
+    for row in rows: by_owner.setdefault(row['owner'],[]).append(row)
+    (logdir/'skipped-by-owner.json').write_text(json.dumps(by_owner,indent=2))
+    for owner,items in by_owner.items():
+        # UID-based filename avoids trusting account names as paths.
+        uid = items[0]['uid']
+        name = 'skipped-owner-%s.txt' % (uid if uid is not None else 'unknown')
+        (logdir/name).write_text('Review these paths; this report does not assert they were updated.\n'+''.join(map(line,items)))
+    return rows
+
+
+def final_summary(results, apply, bundle, say):
+    say('\nFinal summary (%s):' % ('APPLY' if apply else 'LOCAL PREVIEW; nothing applied'))
+    for row in results:
+        owner = row.get('ownership',{})
+        say('%s | %s | owner=%s group=%s' % (row['prefix'],row['status'],owner.get('owner','unknown'),owner.get('group','unknown')))
+        for target in row.get('package_targets',[]):
+            say('  Package target: %s %s -> %s' % (target['name'],target['current'],target['request']))
+        for change in row.get('package_plan',[]):
+            say('  Solver plan: %s %s -> %s (build %s)' % (change['name'],change['before'],change['after'],change['build']))
+        for change in row.get('package_changes',[]):
+            say('  Verified package: %s %s -> %s' % (change['name'],change['before'],change['after']))
+        stats = row.get('permissions',{})
+        if stats:
+            say('  Permissions: %d paths %s; %d group changes planned to cse; %d mode changes planned; %d parent access warnings' % (
+                stats.get('changed' if apply else 'planned',0),'changed' if apply else 'would change',
+                stats.get('group_changes',0),stats.get('mode_changes',0),stats.get('parent_warnings',0)))
+        if row.get('trust_configuration'):
+            say('  Trust configuration: '+row['trust_configuration']+' '+str(bundle))
+        if row.get('permission_warnings'): say('  Permission/access skips: %d; see skip reports' % len(row['permission_warnings']))
+        for issue in row['issues']: say('  Reason: '+issue)
+    say('Environment counts: '+', '.join('%s=%d'%(s,sum(r['status']==s for r in results)) for s in ('previewed','previewed-with-skips','updated','updated-with-skips','skipped','incomplete')))
+    say('Counts are environments, not package versions. Incomplete means a required package/check failed or needs review; reasons appear above.')
+    if not apply: say('Preview targets are requests, not solved upgrades. No dependency solve ran; exact versions/builds are validated during apply.')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('miniforge', nargs='?', type=Path)
     ap.add_argument('--apply', action='store_true')
+    ap.add_argument('--verbose',action='store_true',help='Show per-path permission details and subprocess commands; full details are always logged')
     ap.add_argument('--offline', action='store_true',help='Apply using cache/file channels; never retrieve online')
     ap.add_argument('--upgrade-conda',action='store_true',help='Also upgrade installed conda; default retain its version/build')
     ap.add_argument('--ca-bundle',type=Path,help='Source site PEM; default detect from conda/current configuration')
@@ -539,6 +620,9 @@ def main():
     os.chmod(str(logdir),0o700)
     log = open(str(logdir/'run.log'),'w',buffering=1)
     def say(s): print(s,flush=True);log.write(s+'\n')
+    def detail(s):
+        if args.verbose: print(s,flush=True)
+        log.write(s+'\n')
     say('Mode: '+('APPLY' if args.apply else 'LOCAL PREVIEW; no network operations'))
     say('Package source: conda-forge ONLY; external plugins disabled; no PyPI fallback')
     say('Base: '+str(base)); say('Source CA: '+str(source));say('Private logs: '+str(logdir))
@@ -547,7 +631,7 @@ def main():
     say('Roots removed from CSE copy: '+(', '.join(removed) or 'none of the four matched'))
     say('This is local mitigation, not evidence of proxy remediation or a full trust-store refresh.')
     def run(cmd, allow_failure=False):
-        say('$ '+shlex.join(map(str,cmd)))
+        detail('$ '+shlex.join(map(str,cmd)))
         r = subprocess.run(list(map(str,cmd)),env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         log.write(r.stdout+r.stderr)
         if r.returncode and not allow_failure: raise RuntimeError('Command failed; see private run.log')
@@ -581,7 +665,7 @@ def main():
         env.update(values)
         env['CONDA_OFFLINE'] = 'true' if args.offline else 'false'
     for i,prefix in enumerate(prefixes):
-        row = {'prefix':str(prefix),'status':'incomplete','issues':[],'skipped_paths':[],'changes_started':False};results.append(row)
+        row = {'prefix':str(prefix),'status':'incomplete','issues':[],'skipped_paths':[],'changes_started':False,'ownership':path_owner(prefix)};results.append(row)
         say('\nPrefix: '+str(prefix))
         try:
             eligible = (prefix/'conda-meta/history').is_file() and maintainable(prefix) and maintainable(prefix/'conda-meta')
@@ -591,12 +675,13 @@ def main():
             eligible = False;reason = str(exc)
         if not eligible:
             row['status']='skipped';row['issues'].append(reason)
-            skipped_paths.append({'path':str(prefix),'stage':'environment','reason':reason})
+            skipped_paths.append({'path':str(prefix),'stage':'environment','reason':reason,'prefix':str(prefix)})
             say('SKIP ENVIRONMENT: '+str(prefix)+': '+reason);continue
         try:
             meta = records(prefix)
             targets,allowed,specs = plan_specs(meta,args.upgrade_conda)
-            say('Package targets: '+(', '.join(sorted(targets)) or 'none'))
+            row['package_targets'] = [{'name':n,'current':meta[n]['version'],'request':('>='+MINIMUM[n] if n in MINIMUM else ('>=26.9.4' if n == 'conda' else 'compatible conda-forge build'))} for n in sorted(targets)]
+            detail('Package targets: '+(', '.join(sorted(targets)) or 'none'))
             audit = {'packages':{},'bundles':{}}
             py = prefix/'bin/python'
             if 'python' in meta:
@@ -612,13 +697,15 @@ def main():
                     p=prefix/relative
                     if p.is_file(): (logdir/('%03d-before-'%i+relative.replace('/','_'))).write_bytes(p.read_bytes())
                 (logdir/('%03d-before-explicit.txt'%i)).write_text(run([conda,'list','-p',prefix,'--explicit']).stdout)
-                if row['issues']: raise RuntimeError('Unsupported old pip; prefix left unchanged')
+                if row['issues']: raise RuntimeError('Package review required; prefix left unchanged (see reasons above)')
                 if targets:
                     cmd=[conda,'install','-p',prefix,'--solver','classic','--freeze-installed','--json']+CHANNEL_ARGS+specs
                     if args.offline: cmd.append('--offline')
                     plan=runjson(cmd+['--dry-run'])
                     (logdir/('%03d-plan.json'%i)).write_text(json.dumps(plan,indent=2))
-                    changed=check_plan(plan,allowed);say('Validated management changes: '+(', '.join(changed) or 'none'))
+                    changed=check_plan(plan,allowed)
+                    row['package_plan'] = [{'name':r['name'],'before':meta.get(r['name'],{}).get('version','absent'),'after':r['version'],'build':r.get('build_string') or r.get('build')} for r in plan.get('actions',{}).get('LINK',[])]
+                    detail('Validated management changes: '+(', '.join(changed) or 'none'))
                     # Lock the planned final versions/builds before the execution solve.
                     final={n:(r['version'],r['build']) for n,r in meta.items()}
                     for r in plan.get('actions',{}).get('LINK',[]):
@@ -633,6 +720,8 @@ def main():
                 run([conda,'config','--file',prefix/'.condarc','--set','ssl_verify',bundle])
                 run([conda,'env','config','vars','set','-p',prefix]+[k+'='+v for k,v in values.items()])
                 after_meta=records(prefix)
+                row['package_changes'] = [{'name':n,'before':meta.get(n,{}).get('version','absent'),'after':r['version']} for n,r in sorted(after_meta.items()) if n not in meta or (r['version'],r['build']) != (meta[n]['version'],meta[n]['build'])]
+                row['trust_configuration'] = 'configured to use'
                 if args.upgrade_conda and 'conda' in meta and version(after_meta['conda']['version']) < (26,9,4):
                     raise RuntimeError('Conda still below the requested minimum')
                 for n in set(MINIMUM)&set(meta):
@@ -657,33 +746,34 @@ def main():
                     verify_chains(prefix/'bin/openssl' if (prefix/'bin/openssl').is_file() else Path('/usr/bin/openssl'),bundle,args.chains_dir.resolve(),env,run)
             else:
                 for n,minimum in MINIMUM.items():
-                    if n in meta:say('%s: %s; requested minimum %s'%(n,meta[n]['version'],minimum))
-                say('Would configure conda/activation to use: '+str(bundle))
+                    if n in meta:detail('%s: %s; requested minimum %s'%(n,meta[n]['version'],minimum))
+                row['trust_configuration'] = 'would configure conda/activation to use'
+                detail('Would configure conda/activation to use: '+str(bundle))
             for n in ('pixi',):
                 if n in meta or n in audit['packages']:row['issues'].append(n+' needs separate embedded-tool/dependency review')
-            permissions = public_permissions(prefix,base,args.apply,say,row['skipped_paths'],args.exclude)
+            row['permissions'] = {}
+            permissions = public_permissions(prefix,base,args.apply,detail,row['skipped_paths'],args.exclude,row['permissions'])
             skipped_paths.extend(row['skipped_paths'])
             row['permission_warnings'] = permissions
             row['status']='incomplete' if row['issues'] else (('updated' if args.apply else 'previewed') + ('-with-skips' if permissions else ''))
         except (PermissionError,FileNotFoundError) as exc:
             row['status']='incomplete' if row['changes_started'] else 'skipped'
             row['issues'].append(str(exc))
-            skipped_paths.append({'path':str(exc.filename or prefix),'stage':'environment','reason':str(exc)})
+            skipped_paths.append({'path':str(exc.filename or prefix),'stage':'environment','reason':str(exc),'prefix':str(prefix)})
             log.write(traceback.format_exc())
         except Exception as exc:
             row['issues'].append(str(exc));log.write(traceback.format_exc())
         for issue in row['issues']:say('ATTENTION: '+issue)
         say('Status: '+row['status'])
     (logdir/'summary.json').write_text(json.dumps(results,indent=2))
-    # Preserve every discovery/permission skip, including unknown inaccessible directories.
-    skipped_paths = list({(r['path'],r['stage'],r['reason']):r for r in skipped_paths}.values())
-    (logdir/'skipped-paths.json').write_text(json.dumps(skipped_paths,indent=2))
-    (logdir/'skipped-paths.txt').write_text(''.join('%s | %s | %s\n' % (r['stage'],r['path'],r['reason']) for r in skipped_paths))
+    skipped_paths = write_skip_reports(logdir,skipped_paths)
+    final_summary(results,args.apply,bundle,say)
     if skipped_paths:
-        say('\nSkipped paths (left unchanged where access/ownership prevented changes):')
-        for r in skipped_paths:say('  %s | %s | %s' % (r['stage'],r['path'],r['reason']))
-        say('Full skip report: '+str(logdir/'skipped-paths.txt'))
-    say('\nSummary: '+', '.join('%s=%d'%(s,sum(r['status']==s for r in results)) for s in ('previewed','previewed-with-skips','updated','updated-with-skips','skipped','incomplete')))
+        say('Skipped paths/access warnings: %d; owner details: %s' % (len(skipped_paths),logdir/'skipped-paths.txt'))
+        say('Reports grouped by owner: '+str(logdir/'skipped-by-owner.json')+' and skipped-owner-UID.txt')
+        if args.verbose:
+            for r in skipped_paths: say('  %s | owner=%s | %s | %s' % (r['stage'],r['owner'],r['path'],r['reason']))
+    say('Full summary: '+str(logdir/'summary.json'))
     if args.apply:say('For the current shell after loading your module: . '+shlex.quote(str(trustdir/'use-ca.sh')))
     say('No external test endpoints were contacted. OS/proxy trust unchanged.')
     log.close()
