@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 8 (2026-10-22).
+"""CSE Miniforge certificate maintenance, revision 9 (2026-10-22).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -15,8 +15,9 @@ Python 3.8+, standard library. Run as a maintenance account, not root.
 
 No test-site connections, connectivity probes, remote execution or OS writes.
 Preview is local-only: inventory, CA inspection, ownership and permissions.
-Apply defaults to conda-forge; repeat --channel for approved additional community
-channels/mirrors. Anaconda defaults/repo.anaconda.com sources are excluded.
+Apply reuses non-default channels recorded in each environment's installed conda
+packages, preserving per-package sources where identifiable. conda-forge remains a
+fallback; --channel adds an explicit community channel/mirror when metadata is absent. Anaconda defaults/repo.anaconda.com sources are excluded.
 All solves use --override-channels and strict channel priority.
 There is no PyPI/pip-install fallback. External conda plugins are disabled for
 maintenance subprocesses so conda-pypi cannot introduce a PyPI source.
@@ -134,7 +135,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
@@ -595,8 +596,10 @@ def final_summary(results, apply, bundle, say):
         owner = row.get('ownership',{})
         say('%s | %s | owner=%s group=%s' % (row['prefix'],row['status'],owner.get('owner','unknown'),owner.get('group','unknown')))
         if row.get('installed_channels'): say('  Installed channel metadata (historical): '+', '.join(row['installed_channels']))
+        if row.get('requested_channels'): say('  Channels used: '+', '.join(row['requested_channels']))
+        if row.get('excluded_installed_sources'): say('  Excluded installed sources: '+', '.join(sorted({r['source'] for r in row['excluded_installed_sources']})))
         for target in row.get('package_targets',[]):
-            say('  Package target: %s %s -> %s' % (target['name'],target['current'],target['request']))
+            say('  Package target: %s %s -> %s | source=%s' % (target['name'],target['current'],target['request'],target.get('source','not recorded')))
         for change in row.get('package_plan',[]):
             say('  Solver plan: %s %s -> %s (build %s)' % (change['name'],change['before'],change['after'],change['build']))
         for change in row.get('package_changes',[]):
@@ -727,6 +730,7 @@ def report_existing(directory, verbose=False):
         if not evidence:
             for path in denied_paths('\n'.join(issues)): print_access(access_snapshot(path),print)
         print('  Next step: '+advice)
+        if row.get('requested_channels'): print('  Channels selected: '+', '.join(row['requested_channels']))
         if row.get('installed_channels'): print('  Installed channel metadata (historical): '+', '.join(row['installed_channels']))
         if row.get('non_conda_tools'):
             print('  Non-conda inventory: '+json.dumps(row['non_conda_tools'],sort_keys=True))
@@ -818,11 +822,83 @@ def requested_channels(extras, config):
         if '::' in pin:
             origin=pin.split('::',1)[0]
             if origin not in names and origin.rstrip('/') not in urls:
-                raise RuntimeError('Channel-qualified pin is outside requested channels: '+pin)
+                if any(url not in urls for url in resolve(origin)):
+                    raise RuntimeError('Channel-qualified pin is outside requested channels: '+pin)
     # Retain the legacy command shape for the ordinary conda-forge mapping.
     flags = CHANNEL_ARGS if not extras and urls==['https://conda.anaconda.org/conda-forge'] else (
         ['--override-channels']+[x for url in urls for x in ('--channel',url)]+['--strict-channel-priority'])
     return names,urls,flags
+
+
+def recorded_origin(record):
+    """Normalize conda channel metadata without losing label paths or mirror hosts."""
+    missing={'','<unknown>','unknown','none','@','pypi','pypi_0'}
+    channel=record.get('channel')
+    if isinstance(channel,dict): channel=channel.get('base_url') or channel.get('name')
+    channel=str(channel or '').strip()
+    value=channel if channel.lower() not in missing else str(record.get('url') or '').strip()
+    if value.lower() in missing or (value.startswith('<') and value.endswith('>')): return None
+    if urlsplit(value).path.endswith('.whl'): return None
+    # A recorded archive URL includes its platform directory and filename.
+    if '://' in value:
+        parsed=urlsplit(value)
+        path=parsed.path.rstrip('/')
+        if path.endswith(('.conda','.tar.bz2')):path=path.rsplit('/',1)[0]
+        last=path.rsplit('/',1)[-1]
+        if last==record.get('subdir') or re.fullmatch(r'(?:noarch|linux-[\w]+|osx-[\w]+|win-[\w]+|freebsd-[\w]+|zos-[\w]+)',last):
+            path=path.rsplit('/',1)[0]
+        # Query strings often sign an archive download; never turn those into
+        # repository credentials. A channel endpoint requiring them needs --channel.
+        value=urlunsplit((parsed.scheme,parsed.netloc,path,'',''))
+    else:
+        value=value.rstrip('/')
+        last=value.rsplit('/',1)[-1]
+        if '/' in value and (last==record.get('subdir') or re.fullmatch(r'(?:noarch|linux-[\w]+|osx-[\w]+|win-[\w]+)',last)):
+            value=value.rsplit('/',1)[0]
+    return value
+
+
+def environment_channels(meta, extras, config):
+    config_without_pins={k:v for k,v in config.items() if k!='pinned_packages'}
+    origins, excluded, unknown={},[],[]
+    for name,record in sorted(meta.items()):
+        origin=recorded_origin(record)
+        if not origin:
+            unknown.append(name);continue
+        # Check both fields: an innocent channel label must not mask a forbidden URL.
+        if forbidden_channel(origin) or (record.get('url') and forbidden_channel(record['url'])):
+            excluded.append({'package':name,'source':origin,'reason':'Anaconda defaults source excluded'});continue
+        try:
+            _,resolved,_=requested_channels([origin],config_without_pins)
+        except RuntimeError as exc:
+            excluded.append({'package':name,'source':origin,'reason':str(exc)});continue
+        fallback=requested_channels([],config_without_pins)[1]
+        # Resolving an origin also includes the common fallback. Preserve a single
+        # origin, rather than guessing which member of a multichannel supplied it.
+        candidates=[url for url in resolved if url not in fallback]
+        if not candidates and origin in ('conda-forge',)+tuple(fallback): candidates=fallback
+        if len(candidates)!=1:
+            unknown.append(name);continue
+        origins[name]=candidates[0]
+    inferred=list(dict.fromkeys(origins.values()))
+    names,urls,flags=requested_channels(list(extras)+inferred,config)
+    return names,urls,flags,origins,excluded,unknown
+
+
+def qualify_specs(specs,origins):
+    output=[]
+    for spec in specs:
+        name=re.split(r'[<>=!~ ]',spec,1)[0]
+        output.append(origins[name]+'::'+spec if name in origins else spec)
+    return output
+
+
+def allowed_pin_origin(origin,names,urls,config):
+    if origin in names or origin.rstrip('/') in urls:return True
+    try:
+        _,resolved,_=requested_channels([origin],{k:v for k,v in config.items() if k!='pinned_packages'})
+        return all(url in urls for url in resolved)
+    except RuntimeError:return False
 
 
 def inspect_trust(base, prefixes=()):
@@ -914,7 +990,7 @@ def main():
     if not maintainable(base): raise RuntimeError('No user/group maintenance access to base')
     if args.trust_only and not args.ca_bundle: ap.error('--trust-only requires --ca-bundle with your approved CSE PEM source')
     config = {} if args.trust_only else json.loads(capture([conda,'config','--show','--json'],env))
-    channel_names,channel_urls,channel_args = requested_channels(args.channel,config)
+    channel_names,channel_urls,channel_args = requested_channels(args.channel,{k:v for k,v in config.items() if k!='pinned_packages'})
     source = choose_source(args,config,base)
     bundle_text, removed = filtered_bundle([source] + args.extra_ca)
     skipped_paths = []
@@ -935,7 +1011,7 @@ def main():
         if args.verbose: print(s,flush=True)
         log.write(s+'\n')
     say('Mode: '+('APPLY' if args.apply else 'LOCAL PREVIEW; no network operations'))
-    say('Package channels: '+', '.join(channel_names)+'; Anaconda defaults excluded; external plugins disabled; no PyPI fallback')
+    say('Fallback/explicit package channels: '+', '.join(channel_names)+'; Anaconda defaults excluded; external plugins disabled; no PyPI fallback')
     say('Resolved channel URLs: '+', '.join(channel_urls))
     say('Scope: '+('CSE trust files only' if args.trust_only else ', '.join(str(p)+(' [BASE]' if p==base else '') for p in prefixes)))
     say('Base: '+str(base)); say('Source CA: '+str(source));say('Private logs: '+str(logdir))
@@ -1033,15 +1109,23 @@ def main():
             row['phase'] = 'read conda package metadata'
             meta = records(prefix)
             row['installed_channels']=sorted({str(r.get('channel') or r.get('url') or 'unknown') for r in meta.values()})
-            row['requested_channels']=channel_names
+            channel_names,channel_urls,channel_args,origins,excluded_origins,unknown_origins=environment_channels(meta,args.channel,config)
+            row['requested_channels']=channel_urls
+            row['package_origins']=origins
+            row['excluded_installed_sources']=excluded_origins
+            row['unknown_package_origins']=unknown_origins
+            say('Environment channels from installed records: '+', '.join(channel_urls))
+            if excluded_origins:say('Excluded Anaconda/default sources: '+', '.join(sorted({r['source'] for r in excluded_origins})))
+            if unknown_origins:detail('Unknown/non-channel package origins (no source inferred): '+', '.join(unknown_origins))
             for pinfile in (prefix/'conda-meta/pinned',):
                 if pinfile.is_file():
                     for pin in pinfile.read_text().splitlines():
                         pin=pin.split('#',1)[0].strip()
-                        if '::' in pin and pin.split('::',1)[0] not in channel_names+channel_urls:
+                        if '::' in pin and not allowed_pin_origin(pin.split('::',1)[0],channel_names,channel_urls,config):
                             raise RuntimeError('Channel-qualified prefix pin outside requested channels: '+pin)
             targets,allowed,specs = plan_specs(meta,args.upgrade_conda)
-            row['package_targets'] = [{'name':n,'current':meta[n]['version'],'request':('>='+MINIMUM[n] if n in MINIMUM else ('>=26.9.4' if n == 'conda' else 'compatible conda-forge build'))} for n in sorted(targets)]
+            specs=qualify_specs(specs,origins)
+            row['package_targets'] = [{'name':n,'current':meta[n]['version'],'request':('>='+MINIMUM[n] if n in MINIMUM else ('>=26.9.4' if n == 'conda' else 'compatible build from installed source')),'source':origins.get(n,'fallback/explicit allowed channels')} for n in sorted(targets)]
             detail('Package targets: '+(', '.join(sorted(targets)) or 'none'))
             audit = {'packages':{},'bundles':{}}
             py = prefix/'bin/python'
@@ -1073,10 +1157,13 @@ def main():
                     detail('Validated management changes: '+(', '.join(changed) or 'none'))
                     # Lock the planned final versions/builds before the execution solve.
                     final={n:(r['version'],r['build']) for n,r in meta.items()}
+                    final_origins=dict(origins)
                     for r in plan.get('actions',{}).get('LINK',[]):
                         final[r['name']]=(r['version'],r.get('build_string') or r.get('build'))
+                        _,_,_,planned_origins,_,_=environment_channels({r['name']:r},args.channel,config)
+                        if r['name'] in planned_origins:final_origins[r['name']]=planned_origins[r['name']]
                     if any(not b for v,b in final.values()):raise RuntimeError('Plan omitted build identifiers')
-                    exact=[n+'='+v+'='+b for n,(v,b) in sorted(final.items())]
+                    exact=qualify_specs([n+'='+v+'='+b for n,(v,b) in sorted(final.items())],final_origins)
                     execution=[conda,'install','-p',prefix,'--solver','classic','--freeze-installed','--json','--yes']+channel_args+exact
                     if args.offline: execution.append('--offline')
                     row['phase'] = 'install validated package plan'
