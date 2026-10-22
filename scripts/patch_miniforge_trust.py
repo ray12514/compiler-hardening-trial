@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 7 (2026-10-22).
+"""CSE Miniforge certificate maintenance, revision 8 (2026-10-22).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
   python3 patch_miniforge_trust.py /path/to/miniforge     # explicit install
-  python3 patch_miniforge_trust.py --apply               # apply, normal channels
+  python3 patch_miniforge_trust.py --apply               # apply, approved channels
   python3 patch_miniforge_trust.py --apply --offline     # approved cached packages
   python3 patch_miniforge_trust.py --apply --upgrade-conda
   python3 patch_miniforge_trust.py --report latest        # explain saved logs only
+  python3 patch_miniforge_trust.py --inspect-trust        # inspect actual CA files
+  python3 patch_miniforge_trust.py --base-only            # preview base only
+  python3 patch_miniforge_trust.py --only /path/to/env    # preview one prefix
+  python3 patch_miniforge_trust.py --trust-only --ca-bundle /path/to/site.pem --apply
 
 No test-site connections, connectivity probes, remote execution or OS writes.
 Preview is local-only: inventory, CA inspection, ownership and permissions.
-Apply enforces conda-forge with --override-channels and strict channel priority.
+Apply defaults to conda-forge; repeat --channel for approved additional community
+channels/mirrors. Anaconda defaults/repo.anaconda.com sources are excluded.
+All solves use --override-channels and strict channel priority.
 There is no PyPI/pip-install fallback. External conda plugins are disabled for
 maintenance subprocesses so conda-pypi cannot introduce a PyPI source.
 --offline forbids network package retrieval; required packages must be cached or
@@ -63,6 +69,11 @@ otherwise base/ssl/cacert.pem or cert.pem, then OS fallback. --extra-ca PATH add
 explicit organizational roots. The source must be plain PEM certificates; trust
 policy/AUX/private-key/other PEM blocks are rejected rather than losing policy.
 An unavailable configured source fails closed. No CAs are removed from /etc.
+--trust-only requires an explicit --ca-bundle and does not invoke conda or update
+packages. It writes only the managed CSE trust files and a shell snippet on apply;
+existing environments/modulefiles are not configured automatically in this mode.
+--inspect-trust reads actual bundles, versions and local configuration separately
+from past run status. A stored filtered file is not proof that every app uses it.
 Replacing the source later with a corrected vendor/site bundle rebuilds this copy.
 
 Conda SSL configuration and conda activation variables are set for updated prefixes
@@ -123,6 +134,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
+from urllib.parse import urlsplit
 
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
@@ -490,6 +502,11 @@ def plan_specs(meta, upgrade_conda):
 def check_plan(plan, allowed):
     if plan.get('success') is False: raise RuntimeError('Conda solver reported failure')
     actions = plan.get('actions',{})
+    for action in ('LINK','FETCH'):
+        for record in actions.get(action,[]):
+            for key in ('url','channel','base_url'):
+                if record.get(key) and forbidden_channel(record[key]):
+                    raise RuntimeError('Rejected plan source from Anaconda defaults: '+str(record[key]))
     linked = {r['name'] for r in actions.get('LINK',[])}
     unlinked = {r['name'] for r in actions.get('UNLINK',[])}
     if (linked | unlinked) - allowed:
@@ -550,13 +567,15 @@ def write_skip_reports(logdir, skipped_paths):
         if key not in merged:
             merged[key] = dict(item,**path_owner(item['path']))
             merged[key]['prefixes'] = []
+            if any(word in item['reason'].lower() for word in ('permission denied','not readable','not traversable','owner must')):
+                merged[key]['access_details']=access_snapshot(item['path'])
         if item.get('prefix') and item['prefix'] not in merged[key]['prefixes']:
             merged[key]['prefixes'].append(item['prefix'])
     rows = list(merged.values())
     def line(r):
         return '%s | owner=%s uid=%s group=%s | %s | environments=%s | %s\n' % (
             r['stage'],r['owner'],r['uid'],r['group'],r['path'],
-            ', '.join(r['prefixes']) or 'not established',r['reason'])
+            ', '.join(r['prefixes']) or 'not established',r['reason'])+(('  Access: '+json.dumps(r['access_details'],sort_keys=True)+'\n') if r.get('access_details') else '')
     (logdir/'skipped-paths.json').write_text(json.dumps(rows,indent=2))
     (logdir/'skipped-paths.txt').write_text(''.join(map(line,rows)))
     by_owner = {}
@@ -575,6 +594,7 @@ def final_summary(results, apply, bundle, say):
     for row in results:
         owner = row.get('ownership',{})
         say('%s | %s | owner=%s group=%s' % (row['prefix'],row['status'],owner.get('owner','unknown'),owner.get('group','unknown')))
+        if row.get('installed_channels'): say('  Installed channel metadata (historical): '+', '.join(row['installed_channels']))
         for target in row.get('package_targets',[]):
             say('  Package target: %s %s -> %s' % (target['name'],target['current'],target['request']))
         for change in row.get('package_plan',[]):
@@ -591,6 +611,9 @@ def final_summary(results, apply, bundle, say):
         if row.get('permission_warnings'): say('  Permission/access skips: %d; see skip reports' % len(row['permission_warnings']))
         if row.get('phase') and row['status']=='incomplete': say('  Failed/review phase: '+row['phase'])
         for issue in row['issues']: say('  Reason: '+issue)
+        for snapshot in row.get('access_details',[]): print_access(snapshot,say)
+        for event in row.get('command_failures',[]):
+            for snapshot in event.get('access_details',[]): print_access(snapshot,say)
     say('Environment counts: '+', '.join('%s=%d'%(s,sum(r['status']==s for r in results)) for s in ('previewed','previewed-with-skips','updated','updated-with-skips','skipped','incomplete')))
     say('Counts are environments, not package versions. Incomplete means a required package/check failed or needs review; reasons appear above.')
     if not apply: say('Preview targets are requests, not solved upgrades. No dependency solve ran; exact versions/builds are validated during apply.')
@@ -604,7 +627,7 @@ def diagnostic_text(stdout, stderr):
             try: obj,_ = decoder.raw_decode(stream[match.start():].lstrip())
             except ValueError: continue
             if isinstance(obj,dict):
-                parts = [str(obj[k]) for k in ('exception_name','error','message') if obj.get(k)]
+                parts = [(k+': ' if k in ('path','filename') else '')+str(obj[k]) for k in ('exception_name','error','message','path','filename') if obj.get(k)]
                 if parts: return '\n'.join(dict.fromkeys(parts))[:2400]
     combined = stderr+'\n'+stdout
     lines = [line.strip() for line in combined.splitlines() if line.strip()]
@@ -639,7 +662,7 @@ def legacy_failure_details(logtext, prefix):
     """Best-effort extraction from older logs; never execute logged commands."""
     chunks = re.split(r'(?m)^Prefix: ',logtext)
     section = next((chunk.split('\nFinal summary',1)[0] for chunk in chunks[1:]
-                    if chunk.splitlines() and chunk.splitlines()[0].strip()==prefix), '')
+                    if chunk.splitlines() and chunk.splitlines()[0].strip() in (prefix,prefix+' [BASE]')), '')
     commands = list(re.finditer(r'(?m)^\$ ([^\n]*)\n',section))
     if not commands: return None
     # Older wrappers raise after the failed command, so the last command before
@@ -667,6 +690,10 @@ def report_existing(directory, verbose=False):
     print('READ-ONLY REPORT: '+str(directory))
     mode = next((line for line in logtext.splitlines() if line.startswith('Mode: ')),'Mode: not recorded')
     print('Saved run '+mode)
+    try:
+        cert=json.loads((directory/'certificate-status.json').read_text())
+        print('Saved certificate stage: %s | %s | SHA256=%s' % (cert['status'],cert['bundle'],cert.get('sha256')))
+    except FileNotFoundError: print('Saved certificate stage: not separately recorded by this script revision; use --inspect-trust to check actual files')
     print('No environments, packages, permissions or certificates are changed. No network commands run.')
     counts = {}
     failures = []
@@ -691,10 +718,16 @@ def report_existing(directory, verbose=False):
             print('  Command: '+event['command'])
             print('  Return code: '+str(event.get('returncode','not recorded')))
             print('  Diagnostic: '+event['detail'].replace('\n','\n    '))
+            snapshots=event.get('access_details') or [access_snapshot(p) for p in denied_paths(event['detail'])]
+            for snapshot in snapshots: print_access(snapshot,print)
             if event.get('file'): print('  Full command output: '+str(directory/event['file']))
         if not evidence and any('Command failed; see private run.log' in issue for issue in issues):
             print('  Diagnostic unavailable in this summary; legacy run.log extraction found no matching command.')
+        for snapshot in row.get('access_details',[]): print_access(snapshot,print)
+        if not evidence:
+            for path in denied_paths('\n'.join(issues)): print_access(access_snapshot(path),print)
         print('  Next step: '+advice)
+        if row.get('installed_channels'): print('  Installed channel metadata (historical): '+', '.join(row['installed_channels']))
         if row.get('non_conda_tools'):
             print('  Non-conda inventory: '+json.dumps(row['non_conda_tools'],sort_keys=True))
     print('\nEnvironment counts: '+', '.join('%s=%d'%item for item in sorted(counts.items())))
@@ -704,10 +737,156 @@ def report_existing(directory, verbose=False):
     return 0
 
 
+def access_snapshot(path):
+    """Read current access metadata; never chmod to make a check pass."""
+    p = Path(os.path.abspath(os.path.expanduser(str(path))))
+    result = dict(path=str(p),captured_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),**path_owner(p))
+    try:
+        st = p.lstat()
+        result.update(mode=stat.filemode(st.st_mode),octal='%04o'%stat.S_IMODE(st.st_mode),
+                      symlink_target=str(p.resolve()) if stat.S_ISLNK(st.st_mode) else None)
+        result['access'] = {name:os.access(str(p),flag) for name,flag in
+                            (('read',os.R_OK),('write',os.W_OK),('execute_or_traverse',os.X_OK))}
+        try:
+            result['extended_acl'] = 'system.posix_acl_access' in os.listxattr(str(p)) if hasattr(os,'listxattr') else 'unknown'
+        except OSError as exc: result['extended_acl'] = 'unreadable: '+str(exc)
+    except OSError as exc: result['stat_error'] = str(exc)
+    result['blocked_parents'] = []
+    for parent in p.parents:
+        if not os.access(str(parent),os.X_OK):
+            result['blocked_parents'].append(dict(path=str(parent),**path_owner(parent)))
+    return result
+
+
+def denied_paths(text):
+    found = []
+    patterns = (r"[Pp]ermission denied:?\s*['\"]([^'\"]+)['\"]",
+                r"[Pp]ermission denied:?\s*(/[^\n|]+)",
+                r"(?:path|filename)\s*[:=]\s*['\"](/[^'\"]+)['\"]",
+                r"(?:path|filename)\s*:\s*(/[^\n|]+)")
+    for pattern in patterns:
+        for value in re.findall(pattern,text):
+            value=value.strip().rstrip('.')
+            if value.startswith('/') and value not in found:found.append(value)
+    return found
+
+
+def print_access(snapshot, say):
+    say('  Path access snapshot: %s | owner=%s group=%s mode=%s | %s | ACL=%s' % (
+        snapshot['path'],snapshot['owner'],snapshot['group'],snapshot.get('mode','unknown'),
+        snapshot.get('access',snapshot.get('stat_error','unknown')),snapshot.get('extended_acl','unknown')))
+    for parent in snapshot['blocked_parents']:
+        say('    Parent not traversable by current account: %s | owner=%s group=%s' % (parent['path'],parent['owner'],parent['group']))
+
+
+def forbidden_channel(value):
+    value = str(value).strip().rstrip('/')
+    denied=('defaults','anaconda','pkgs/main','pkgs/r','pkgs/free','pkgs/pro','pkgs/msys2')
+    if any(value.lower()==name or value.lower().startswith(name+'/') for name in denied): return True
+    parsed = urlsplit(value)
+    return parsed.hostname in ('repo.anaconda.com','repo.continuum.io') or (
+        parsed.hostname=='conda.anaconda.org' and parsed.path.strip('/').split('/')[0]=='anaconda')
+
+
+def requested_channels(extras, config):
+    """Resolve the explicit allowlist locally, so Anaconda defaults cannot hide in aliases."""
+    custom = config.get('custom_channels') or {}
+    multi = config.get('custom_multichannels') or {}
+    alias = config.get('channel_alias') or 'https://conda.anaconda.org'
+    def resolve(name,seen=()):
+        if forbidden_channel(name): raise RuntimeError('Anaconda defaults channel is excluded: '+str(name))
+        if name in seen: raise RuntimeError('Recursive channel alias: '+name)
+        if name in multi:
+            urls=[]
+            for child in multi[name]: urls.extend(resolve(child,seen+(name,)))
+            return urls
+        if '://' in name:
+            urls=[name.rstrip('/')]
+        elif name.startswith('/'):
+            urls=[Path(name).as_uri()]
+        else:
+            # custom_channels maps a channel name to the base location, without
+            # that channel name (the conda configuration contract).
+            key=next((k for k in sorted(custom,key=len,reverse=True) if name==k or name.startswith(k+'/')),None)
+            urls=[str(custom[key] if key else alias).rstrip('/')+'/'+name]
+        for url in urls:
+            if forbidden_channel(url): raise RuntimeError('Channel resolves to excluded Anaconda defaults: '+url)
+        return urls
+    names=list(dict.fromkeys(['conda-forge']+list(extras)))
+    urls=list(dict.fromkeys(url for name in names for url in resolve(name)))
+    for pin in config.get('pinned_packages') or []:
+        if '::' in pin:
+            origin=pin.split('::',1)[0]
+            if origin not in names and origin.rstrip('/') not in urls:
+                raise RuntimeError('Channel-qualified pin is outside requested channels: '+pin)
+    # Retain the legacy command shape for the ordinary conda-forge mapping.
+    flags = CHANNEL_ARGS if not extras and urls==['https://conda.anaconda.org/conda-forge'] else (
+        ['--override-channels']+[x for url in urls for x in ('--channel',url)]+['--strict-channel-priority'])
+    return names,urls,flags
+
+
+def inspect_trust(base, prefixes=()):
+    print('READ-ONLY CERTIFICATE CHECK | base: '+str(base))
+    bundle=base/'etc/cse-trust/ca-bundle.pem'
+    good=False
+    paths=[bundle]
+    for prefix in dict.fromkeys([base]+list(prefixes)):
+        print('Prefix: '+str(prefix)+(' [BASE]' if prefix==base else ''))
+        try:
+            meta=records(prefix)
+            for n in ('ca-certificates','certifi','pip'):
+                if n in meta:
+                    try: status='MEETS SCRIPT MINIMUM' if version(meta[n]['version'])>=version(MINIMUM[n]) else 'BELOW SCRIPT MINIMUM '+MINIMUM[n]
+                    except RuntimeError: status='version needs review'
+                    print('  Package: %s=%s | %s'%(n,meta[n]['version'],status))
+        except (OSError,ValueError,KeyError) as exc: print('  Package inventory unavailable: '+str(exc))
+        paths.extend(prefix/rel for rel in ('ssl/cert.pem','ssl/cacert.pem'))
+        paths.extend(prefix.glob('lib/python*/site-packages/certifi/cacert.pem'))
+        paths.extend(prefix.glob('lib/python*/site-packages/pip/_vendor/certifi/cacert.pem'))
+        condarc=prefix/'.condarc'
+        try:
+            matches=re.findall(r'(?m)^ssl_verify\s*:\s*(.*)$',condarc.read_text())
+            print('  Prefix ssl_verify setting (raw): '+('; '.join(matches) or 'no top-level setting'))
+        except FileNotFoundError: print('  Prefix .condarc: absent (no local override; inherited configuration may apply)')
+        except OSError as exc: print('  Prefix .condarc: '+str(exc))
+        try:
+            state=json.loads((prefix/'conda-meta/state').read_text())
+            print('  Activation CA variables: '+json.dumps({k:v for k,v in state.get('env_vars',{}).items() if k in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','CURL_CA_BUNDLE','PIP_CERT','SSL_CERT_DIR')},sort_keys=True))
+        except FileNotFoundError: print('  Activation state: absent')
+        except (OSError,ValueError) as exc: print('  Activation state: '+str(exc))
+    for path in dict.fromkeys(paths):
+        try:
+            data=path.read_bytes();entries=pem_entries(data.decode())
+            present=[ROOTS[h] for h,pem in entries if h in ROOTS]
+            print('Bundle: %s\n  SHA256=%s\n  Certificates=%d; known incident roots=%s' % (path,hashlib.sha256(data).hexdigest(),len(entries),', '.join(present) or 'NONE OF THE FOUR MATCHED'))
+            if path==bundle: good=not present
+        except FileNotFoundError:
+            if path==bundle: print('CSE managed bundle: ABSENT at '+str(path))
+        except (OSError,ValueError,RuntimeError) as exc:
+            print('Bundle check failed: %s | %s'%(path,exc))
+            if isinstance(exc,PermissionError):print_access(access_snapshot(path),print)
+    marker=base/'etc/cse-trust/managed-by-patch-miniforge-trust'
+    try: print('Managed marker: '+marker.read_text().strip())
+    except OSError as exc: print('Managed marker unavailable: '+str(exc))
+    print('Current shell CA variables: '+json.dumps({k:os.environ[k] for k in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','CURL_CA_BUNDLE','PIP_CERT','SSL_CERT_DIR') if k in os.environ},sort_keys=True))
+    selected=[k for k in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','CURL_CA_BUNDLE','PIP_CERT') if os.environ.get(k)==str(bundle)]
+    print('Current shell variables selecting CSE copy: '+(', '.join(selected) or 'NONE; application-specific configuration may still apply'))
+    print('CSE bundle screening: '+('PRESENT, PARSEABLE, FOUR KNOWN ROOTS ABSENT' if good else 'NOT CONFIRMED'))
+    print('Stored bundle, package versions and active application trust are separate. This does not prove full chain rejection or proxy remediation.')
+    print('No changes, package updates or external TLS connections were made.')
+    return 0 if good else 2
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('miniforge', nargs='?', type=Path)
     ap.add_argument('--apply', action='store_true')
+    ap.add_argument('--inspect-trust',action='store_true',help='Read actual CSE/base CA files and configuration; no updates')
+    ap.add_argument('--trust-only',action='store_true',help='Only prepare/write the CSE bundle and shell snippet; no package/environment permission changes')
+    scope=ap.add_mutually_exclusive_group()
+    scope.add_argument('--base-only',action='store_true',help='Select only the Miniforge base prefix')
+    scope.add_argument('--only',type=Path,action='append',default=[],help='Select only this exact environment; repeatable; still uses the base conda/CSE bundle')
+    ap.add_argument('--channel',action='append',default=[],help='Additional approved community channel or mirror; repeatable; Anaconda defaults excluded')
     ap.add_argument('--report',type=Path,metavar='LOG_DIR_OR_latest',help='Read an existing summary/run.log and explain failures; no updates, group checks or network')
     ap.add_argument('--verbose',action='store_true',help='Show per-path permission details and subprocess commands; full details are always logged')
     ap.add_argument('--offline', action='store_true',help='Apply using cache/file channels; never retrieve online')
@@ -721,19 +900,30 @@ def main():
     ap.add_argument('--log-dir',type=Path)
     args = ap.parse_args()
     if args.report:
-        if args.apply: ap.error('--report cannot be combined with --apply')
+        if args.apply or args.inspect_trust or args.trust_only: ap.error('--report cannot be combined with apply/trust modes')
         return report_existing(args.report,args.verbose)
+    if args.inspect_trust:
+        if args.apply or args.trust_only: ap.error('--inspect-trust cannot be combined with --apply/--trust-only')
+        base=find_base(args.miniforge,safe_environment())
+        return inspect_trust(base,[p.expanduser().resolve() for p in args.only])
     if os.geteuid() == 0: ap.error('Run as the software maintenance account, not root')
     cse_gid = maintenance_gid()  # validate before any deployment changes
     os.umask(0o002)
     env = safe_environment()
     base = find_base(args.miniforge,env); conda = base/'bin/conda'
     if not maintainable(base): raise RuntimeError('No user/group maintenance access to base')
-    config = json.loads(capture([conda,'config','--show','ssl_verify','--json'],env))
+    if args.trust_only and not args.ca_bundle: ap.error('--trust-only requires --ca-bundle with your approved CSE PEM source')
+    config = {} if args.trust_only else json.loads(capture([conda,'config','--show','--json'],env))
+    channel_names,channel_urls,channel_args = requested_channels(args.channel,config)
     source = choose_source(args,config,base)
     bundle_text, removed = filtered_bundle([source] + args.extra_ca)
     skipped_paths = []
-    prefixes = discover(base,conda,env,args.include,args.scan_root,args.exclude,skipped_paths)
+    if args.base_only or args.trust_only: prefixes=[base]
+    elif args.only: prefixes=list(dict.fromkeys(p.expanduser().resolve() for p in args.only))
+    else: prefixes=discover(base,conda,env,args.include,args.scan_root,args.exclude,skipped_paths)
+    exclusions=[p.expanduser().resolve() for p in args.exclude]
+    prefixes=[p for p in prefixes if not any(p==x or x in p.parents for x in exclusions)]
+    if not prefixes: raise RuntimeError('No prefixes selected after exclusions')
     logdir = (args.log_dir or Path.home()/'.cse-trust-logs'/datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')).expanduser().resolve()
     if any(logdir == p or p in logdir.parents for p in prefixes):
         raise RuntimeError('Logs must be outside all selected environment trees')
@@ -745,11 +935,13 @@ def main():
         if args.verbose: print(s,flush=True)
         log.write(s+'\n')
     say('Mode: '+('APPLY' if args.apply else 'LOCAL PREVIEW; no network operations'))
-    say('Package source: conda-forge ONLY; external plugins disabled; no PyPI fallback')
+    say('Package channels: '+', '.join(channel_names)+'; Anaconda defaults excluded; external plugins disabled; no PyPI fallback')
+    say('Resolved channel URLs: '+', '.join(channel_urls))
+    say('Scope: '+('CSE trust files only' if args.trust_only else ', '.join(str(p)+(' [BASE]' if p==base else '') for p in prefixes)))
     say('Base: '+str(base)); say('Source CA: '+str(source));say('Private logs: '+str(logdir))
     say('Current UID/groups: %s / %s' % (os.geteuid(),','.join(map(str,sorted(groups())))))
     say('Shared permissions target: cse (GID %d); directories 2775, files 0664, executables 0775' % cse_gid)
-    say('Roots removed from CSE copy: '+(', '.join(removed) or 'none of the four matched'))
+    say('Source roots selected for removal from CSE copy: '+(', '.join(removed) or 'none of the four matched'))
     say('This is local mitigation, not evidence of proxy remediation or a full trust-store refresh.')
     command_number = 0
     def record_failure(cmd, stdout, stderr, code, reason=None):
@@ -760,6 +952,7 @@ def main():
         diagnostic = reason or diagnostic_text(stdout,stderr)
         event = {'command':display[:500],'detail':diagnostic,'returncode':code,'file':filename,
                  'phase':row.get('phase','not recorded')}
+        event['access_details']=[access_snapshot(p) for p in denied_paths(diagnostic)]
         (logdir/filename).write_text(json.dumps(dict(event,argv=list(map(str,cmd)),stdout=stdout,stderr=stderr),indent=2))
         row.setdefault('command_failures',[]).append(event)
         return RuntimeError('Command failed during %s (exit %s): %s | %s | full output: %s' %
@@ -769,7 +962,7 @@ def main():
         try:
             r = subprocess.run(list(map(str,cmd)),env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
         except OSError as exc:
-            raise record_failure(cmd,'',str(exc),None) from exc
+            raise record_failure(cmd,'',str(exc),None, str(exc)+(' | filename: '+repr(exc.filename) if exc.filename else '')) from exc
         log.write(r.stdout+r.stderr+'\n')
         if r.returncode and not allow_failure:
             raise record_failure(cmd,r.stdout,r.stderr,r.returncode)
@@ -809,9 +1002,23 @@ def main():
         atomic_write(trustdir/'use-ca.sh','# Source after loading your CSE module.\n'+''.join('export %s=%s\n'%(k,shlex.quote(v)) for k,v in values.items()))
         env.update(values)
         env['CONDA_OFFLINE'] = 'true' if args.offline else 'false'
+    certificate_status={'status':'written' if args.apply else 'planned','bundle':str(bundle),'source':str(source),'roots_selected_for_removal':removed,
+                        'sha256':hashlib.sha256(bundle.read_bytes()).hexdigest() if args.apply else None,
+                        'activation':'shell snippet available; each application/environment must use it; OS/proxy unchanged'}
+    (logdir/'certificate-status.json').write_text(json.dumps(certificate_status,indent=2))
+    say('CSE certificate stage: '+certificate_status['status'].upper()+' | '+str(bundle))
+    if args.apply: say('CSE bundle SHA256: '+certificate_status['sha256'])
+    if args.trust_only:
+        say('No package updates or environment permission normalization attempted.')
+        say('Existing CA packages/embedded bundles remain separate update work.')
+        if args.apply: say('For the current shell after loading your module: . '+shlex.quote(str(trustdir/'use-ca.sh')))
+        say('Certificate stage report: '+str(logdir/'certificate-status.json'))
+        log.close()
+        if lockfile: lockfile.close()
+        return 0
     for i,prefix in enumerate(prefixes):
         row = {'prefix':str(prefix),'status':'incomplete','issues':[],'skipped_paths':[],'changes_started':False,'ownership':path_owner(prefix)};results.append(row)
-        say('\nPrefix: '+str(prefix))
+        say('\nPrefix: '+str(prefix)+(' [BASE]' if prefix==base else ''))
         try:
             eligible = (prefix/'conda-meta/history').is_file() and maintainable(prefix) and maintainable(prefix/'conda-meta')
             eligible = eligible and os.access(str(prefix),os.R_OK|os.X_OK) and os.access(str(prefix/'conda-meta'),os.R_OK|os.X_OK)
@@ -825,6 +1032,14 @@ def main():
         try:
             row['phase'] = 'read conda package metadata'
             meta = records(prefix)
+            row['installed_channels']=sorted({str(r.get('channel') or r.get('url') or 'unknown') for r in meta.values()})
+            row['requested_channels']=channel_names
+            for pinfile in (prefix/'conda-meta/pinned',):
+                if pinfile.is_file():
+                    for pin in pinfile.read_text().splitlines():
+                        pin=pin.split('#',1)[0].strip()
+                        if '::' in pin and pin.split('::',1)[0] not in channel_names+channel_urls:
+                            raise RuntimeError('Channel-qualified prefix pin outside requested channels: '+pin)
             targets,allowed,specs = plan_specs(meta,args.upgrade_conda)
             row['package_targets'] = [{'name':n,'current':meta[n]['version'],'request':('>='+MINIMUM[n] if n in MINIMUM else ('>=26.9.4' if n == 'conda' else 'compatible conda-forge build'))} for n in sorted(targets)]
             detail('Package targets: '+(', '.join(sorted(targets)) or 'none'))
@@ -849,7 +1064,7 @@ def main():
                 (logdir/('%03d-before-explicit.txt'%i)).write_text(run([conda,'list','-p',prefix,'--explicit']).stdout)
                 if targets:
                     row['phase'] = 'solve package update (dry run)'
-                    cmd=[conda,'install','-p',prefix,'--solver','classic','--freeze-installed','--json']+CHANNEL_ARGS+specs
+                    cmd=[conda,'install','-p',prefix,'--solver','classic','--freeze-installed','--json']+channel_args+specs
                     if args.offline: cmd.append('--offline')
                     plan=runjson(cmd+['--dry-run'])
                     (logdir/('%03d-plan.json'%i)).write_text(json.dumps(plan,indent=2))
@@ -862,7 +1077,7 @@ def main():
                         final[r['name']]=(r['version'],r.get('build_string') or r.get('build'))
                     if any(not b for v,b in final.values()):raise RuntimeError('Plan omitted build identifiers')
                     exact=[n+'='+v+'='+b for n,(v,b) in sorted(final.items())]
-                    execution=[conda,'install','-p',prefix,'--solver','classic','--freeze-installed','--json','--yes']+CHANNEL_ARGS+exact
+                    execution=[conda,'install','-p',prefix,'--solver','classic','--freeze-installed','--json','--yes']+channel_args+exact
                     if args.offline: execution.append('--offline')
                     row['phase'] = 'install validated package plan'
                     row['changes_started']=True
@@ -913,6 +1128,7 @@ def main():
         except (PermissionError,FileNotFoundError) as exc:
             row['status']='incomplete' if row['changes_started'] else 'skipped'
             row['issues'].append(str(exc))
+            if exc.filename: row['access_details']=[access_snapshot(exc.filename)]
             skipped_paths.append({'path':str(exc.filename or prefix),'stage':'environment','reason':str(exc),'prefix':str(prefix)})
             log.write(traceback.format_exc())
         except Exception as exc:
@@ -922,6 +1138,7 @@ def main():
     (logdir/'summary.json').write_text(json.dumps(results,indent=2))
     skipped_paths = write_skip_reports(logdir,skipped_paths)
     final_summary(results,args.apply,bundle,say)
+    say('CSE certificate stage: '+certificate_status['status'].upper()+'; see '+str(logdir/'certificate-status.json'))
     if skipped_paths:
         say('Skipped paths/access warnings: %d; owner details: %s' % (len(skipped_paths),logdir/'skipped-paths.txt'))
         say('Reports grouped by owner: '+str(logdir/'skipped-by-owner.json')+' and skipped-owner-UID.txt')
