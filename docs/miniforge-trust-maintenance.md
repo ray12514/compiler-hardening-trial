@@ -41,15 +41,15 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
   > ./patch_miniforge_trust.py
 ```
 
-### Reproduce the skip-inaccessible revision exactly
+### Reproduce the concise-report revision exactly
 
-The script was updated at commit `031c5b34a2cb463f8ddf0ba95d10e244b0fce153`.
+The script was updated at commit `50f92c04d856a74b54e63c6647cffa22e929258b`.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
 ```bash
 git -C "$cse_fetch_dir/repo" fetch --depth 1 origin \
-  031c5b34a2cb463f8ddf0ba95d10e244b0fce153
+  50f92c04d856a74b54e63c6647cffa22e929258b
 ```
 
 Then replace `HEAD:scripts/patch_miniforge_trust.py` with
@@ -57,7 +57,7 @@ Then replace `HEAD:scripts/patch_miniforge_trust.py` with
 `rev-parse FETCH_HEAD` for the provenance record. Verify this exact script revision:
 
 ```bash
-echo 'e1fca95d313a6d7ef904f47485229990988fb49c8e5b6c96728885768947698b  patch_miniforge_trust.py' |
+echo '75758ff46988ab6d01e4bdd802e6297e7965efa658334d2054c2b5efb48ffdb8  patch_miniforge_trust.py' |
   sha256sum --check
 ```
 
@@ -97,7 +97,12 @@ python3 patch_miniforge_trust.py /actual/path/to/miniforge \
 
 Preview performs local discovery, CA parsing and permission inspection. It does not
 download packages or run the solver. Review the base path, CA source, selected prefixes,
-permission-change counts and reported issues.
+permission-change counts and reported issues. Default console output omits per-path
+permission details. Add `--verbose` to display them; full details are always saved in
+the private `run.log`. The end-of-run summary always shows each environment, package
+requests (current version and requested minimum), permission counts, trust configuration
+and reasons for incomplete work. Preview requests are not solver-confirmed upgrades.
+Apply records the validated solver plan and verified installed package changes separately.
 
 ## Apply
 
@@ -167,13 +172,25 @@ The final console report and private logs identify:
 - `incomplete`: a package update, verification, or another required operation failed,
   or an environment became inaccessible after changes started.
 
-`skipped-paths.txt` and `skipped-paths.json` contain full paths, stages and reasons.
+`skipped-paths.txt` and `skipped-paths.json` contain full paths, stages, reasons,
+owning usernames/UIDs, groups/GIDs and associated environments where known. The
+path owner is looked up in the host account database; an unknown UID remains numeric,
+and an inaccessible path whose ownership cannot be read is labeled unknown. No owner
+is guessed from a parent directory.
+
+`skipped-by-owner.json` groups the paths by owner. `skipped-owner-UID.txt` provides
+a separate private text report for each owner (or `skipped-owner-unknown.txt`). You can
+review and share the relevant report with that colleague; the script sends nothing.
+These reports identify owners, not proof that a particular colleague caused the issue.
 `summary.json` lists each selected prefix and status. Discovery cannot identify what
 is inside an unreadable directory; such a directory is recorded as an uninspected
 path rather than asserted to be a conda environment.
 
 Access/ownership/ACL skips alone are nonfatal warnings (exit 0), and available
-environments continue. Actual package/check failures remain exit 2 after the remaining
+environments continue. `incomplete=4` in the console means four environments need review, not four package
+versions and not process exit code 4. Each environment's reasons appear in the final
+summary and `summary.json`. A permission/access skip alone is distinct from an
+incomplete package/check operation. Actual package/check failures remain exit 2 after the remaining
 environments have been attempted. Necessary base/CA-source/group validation and lock
 failures still stop the run before it can safely proceed.
 
@@ -196,6 +213,16 @@ files, extended ACLs and files owned by other accounts are preserved or reported
 review. Another owner's files can only be left unchanged if already compliant; group
 write access alone does not permit chmod/chgrp. Parent directories and package-cache
 contents are not recursively modified. Private parent traversal can still block access.
+
+“Parent lacks other-traverse bit” means an ancestor directory lacks execute permission
+for users outside its owner/group. Group membership or an ACL may still grant access;
+this warning alone does not establish that everyone is blocked. Such paths are
+reported under `parent-access`, with their actual owner where readable. The script
+does not widen home directories or overwrite ACLs. Making an environment group `cse`
+does not itself fix access through a private parent. For shared software, have the
+parent owner/admin review traversal or move the environment into an approved shared
+software location. All selected eligible environments, including ones in your home,
+use the same `cse` group target; the user owner UID stays unchanged.
 
 ## Certificate behavior and activation
 
@@ -237,7 +264,8 @@ Tcl/Lua conventions. The script does not edit an unknown modulefile.
 ## Results and limits
 
 The printed private log directory contains `run.log`, configuration/history records,
-solver plans, `summary.json`, `skipped-paths.txt` and `skipped-paths.json`. Exit 0 allows
+solver plans, `summary.json`, `skipped-paths.txt`, `skipped-paths.json`,
+`skipped-by-owner.json` and `skipped-owner-UID.txt`. Exit 0 allows
 reported access/ownership skips; inspect the summary before declaring an installation
 fully remediated. Exit 2 means incomplete package/check work or a critical startup
 failure. Preview success is not a claim that a future dependency solve will succeed.
@@ -249,7 +277,8 @@ The proxy's upstream verification must be assessed separately by its maintainers
 
 Local tests cover the exact cse lookup/membership checks, file/directory modes,
 foreign-owner reporting, hardlink isolation, secret exclusions, discovery, pinning,
-CA filtering and simulated preview/offline apply. Actual SUSE/RHEL deployment remains
+CA filtering, quiet/verbose output, owner report grouping, final-summary reasons,
+permission preview counts and simulated preview/offline apply. Actual SUSE/RHEL deployment remains
 a target-system validation task.
 
 ## References
@@ -259,3 +288,4 @@ a target-system validation task.
 - [Git clone options](https://git-scm.com/docs/git-clone)
 - [Git show](https://git-scm.com/docs/git-show)
 - [OpenSSH scp](https://man.openbsd.org/scp)
+
