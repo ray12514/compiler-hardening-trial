@@ -41,15 +41,15 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
   > ./patch_miniforge_trust.py
 ```
 
-### Reproduce the concise-report revision exactly
+### Reproduce the failure-report revision exactly
 
-The script was updated at commit `50f92c04d856a74b54e63c6647cffa22e929258b`.
+The script was updated at commit `e100f7caa3785065139a89a2cbfbd29188ac3d5d`.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
 ```bash
 git -C "$cse_fetch_dir/repo" fetch --depth 1 origin \
-  50f92c04d856a74b54e63c6647cffa22e929258b
+  e100f7caa3785065139a89a2cbfbd29188ac3d5d
 ```
 
 Then replace `HEAD:scripts/patch_miniforge_trust.py` with
@@ -57,7 +57,7 @@ Then replace `HEAD:scripts/patch_miniforge_trust.py` with
 `rev-parse FETCH_HEAD` for the provenance record. Verify this exact script revision:
 
 ```bash
-echo '75758ff46988ab6d01e4bdd802e6297e7965efa658334d2054c2b5efb48ffdb8  patch_miniforge_trust.py' |
+echo '1570a6ba8c794ff13edff914305d68d57cd9cb8d5fc9111f44fa667486aea026  patch_miniforge_trust.py' |
   sha256sum --check
 ```
 
@@ -103,6 +103,75 @@ the private `run.log`. The end-of-run summary always shows each environment, pac
 requests (current version and requested minimum), permission counts, trust configuration
 and reasons for incomplete work. Preview requests are not solver-confirmed upgrades.
 Apply records the validated solver plan and verified installed package changes separately.
+
+## Explain an existing failed run without retrying
+
+Retrieve the updated script, then run:
+
+```bash
+python3 patch_miniforge_trust.py --report latest
+```
+
+This reads the latest directory containing `summary.json` under your home directory's
+`~/.cse-trust-logs`. Check the printed saved run mode: the latest run might be a
+preview. To select a particular apply run, use the exact `Private logs:` directory
+printed by that run:
+
+```bash
+python3 patch_miniforge_trust.py --report "$HOME/.cse-trust-logs/REPLACE_WITH_RUN_DIRECTORY"
+```
+
+Replace the last directory component with the actual timestamp directory. Neither
+command updates packages, changes certificates or permissions, checks group membership,
+nor runs network/subprocess commands. Report mode returns 0 when it successfully
+reads the report, regardless of the saved update statuses. `--report --apply` is rejected.
+
+The report shows failed/skipped environments, owners where recorded, saved reasons,
+command diagnostics, categories and suggested next steps. It suppresses ordinary
+successful rows unless `--verbose` is supplied. For older logs, the command associated
+with a generic failure is inferred from the preceding logged command; its return code
+was not recorded. JSON errors and exception messages are extracted where available.
+This recovery is best-effort: a missing underlying error is reported as unresolved,
+not guessed. New runs save `failed-command-NNN.json` with the actual arguments, return
+code (null if the executable could not start), operation phase, stdout and stderr;
+these details are also referenced in `summary.json`.
+
+The report is plain text; save a copy if needed:
+
+```bash
+python3 patch_miniforge_trust.py --report latest > miniforge-failure-report.txt
+```
+
+Review paths and command output for credentials or sensitive site details before
+sharing outside your authorized team. No reports are sent automatically.
+
+`updated-with-skips` means package/configuration work completed with permission/access
+exceptions. It is not counted as a failed package update. `incomplete` can mean the
+script deliberately declined an unsupported operation, not just that conda failed.
+
+### Mixed pip/uv and conda ownership
+
+The presence of pip-installed applications alone does not trigger the migration block.
+The script blocks a prefix when its audit finds an outdated tool in the security
+minimum list without a corresponding conda package record. It reports that tool by
+name (for example, `certifi`). New audits also record installer metadata and installation
+location when available; these are evidence, not proof of the environment's full history.
+A mixed-package review is checked before prefix backup/export/solve commands, so an
+unrelated export failure cannot obscure the deliberate block.
+
+Do not bulk uninstall pip/uv tools or force conda to overwrite their files. Conda cannot
+fully account for pip's changes. A reviewed migration or replacement environment must
+preserve the applications' requirements and use the approved conda-forge source; the
+script does not switch to PyPI. The new report identifies these environments separately
+from repository/solver failures, so the two problems can be addressed independently.
+
+### Permission denied despite owning the environment
+
+The denied path might be a package cache, a parent, a configuration file or an executable
+rather than the environment root. ACLs, missing traversal/execute permissions and
+filesystem policy can deny an operation despite apparent ownership. Use the exact path
+and command in the report to determine the required repair. The script does not fix
+this by recursively widening unrelated directories or changing another user's owner UID.
 
 ## Apply
 
@@ -278,11 +347,13 @@ The proxy's upstream verification must be assessed separately by its maintainers
 Local tests cover the exact cse lookup/membership checks, file/directory modes,
 foreign-owner reporting, hardlink isolation, secret exclusions, discovery, pinning,
 CA filtering, quiet/verbose output, owner report grouping, final-summary reasons,
-permission preview counts and simulated preview/offline apply. Actual SUSE/RHEL deployment remains
+permission preview counts, read-only legacy-log reporting, structured command-failure
+records, mixed-package review ordering and simulated preview/offline apply. Actual SUSE/RHEL deployment remains
 a target-system validation task.
 
 ## References
 
+- [Conda guidance for pip in environments](https://docs.conda.io/projects/conda/en/stable/user-guide/tasks/manage-environments.html#using-pip-in-an-environment)
 - [Conda incident guidance](https://conda.org/blog/2026-10-21-emudhra-security-updates/)
 - [Python incident guidance](https://discuss.python.org/t/109576)
 - [Git clone options](https://git-scm.com/docs/git-clone)
