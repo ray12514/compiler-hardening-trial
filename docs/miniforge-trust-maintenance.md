@@ -41,15 +41,15 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
   > ./patch_miniforge_trust.py
 ```
 
-### Reproduce the cse-permissions revision exactly
+### Reproduce the conda-forge-only revision exactly
 
-The script was updated at commit `0e591c1d1d4ece947f16f60220794a390d64f52f`.
+The script was updated at commit `f82b63ebc7cd313b897996293e41d00c9a0e73d1`.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
 ```bash
 git -C "$cse_fetch_dir/repo" fetch --depth 1 origin \
-  0e591c1d1d4ece947f16f60220794a390d64f52f
+  f82b63ebc7cd313b897996293e41d00c9a0e73d1
 ```
 
 Then replace `HEAD:scripts/patch_miniforge_trust.py` with
@@ -57,7 +57,7 @@ Then replace `HEAD:scripts/patch_miniforge_trust.py` with
 `rev-parse FETCH_HEAD` for the provenance record. Verify this exact script revision:
 
 ```bash
-echo '8cfae07c90281f67b5e8703c7ace1ddc6a764af923338daeab66def90a62b387  patch_miniforge_trust.py' |
+echo '17da94bee4fd95c45bd224dd37166a32133d80a847e2b1d6008ffe4c63dd9af6  patch_miniforge_trust.py' |
   sha256sum --check
 ```
 
@@ -110,10 +110,15 @@ python3 patch_miniforge_trust.py /actual/path/to/miniforge \
   --apply
 ```
 
-Normal apply uses the installation's configured channels/mirrors. Pip-managed tools,
-if present and outdated, use PyPI. For disconnected operation, add `--offline`;
-required conda packages must already be cached or available through configured local
-file channels. Pip-managed packages requiring updates are reported separately in that mode.
+All install/solve commands explicitly use `--override-channels --channel conda-forge`
+and strict channel priority. Other configured channels are not searched. Existing
+`channel_alias`/custom-channel mappings for your approved conda-forge mirror still apply.
+There is no PyPI or pip-install fallback. External conda plugins are disabled during
+maintenance subprocesses to prevent conda-pypi from introducing another package source.
+For disconnected operation, add `--offline`; the necessary conda-forge packages must
+already be cached or available through the site's conda-forge mirror mapping.
+Outdated pip-managed tools are reported for reviewed migration, without overwriting
+pip-owned files automatically.
 
 Conda itself is retained by default; add `--upgrade-conda` to request conda >=26.9.4.
 Python and scientific packages keep their installed versions/builds. A blocked
@@ -166,7 +171,17 @@ trust collection. Broad-root removal can affect legitimate chains. Organizationa
 already in the selected source are retained; `--extra-ca /path/to/org-ca.pem` adds an
 explicit additional CA. Private keys and trust-policy/AUX PEM inputs are rejected.
 
-The conda CA packages and pip's embedded trust are updated separately. An old environment
+The conda CA packages and pip's embedded trust are updated separately, using conda-forge
+packages. Existing conda-installed sigstore is also targeted at >=4.5.1; its dependencies
+are solved together. If the required build cannot be obtained from conda-forge, the
+prefix is reported incomplete rather than switching sources. After updating an installed
+sigstore, the script runs `python -I -m sigstore --help` as a local startup check and
+captures its errors or signal status. This is not a full signing/verification test and
+does not establish that a coworker's unrelated runtime error is fixed. Supply the exact
+failing command and traceback for that diagnosis. Sigstore is not added to prefixes
+where it was absent.
+
+An old environment
 that cannot accept fixed package versions is reported for reviewed remediation.
 
 Successful prefixes receive conda SSL configuration and conda activation variables.
