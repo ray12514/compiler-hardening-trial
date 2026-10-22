@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 4 (2026-10-22).
+"""CSE Miniforge certificate maintenance, revision 5 (2026-10-22).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -23,6 +23,13 @@ checks primary/supplementary memberships AND effective prefix/conda-meta write
 access. It does not search other users' homes. --scan-root ROOT optionally locates
 unregistered prefixes under a site-owned software root. Repeated --exclude PREFIX
 also excludes its descendants. All selected eligible prefixes are treated as shared.
+Inaccessible/missing discovery paths and ineligible environments are skipped and
+reported. Permission traversal catches errors per path and continues with siblings.
+Hidden directories are not skipped merely for being hidden. --exclude also prunes
+nested paths from permission traversal. Access/ownership/ACL skips alone are
+nonfatal warnings (exit 0); real package/check failures remain incomplete (exit 2).
+summary.json distinguishes updated-with-skips from fully updated; skipped-paths.txt
+and skipped-paths.json list full paths, stages and reasons. A skip is not protection.
 
 Default package targets: existing ca-certificates>=2026.10.19 (conda-forge),
 certifi>=2026.10.19, pip>=26.2.2, uv>=0.13.4, and sigstore>=4.5.1 where
@@ -189,70 +196,86 @@ def secret(p):
     return p.name in SECRETS or p.name.endswith(('.key', '.p12', '.pfx'))
 
 
-def public_permissions(prefix, base, apply, say):
+def public_permissions(prefix, base, apply, say, skipped=None, excludes=()):
     problems, changed = [], 0
     shared_gid = maintenance_gid()
+    exclusions = [Path(os.path.abspath(os.path.expanduser(str(p)))) for p in excludes]
+    def excluded(p):
+        return any(p == x or x in p.parents for x in exclusions)
+    def note(p, reason):
+        message = str(p) + ': ' + str(reason)
+        problems.append(message)
+        if skipped is not None:
+            skipped.append({'path':str(p),'stage':'permissions','reason':str(reason),
+                            'prefix':str(prefix)})
+        say('SKIP PATH: ' + message)
     def visit(p):
         nonlocal changed
         st = p.lstat()
-        if stat.S_ISLNK(st.st_mode):
-            return
-        if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
-            return
-        if hasattr(os, 'listxattr') and 'system.posix_acl_access' in os.listxattr(str(p)):
-            problems.append('Extended ACL needs review: ' + str(p)); return
-        old = stat.S_IMODE(st.st_mode)
-        if stat.S_ISREG(st.st_mode) and old & (stat.S_ISUID | stat.S_ISGID):
-            problems.append('Privileged file needs manual review: ' + str(p)); return
-        new = public_mode(old, stat.S_ISDIR(st.st_mode))
-        desired_gid = shared_gid
-        if old == new and desired_gid == st.st_gid:
-            return
+        if stat.S_ISLNK(st.st_mode): return
+        if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)): return
+        if stat.S_ISDIR(st.st_mode) and not os.access(str(p),os.R_OK|os.X_OK):
+            note(p,'Directory is not readable/traversable; left unchanged');return
+        if hasattr(os,'listxattr') and 'system.posix_acl_access' in os.listxattr(str(p)):
+            note(p,'Extended ACL needs owner/admin review');return
+        old=stat.S_IMODE(st.st_mode)
+        if stat.S_ISREG(st.st_mode) and old & (stat.S_ISUID|stat.S_ISGID):
+            note(p,'Privileged file needs owner/admin review');return
+        new=public_mode(old,stat.S_ISDIR(st.st_mode))
+        if old == new and shared_gid == st.st_gid:return
         if st.st_uid != os.geteuid():
-            # A group maintainer can replace files but cannot chmod another UID's files.
-            # Do not take ownership by replacing them merely for permissions.
-            problems.append("Owner must set group cse and required permissions: " + str(p)); return
+            note(p,'Owner must set group cse and required permissions');return
         changed += 1
-        if apply:
-            if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
-                fd, tmp = tempfile.mkstemp(prefix='.trust-mode-', dir=str(p.parent))
-                os.close(fd)
-                try:
-                    shutil.copy2(str(p), tmp)
-                    os.chown(tmp, -1, desired_gid)
-                    os.chmod(tmp, new)
-                    os.replace(tmp, str(p))
-                finally:
-                    if os.path.exists(tmp): os.unlink(tmp)
-            else:
-                if desired_gid != st.st_gid: os.chown(str(p), -1, desired_gid)
-                os.chmod(str(p), new)
-    def walk_error(exc):
-        problems.append('Unreadable subtree: ' + str(exc))
-    for root, dirs, files in os.walk(str(prefix), followlinks=False, onerror=walk_error):
-        root = Path(root)
-        visit(root)
-        keep = []
+        if not apply:return
+        if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+            fd,tmp=tempfile.mkstemp(prefix='.trust-mode-',dir=str(p.parent));os.close(fd)
+            try:
+                shutil.copy2(str(p),tmp);os.chown(tmp,-1,shared_gid);os.chmod(tmp,new)
+                os.replace(tmp,str(p))
+            finally:
+                if os.path.exists(tmp):os.unlink(tmp)
+        else:
+            if shared_gid != st.st_gid:os.chown(str(p),-1,shared_gid)
+            os.chmod(str(p),new)
+    def safe_visit(p):
+        try:visit(p)
+        except OSError as exc:note(p,exc)
+    def walk_error(exc):note(exc.filename or prefix,exc)
+    for root,dirs,files in os.walk(str(prefix),followlinks=False,onerror=walk_error):
+        root=Path(root)
+        if excluded(root):dirs[:]=[];continue
+        if not os.access(str(root),os.R_OK|os.X_OK):
+            note(root,'Directory is not readable/traversable; left unchanged');dirs[:]=[];continue
+        safe_visit(root)
+        keep=[]
         for name in dirs:
-            p = root / name
-            if secret(p):
-                say('Preserving private-path permissions: ' + str(p)); continue
-            if p.is_symlink(): continue
-            if prefix == base and name in ('pkgs', 'envs') and root == base:
-                visit(p); continue
-            if (p / 'conda-meta/history').is_file():
-                continue
-            keep.append(name)
-        dirs[:] = keep
+            p=root/name
+            try:
+                if excluded(p):
+                    say('EXCLUDED: '+str(p));continue
+                if secret(p):
+                    say('Preserving private-path permissions: '+str(p));continue
+                if p.is_symlink():continue
+                if not os.access(str(p),os.R_OK|os.X_OK):
+                    note(p,'Directory is not readable/traversable; left unchanged');continue
+                if prefix == base and name in ('pkgs','envs') and root == base:
+                    safe_visit(p);continue
+                if (p/'conda-meta/history').is_file():continue
+                keep.append(name)
+            except OSError as exc:note(p,exc)
+        dirs[:]=keep
         for name in files:
-            p = root / name
+            p=root/name
+            if excluded(p):continue
             if secret(p):
-                say('Preserving private-path permissions: ' + str(p)); continue
-            visit(p)
+                say('Preserving private-path permissions: '+str(p));continue
+            safe_visit(p)
     for p in prefix.parents:
-        if not p.stat().st_mode & stat.S_IXOTH:
-            problems.append('Parent lacks other-traverse bit (ACL may differ): ' + str(p))
-    say('Permissions %s: %d paths' % ('changed' if apply else 'would change', changed))
+        try:
+            if not p.stat().st_mode & stat.S_IXOTH:
+                note(p,'Parent lacks other-traverse bit (ACL may differ); left unchanged')
+        except OSError as exc:note(p,exc)
+    say('Permissions %s: %d paths' % ('changed' if apply else 'would change',changed))
     return problems
 
 
@@ -369,20 +392,64 @@ def choose_source(args, config, base):
     return system_bundle()
 
 
-def discover(base, conda, env, includes, scans, excludes):
-    inventory = json.loads(capture([conda,'env','list','--json'],env))
-    paths = {base} | {Path(p).resolve() for p in inventory['envs']} | {p.expanduser().resolve() for p in includes}
-    if (base/'envs').is_dir():
-        paths |= {p.resolve() for p in (base/'envs').iterdir() if (p/'conda-meta/history').is_file()}
+def discover(base, conda, env, includes, scans, excludes, skipped=None):
+    def note(p,reason):
+        if skipped is not None:skipped.append({'path':str(p),'stage':'discovery','reason':str(reason)})
+    def canonical(p):
+        p=Path(p).expanduser()
+        try:return p.resolve()
+        except OSError as exc:
+            note(p,exc);return Path(os.path.abspath(str(p)))
+    exclusions=[canonical(p) for p in excludes]
+    def excluded(p):return any(p == x or x in p.parents for x in exclusions)
+    paths={base}
+    try:
+        inventory=json.loads(capture([conda,'env','list','--json'],env))
+        candidates=inventory['envs']
+    except (RuntimeError,ValueError,KeyError,OSError) as exc:
+        note(conda,'conda env list failed; trying the local registry: '+str(exc))
+        candidates=[]
+        registry=Path.home()/'.conda/environments.txt'
+        try:
+            if registry.is_file():candidates=registry.read_text().splitlines()
+        except OSError as registry_error:note(registry,registry_error)
+    for p in list(candidates)+list(includes):
+        if str(p).strip():paths.add(canonical(p))
+    envdir=base/'envs'
+    try:
+        if envdir.is_dir():
+            for p in envdir.iterdir():
+                if excluded(p):continue
+                try:
+                    if not os.access(str(p),os.R_OK|os.X_OK):
+                        note(p,'Cannot inspect possible environment; directory inaccessible');continue
+                    if (p/'conda-meta/history').is_file():paths.add(canonical(p))
+                except OSError as exc:note(p,exc)
+    except OSError as exc:note(envdir,exc)
     for scan in scans:
-        scan = scan.expanduser().resolve(strict=True)
-        for root, dirs, files in os.walk(str(scan), followlinks=False):
-            root = Path(root)
-            if (root/'conda-meta/history').is_file(): paths.add(root.resolve())
-            dirs[:] = [d for d in dirs if d not in ('pkgs','conda-meta','.git') and not (root/d).is_symlink()]
-    exclusions = [p.expanduser().resolve() for p in excludes]
-    return sorted([p for p in paths if not any(p == x or x in p.parents for x in exclusions)],
-                  key=lambda p:(p != base,str(p)))
+        scan=canonical(scan)
+        if excluded(scan):continue
+        if not os.access(str(scan),os.R_OK|os.X_OK):
+            note(scan,'Scan root missing or inaccessible');continue
+        def walk_error(exc):note(exc.filename or scan,exc)
+        for root,dirs,files in os.walk(str(scan),followlinks=False,onerror=walk_error):
+            root=Path(root)
+            if excluded(root):dirs[:]=[];continue
+            try:
+                if (root/'conda-meta/history').is_file():paths.add(canonical(root))
+            except OSError as exc:note(root,exc)
+            keep=[]
+            for name in dirs:
+                p=root/name
+                if name in ('pkgs','conda-meta','.git') or excluded(p):continue
+                try:
+                    if p.is_symlink():continue
+                    if not os.access(str(p),os.R_OK|os.X_OK):
+                        note(p,'Directory is not readable/traversable; scan skipped');continue
+                    keep.append(name)
+                except OSError as exc:note(p,exc)
+            dirs[:]=keep
+    return sorted([p for p in paths if not excluded(p)],key=lambda p:(p != base,str(p)))
 
 
 def plan_specs(meta, upgrade_conda):
@@ -463,7 +530,8 @@ def main():
     config = json.loads(capture([conda,'config','--show','ssl_verify','--json'],env))
     source = choose_source(args,config,base)
     bundle_text, removed = filtered_bundle([source] + args.extra_ca)
-    prefixes = discover(base,conda,env,args.include,args.scan_root,args.exclude)
+    skipped_paths = []
+    prefixes = discover(base,conda,env,args.include,args.scan_root,args.exclude,skipped_paths)
     logdir = (args.log_dir or Path.home()/'.cse-trust-logs'/datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')).expanduser().resolve()
     if any(logdir == p or p in logdir.parents for p in prefixes):
         raise RuntimeError('Logs must be outside all selected environment trees')
@@ -513,11 +581,18 @@ def main():
         env.update(values)
         env['CONDA_OFFLINE'] = 'true' if args.offline else 'false'
     for i,prefix in enumerate(prefixes):
-        row = {'prefix':str(prefix),'status':'incomplete','issues':[]};results.append(row)
+        row = {'prefix':str(prefix),'status':'incomplete','issues':[],'skipped_paths':[],'changes_started':False};results.append(row)
         say('\nPrefix: '+str(prefix))
-        if not (prefix/'conda-meta/history').is_file() or not maintainable(prefix) or not maintainable(prefix/'conda-meta'):
-            row['status']='skipped';row['issues'].append('Not an accessible user/group-maintainable prefix')
-            say('SKIP: '+row['issues'][0]);continue
+        try:
+            eligible = (prefix/'conda-meta/history').is_file() and maintainable(prefix) and maintainable(prefix/'conda-meta')
+            eligible = eligible and os.access(str(prefix),os.R_OK|os.X_OK) and os.access(str(prefix/'conda-meta'),os.R_OK|os.X_OK)
+            reason = 'Not an accessible user/group-maintainable prefix'
+        except OSError as exc:
+            eligible = False;reason = str(exc)
+        if not eligible:
+            row['status']='skipped';row['issues'].append(reason)
+            skipped_paths.append({'path':str(prefix),'stage':'environment','reason':reason})
+            say('SKIP ENVIRONMENT: '+str(prefix)+': '+reason);continue
         try:
             meta = records(prefix)
             targets,allowed,specs = plan_specs(meta,args.upgrade_conda)
@@ -552,7 +627,9 @@ def main():
                     exact=[n+'='+v+'='+b for n,(v,b) in sorted(final.items())]
                     execution=[conda,'install','-p',prefix,'--solver','classic','--freeze-installed','--json','--yes']+CHANNEL_ARGS+exact
                     if args.offline: execution.append('--offline')
+                    row['changes_started']=True
                     runjson(execution)
+                row['changes_started']=True
                 run([conda,'config','--file',prefix/'.condarc','--set','ssl_verify',bundle])
                 run([conda,'env','config','vars','set','-p',prefix]+[k+'='+v for k,v in values.items()])
                 after_meta=records(prefix)
@@ -584,19 +661,34 @@ def main():
                 say('Would configure conda/activation to use: '+str(bundle))
             for n in ('pixi',):
                 if n in meta or n in audit['packages']:row['issues'].append(n+' needs separate embedded-tool/dependency review')
-            row['issues']+=public_permissions(prefix,base,args.apply,say)
-            row['status']='incomplete' if row['issues'] else ('updated' if args.apply else 'previewed')
+            permissions = public_permissions(prefix,base,args.apply,say,row['skipped_paths'],args.exclude)
+            skipped_paths.extend(row['skipped_paths'])
+            row['permission_warnings'] = permissions
+            row['status']='incomplete' if row['issues'] else (('updated' if args.apply else 'previewed') + ('-with-skips' if permissions else ''))
+        except (PermissionError,FileNotFoundError) as exc:
+            row['status']='incomplete' if row['changes_started'] else 'skipped'
+            row['issues'].append(str(exc))
+            skipped_paths.append({'path':str(exc.filename or prefix),'stage':'environment','reason':str(exc)})
+            log.write(traceback.format_exc())
         except Exception as exc:
             row['issues'].append(str(exc));log.write(traceback.format_exc())
         for issue in row['issues']:say('ATTENTION: '+issue)
         say('Status: '+row['status'])
     (logdir/'summary.json').write_text(json.dumps(results,indent=2))
-    say('\nSummary: '+', '.join('%s=%d'%(s,sum(r['status']==s for r in results)) for s in ('previewed','updated','skipped','incomplete')))
+    # Preserve every discovery/permission skip, including unknown inaccessible directories.
+    skipped_paths = list({(r['path'],r['stage'],r['reason']):r for r in skipped_paths}.values())
+    (logdir/'skipped-paths.json').write_text(json.dumps(skipped_paths,indent=2))
+    (logdir/'skipped-paths.txt').write_text(''.join('%s | %s | %s\n' % (r['stage'],r['path'],r['reason']) for r in skipped_paths))
+    if skipped_paths:
+        say('\nSkipped paths (left unchanged where access/ownership prevented changes):')
+        for r in skipped_paths:say('  %s | %s | %s' % (r['stage'],r['path'],r['reason']))
+        say('Full skip report: '+str(logdir/'skipped-paths.txt'))
+    say('\nSummary: '+', '.join('%s=%d'%(s,sum(r['status']==s for r in results)) for s in ('previewed','previewed-with-skips','updated','updated-with-skips','skipped','incomplete')))
     if args.apply:say('For the current shell after loading your module: . '+shlex.quote(str(trustdir/'use-ca.sh')))
     say('No external test endpoints were contacted. OS/proxy trust unchanged.')
     log.close()
     if lockfile:lockfile.close()
-    return 2 if any(r['status'] in ('skipped','incomplete') for r in results) else 0
+    return 2 if any(r['status'] == 'incomplete' for r in results) else 0
 
 
 if __name__=='__main__':
