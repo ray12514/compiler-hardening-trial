@@ -41,15 +41,15 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
   > ./patch_miniforge_trust.py
 ```
 
-### Reproduce the failure-report revision exactly
+### Reproduce the certificate-stage revision exactly
 
-The script was updated at commit `e100f7caa3785065139a89a2cbfbd29188ac3d5d`.
+The script was updated at commit `38c953d2bb03697c6afd2a8d75734c379548b8d4`.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
 ```bash
 git -C "$cse_fetch_dir/repo" fetch --depth 1 origin \
-  e100f7caa3785065139a89a2cbfbd29188ac3d5d
+  38c953d2bb03697c6afd2a8d75734c379548b8d4
 ```
 
 Then replace `HEAD:scripts/patch_miniforge_trust.py` with
@@ -57,7 +57,7 @@ Then replace `HEAD:scripts/patch_miniforge_trust.py` with
 `rev-parse FETCH_HEAD` for the provenance record. Verify this exact script revision:
 
 ```bash
-echo '1570a6ba8c794ff13edff914305d68d57cd9cb8d5fc9111f44fa667486aea026  patch_miniforge_trust.py' |
+echo '40f78b72458da81a64b4fc6394a43c15799c33258ac7490c8be7b3c9ffe8a857  patch_miniforge_trust.py' |
   sha256sum --check
 ```
 
@@ -72,6 +72,102 @@ scp ./patch_miniforge_trust.py YOUR_USER@YOUR_LOGIN_HOST:./patch_miniforge_trust
 
 Replace the destination with your actual SSH hostname or configured alias.
 Use your established SSH configuration for authentication, ports and jump hosts.
+
+## First establish the certificate state
+
+Package-update failure does not establish whether the CSE bundle was written. In older
+revisions, the shared CSE trust files were written before the environment loop. The
+message listing roots to remove was computed from the source; it was not a receipt
+that applications had switched bundles.
+
+After retrieving this revision, load the intended Miniforge module and run:
+
+```bash
+python3 patch_miniforge_trust.py --inspect-trust
+```
+
+Or name the installation explicitly:
+
+```bash
+python3 patch_miniforge_trust.py /actual/path/to/miniforge --inspect-trust
+```
+
+This is read-only and uses no external TLS connections. With an explicit installation
+path, it does not execute conda or the environment's Python. It reports:
+
+- Whether the actual managed `etc/cse-trust/ca-bundle.pem` exists and parses.
+- Its SHA256 and presence/absence of the four known incident-root fingerprints.
+- Base CA package versions relative to this script's minimums.
+- Base `ssl/cert.pem`, `ssl/cacert.pem`, and discoverable Python certifi/pip bundles.
+- Raw prefix `ssl_verify` settings, activation CA variables, and current-shell CA variables.
+
+Add `--only /path/to/environment` to inspect that prefix alongside the base. An absent
+prefix setting does not rule out inherited/user configuration. No known-root match is
+screening, not full chain verification. The command returns 0 if the managed bundle is
+parseable with those four roots absent; otherwise 2. That return code does not certify
+other bundles, application activation, organizational CA completeness, or the proxy.
+
+### Prepare the CSE bundle independently of package updates
+
+If the managed copy is absent or needs rebuilding, explicitly select your approved
+existing CSE PEM source. Start with a preview:
+
+```bash
+python3 patch_miniforge_trust.py /actual/path/to/miniforge \
+  --trust-only --ca-bundle /actual/path/to/CSE-existing-bundle.pem
+```
+
+Then apply that stage alone:
+
+```bash
+python3 patch_miniforge_trust.py /actual/path/to/miniforge \
+  --trust-only --ca-bundle /actual/path/to/CSE-existing-bundle.pem --apply
+```
+
+This writes the filtered CSE copy, the managed marker/lock, the dedicated empty CA
+lookup directory and `use-ca.sh`. It does not invoke conda, install packages, configure
+individual environments, or recursively normalize environment permissions. Your account
+still needs maintenance access to the installation and membership in `cse`. The source
+PEM is retained; organizational roots are kept except any exact incident-root match.
+It remains interim broad-root filtering, not a fresh public CA collection.
+
+`certificate-status.json` records `planned` or `written`, the source, destination and
+written bundle SHA256. Normal apply also saves this status before package work, and
+prints the certificate stage separately at the end. A startup failure before that
+record is written requires checking the actual files with `--inspect-trust`.
+
+The new bundle takes effect for the current shell only when you source the printed
+`use-ca.sh` after loading your module, or implement the equivalent module settings.
+An application may still use its own trust configuration. This stage does not replace
+outdated CA packages, pip's embedded bundles, system trust, or proxy upstream policy.
+
+## Work on the base, then one environment
+
+The base is selected first in normal discovery unless explicitly excluded. It is now
+labeled `[BASE]` in scope/progress output. To isolate it and avoid discovering other
+users' environments:
+
+```bash
+python3 patch_miniforge_trust.py /actual/path/to/miniforge \
+  --base-only --ca-bundle /actual/path/to/CSE-existing-bundle.pem
+```
+
+Add `--apply` after reviewing that preview. Then select one environment exactly:
+
+```bash
+python3 patch_miniforge_trust.py /actual/path/to/miniforge \
+  --only /actual/path/to/environment \
+  --ca-bundle /actual/path/to/CSE-existing-bundle.pem
+```
+
+`--only` is repeatable and replaces discovery; it does not implicitly update base
+packages. Apply still uses the base conda executable and writes the shared CSE trust
+files. `--base-only` and `--only` cannot be combined. Exclusions still apply. Package
+updates remain serial; these flags reduce scope rather than change concurrency.
+
+A failed update does not establish that an environment is unused. The script never
+deletes environments on failure. Review obsolete environments separately with their
+owners and consumers before explicit retirement; the base must not be retired this way.
 
 ## Preview before applying
 
@@ -161,7 +257,7 @@ unrelated export failure cannot obscure the deliberate block.
 
 Do not bulk uninstall pip/uv tools or force conda to overwrite their files. Conda cannot
 fully account for pip's changes. A reviewed migration or replacement environment must
-preserve the applications' requirements and use the approved conda-forge source; the
+preserve the applications' requirements and use explicitly approved community sources; the
 script does not switch to PyPI. The new report identifies these environments separately
 from repository/solver failures, so the two problems can be addressed independently.
 
@@ -170,7 +266,13 @@ from repository/solver failures, so the two problems can be addressed independen
 The denied path might be a package cache, a parent, a configuration file or an executable
 rather than the environment root. ACLs, missing traversal/execute permissions and
 filesystem policy can deny an operation despite apparent ownership. Use the exact path
-and command in the report to determine the required repair. The script does not fix
+and command in the report to determine the required repair. New command failures
+extract the denied filename when available and attach a snapshot of owner/group,
+mode, read/write/execute access, ACL presence and inaccessible ancestors. A snapshot
+cannot prove mount/SELinux/server policy or diagnose a race after the fact. Old reports
+can recover a filename and take a current snapshot where the legacy log contains it;
+a missing path cannot be reconstructed reliably. Snapshots are evidence at their
+capture time, not permission repairs. The script does not fix
 this by recursively widening unrelated directories or changing another user's owner UID.
 
 ## Apply
@@ -184,13 +286,35 @@ python3 patch_miniforge_trust.py /actual/path/to/miniforge \
   --apply
 ```
 
-All install/solve commands explicitly use `--override-channels --channel conda-forge`
-and strict channel priority. Other configured channels are not searched. Existing
-`channel_alias`/custom-channel mappings for your approved conda-forge mirror still apply.
+Conda remains the package manager. Anaconda `defaults` repositories are a separate
+package source. The default requested channel is conda-forge; additional approved
+community channels or mirrors can now be named explicitly with repeatable `--channel`:
+
+```bash
+python3 patch_miniforge_trust.py /actual/path/to/miniforge \
+  --only /actual/path/to/environment --channel bioconda \
+  --ca-bundle /actual/path/to/CSE-existing-bundle.pem
+```
+
+Use a channel only if approved for your site. The script resolves explicit channel
+names through the configured alias/custom-channel/multichannel mappings locally.
+All install/solve commands use `--override-channels` and strict channel priority;
+additional configured channels are not silently adopted. `defaults`, known Anaconda
+repository URLs and aliases resolving to those URLs are rejected. Channel-qualified
+configuration/prefix pins outside the explicit requested list are reported before
+solving; existing site pins are not discarded. Solver LINK/FETCH records referencing
+known Anaconda defaults locations are rejected before executing the install.
+
+Installed channel metadata is historical evidence and is listed separately from
+requested channels. A historical channel name in an error or package record does not
+by itself prove that this run contacted it. Exact pinned builds from an omitted
+community channel may be unavailable until you include its approved channel. Unknown
+site mirrors cannot be classified by ownership from their URL alone; approve their
+upstream contents through your normal site process.
 There is no PyPI or pip-install fallback. External conda plugins are disabled during
 maintenance subprocesses to prevent conda-pypi from introducing another package source.
-For disconnected operation, add `--offline`; the necessary conda-forge packages must
-already be cached or available through the site's conda-forge mirror mapping.
+For disconnected operation, add `--offline`; the necessary packages from the requested approved channels must
+already be cached or available through the site mirror mapping.
 Outdated pip-managed tools are reported for reviewed migration, without overwriting
 pip-owned files automatically.
 
@@ -308,7 +432,7 @@ explicit additional CA. Private keys and trust-policy/AUX PEM inputs are rejecte
 
 The conda CA packages and pip's embedded trust are updated separately, using conda-forge
 packages. Existing conda-installed sigstore is also targeted at >=4.5.1; its dependencies
-are solved together. If the required build cannot be obtained from conda-forge, the
+are solved together. If the required build cannot be obtained from the requested approved channels, the
 prefix is reported incomplete rather than switching sources. After updating an installed
 sigstore, the script runs `python -I -m sigstore --help` as a local startup check and
 captures its errors or signal status. This is not a full signing/verification test and
@@ -333,7 +457,7 @@ Tcl/Lua conventions. The script does not edit an unknown modulefile.
 ## Results and limits
 
 The printed private log directory contains `run.log`, configuration/history records,
-solver plans, `summary.json`, `skipped-paths.txt`, `skipped-paths.json`,
+solver plans, `certificate-status.json`, `summary.json`, `skipped-paths.txt`, `skipped-paths.json`,
 `skipped-by-owner.json` and `skipped-owner-UID.txt`. Exit 0 allows
 reported access/ownership skips; inspect the summary before declaring an installation
 fully remediated. Exit 2 means incomplete package/check work or a critical startup
@@ -348,7 +472,9 @@ Local tests cover the exact cse lookup/membership checks, file/directory modes,
 foreign-owner reporting, hardlink isolation, secret exclusions, discovery, pinning,
 CA filtering, quiet/verbose output, owner report grouping, final-summary reasons,
 permission preview counts, read-only legacy-log reporting, structured command-failure
-records, mixed-package review ordering and simulated preview/offline apply. Actual SUSE/RHEL deployment remains
+records, mixed-package review ordering, access-path snapshots, certificate-only
+operations, actual-bundle inspection, exact-prefix scope, channel-source guards and
+simulated preview/offline apply. Actual SUSE/RHEL deployment remains
 a target-system validation task.
 
 ## References
