@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 6 (2026-10-22).
+"""CSE Miniforge certificate maintenance, revision 7 (2026-10-22).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -7,6 +7,7 @@ Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --apply               # apply, normal channels
   python3 patch_miniforge_trust.py --apply --offline     # approved cached packages
   python3 patch_miniforge_trust.py --apply --upgrade-conda
+  python3 patch_miniforge_trust.py --report latest        # explain saved logs only
 
 No test-site connections, connectivity probes, remote execution or OS writes.
 Preview is local-only: inventory, CA inspection, ownership and permissions.
@@ -33,6 +34,9 @@ and skipped-paths.json list full paths, owners, groups, stages and reasons.
 Default output is concise; --verbose shows path details. Full details are logged.
 Final summaries always repeat package requests, permission counts and failure reasons.
 Per-owner skip reports are private review aids. A skip is not protection.
+--report LOG_DIR (or latest) reads prior summaries/logs without updates or network.
+New command failures save separate JSON records with arguments, exit status, phase
+and stdout/stderr; final summaries include the underlying error rather than a wrapper.
 
 Default package targets: existing ca-certificates>=2026.10.19 (conda-forge),
 certifi>=2026.10.19, pip>=26.2.2, uv>=0.13.4, and sigstore>=4.5.1 where
@@ -295,9 +299,13 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
 AUDIT = r'''
 import sys, json, ssl, importlib.util
 from importlib import metadata
-d = {'python': list(sys.version_info[:3]), 'packages': {}, 'bundles': {}}
+d = {'python': list(sys.version_info[:3]), 'packages': {}, 'bundles': {}, 'provenance': {}}
 for name in ('pip','certifi','uv','sigstore','pixi'):
-    try: d['packages'][name] = metadata.version(name)
+    try:
+        dist = metadata.distribution(name)
+        d['packages'][name] = dist.version
+        d['provenance'][name] = {'installer':(dist.read_text('INSTALLER') or '').strip(),
+                                  'location':str(dist.locate_file(''))}
     except metadata.PackageNotFoundError: pass
 for name in ('certifi','pip._vendor.certifi'):
     try:
@@ -581,16 +589,126 @@ def final_summary(results, apply, bundle, say):
         if row.get('trust_configuration'):
             say('  Trust configuration: '+row['trust_configuration']+' '+str(bundle))
         if row.get('permission_warnings'): say('  Permission/access skips: %d; see skip reports' % len(row['permission_warnings']))
+        if row.get('phase') and row['status']=='incomplete': say('  Failed/review phase: '+row['phase'])
         for issue in row['issues']: say('  Reason: '+issue)
     say('Environment counts: '+', '.join('%s=%d'%(s,sum(r['status']==s for r in results)) for s in ('previewed','previewed-with-skips','updated','updated-with-skips','skipped','incomplete')))
     say('Counts are environments, not package versions. Incomplete means a required package/check failed or needs review; reasons appear above.')
     if not apply: say('Preview targets are requests, not solved upgrades. No dependency solve ran; exact versions/builds are validated during apply.')
 
 
+def diagnostic_text(stdout, stderr):
+    """Extract conda's actual JSON error or meaningful exception, not our wrapper."""
+    decoder = json.JSONDecoder()
+    for stream in (stdout,stderr):
+        for match in re.finditer(r'(?m)^\s*\{',stream):
+            try: obj,_ = decoder.raw_decode(stream[match.start():].lstrip())
+            except ValueError: continue
+            if isinstance(obj,dict):
+                parts = [str(obj[k]) for k in ('exception_name','error','message') if obj.get(k)]
+                if parts: return '\n'.join(dict.fromkeys(parts))[:2400]
+    combined = stderr+'\n'+stdout
+    lines = [line.strip() for line in combined.splitlines() if line.strip()]
+    useful = [line for line in lines if re.search(
+        r'PermissionError|Permission denied|Errno \d+|[A-Za-z]+Error:|[A-Za-z]+Error\b|'
+        r'CERTIFICATE_VERIFY_FAILED|Unsatisfiable|not writable|not found|No space left|Read-only file system|'
+        r'cannot execute|GLIBC_|failed to|Could not|HTTP [45]\d\d',line,re.I)
+        and not line.startswith(('except ','if ','raise ','File '))
+        and not any(x in line for x in ('Command failed; see private','raise RuntimeError(', 'raise command_failure', 'if r.returncode'))]
+    if useful: return '\n'.join(useful[-8:])[:2400]
+    return '\n'.join(lines[-8:])[:2400] or 'Command returned no diagnostic output'
+
+
+def failure_category(text):
+    value = text.lower()
+    if 'non-conda' in value or 'conda-forge migration' in value:
+        return 'Mixed package ownership', 'Review the named pip/uv-managed tool and its requirements; do not overwrite it with conda in bulk.'
+    if any(x in value for x in ('permission denied','permissionerror','not writable','notwritableerror','read-only file system')):
+        return 'Filesystem access', 'Check the exact denied path, its parent traversal, ACLs, mount policy and cache location; environment ownership alone is insufficient.'
+    if any(x in value for x in ('certificate_verify_failed','sslerror','ssl verification','certificate verify failed','proxyerror')):
+        return 'TLS/proxy access', 'Review CA/proxy configuration and the specific endpoint; do not disable TLS verification.'
+    if any(x in value for x in ('packagesnotfound','unsatisfiable','conflict','could not solve')):
+        return 'Package availability/dependencies', 'Check approved conda-forge mirror availability and installed pins/Python compatibility.'
+    if any(x in value for x in ('connectionerror','condahttperror','timed out','name resolution','network is unreachable')):
+        return 'Repository/network access', 'Check the approved mirror/proxy route or offline cache availability.'
+    if any(x in value for x in ('jsondecodeerror','invalid json','not valid json','no json')):
+        return 'Invalid command output', 'Inspect the recorded stdout/stderr for startup errors or output preceding JSON.'
+    return 'Other/unresolved', 'Use the command and diagnostic below; the old generic wrapper alone does not identify the cause.'
+
+
+def legacy_failure_details(logtext, prefix):
+    """Best-effort extraction from older logs; never execute logged commands."""
+    chunks = re.split(r'(?m)^Prefix: ',logtext)
+    section = next((chunk.split('\nFinal summary',1)[0] for chunk in chunks[1:]
+                    if chunk.splitlines() and chunk.splitlines()[0].strip()==prefix), '')
+    commands = list(re.finditer(r'(?m)^\$ ([^\n]*)\n',section))
+    if not commands: return None
+    # Older wrappers raise after the failed command, so the last command before
+    # the wrapper is the candidate. This is inferred, not a recorded return code.
+    wrapper = section.find('RuntimeError: Command failed; see private run.log')
+    if wrapper < 0: return None
+    candidates = [m for m in commands if m.start()<wrapper]
+    if not candidates: return None
+    match = candidates[-1]
+    output = section[match.end():wrapper]
+    detail = diagnostic_text(output,'')
+    return {'command':match.group(1)[:500], 'detail':detail,'returncode':None,
+            'phase':'legacy log (inferred command; return code not recorded)'}
+
+
+def report_existing(directory, verbose=False):
+    if str(directory)=='latest':
+        root = Path.home()/'.cse-trust-logs'
+        candidates = [p for p in root.iterdir() if p.is_dir() and (p/'summary.json').is_file()]
+        if not candidates: raise RuntimeError('No completed summary found under '+str(root))
+        directory = max(candidates,key=lambda p:p.name)
+    directory = Path(directory).expanduser().resolve(strict=True)
+    results = json.loads((directory/'summary.json').read_text())
+    logtext = (directory/'run.log').read_text(errors='replace') if (directory/'run.log').is_file() else ''
+    print('READ-ONLY REPORT: '+str(directory))
+    mode = next((line for line in logtext.splitlines() if line.startswith('Mode: ')),'Mode: not recorded')
+    print('Saved run '+mode)
+    print('No environments, packages, permissions or certificates are changed. No network commands run.')
+    counts = {}
+    failures = []
+    for row in results:
+        counts[row['status']] = counts.get(row['status'],0)+1
+        if row['status'] not in ('incomplete','skipped') and not verbose: continue
+        issues = row.get('issues',[])
+        evidence = row.get('command_failures',[])
+        if not evidence and any('Command failed; see private run.log' in issue for issue in issues):
+            inferred = legacy_failure_details(logtext,row['prefix'])
+            if inferred: evidence = [inferred]
+        cause_text = '\n'.join(issues+[e['detail'] for e in evidence])
+        category,advice = failure_category(cause_text)
+        failures.append(category)
+        print('\n%s | %s | owner=%s' % (row['prefix'],row['status'],row.get('ownership',{}).get('owner','unknown')))
+        print('  Category: '+category)
+        print('  Changes started: '+str(row.get('changes_started','not recorded'))+' (not a transaction/rollback guarantee)')
+        for issue in issues:
+            if 'Command failed; see private run.log' not in issue: print('  Reason: '+issue)
+        for event in evidence:
+            print('  Phase: '+event.get('phase','not recorded'))
+            print('  Command: '+event['command'])
+            print('  Return code: '+str(event.get('returncode','not recorded')))
+            print('  Diagnostic: '+event['detail'].replace('\n','\n    '))
+            if event.get('file'): print('  Full command output: '+str(directory/event['file']))
+        if not evidence and any('Command failed; see private run.log' in issue for issue in issues):
+            print('  Diagnostic unavailable in this summary; legacy run.log extraction found no matching command.')
+        print('  Next step: '+advice)
+        if row.get('non_conda_tools'):
+            print('  Non-conda inventory: '+json.dumps(row['non_conda_tools'],sort_keys=True))
+    print('\nEnvironment counts: '+', '.join('%s=%d'%item for item in sorted(counts.items())))
+    print('Failure/review categories: '+(', '.join('%s=%d'%(c,failures.count(c)) for c in sorted(set(failures))) or 'none'))
+    print('updated-with-skips means work completed with access/permission exceptions; it is not a failed package update.')
+    print('Legacy diagnostics are best-effort evidence from saved logs, not a new system test.')
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('miniforge', nargs='?', type=Path)
     ap.add_argument('--apply', action='store_true')
+    ap.add_argument('--report',type=Path,metavar='LOG_DIR_OR_latest',help='Read an existing summary/run.log and explain failures; no updates, group checks or network')
     ap.add_argument('--verbose',action='store_true',help='Show per-path permission details and subprocess commands; full details are always logged')
     ap.add_argument('--offline', action='store_true',help='Apply using cache/file channels; never retrieve online')
     ap.add_argument('--upgrade-conda',action='store_true',help='Also upgrade installed conda; default retain its version/build')
@@ -602,6 +720,9 @@ def main():
     ap.add_argument('--chains-dir',type=Path,help='Approved local incident chain directory; no downloads')
     ap.add_argument('--log-dir',type=Path)
     args = ap.parse_args()
+    if args.report:
+        if args.apply: ap.error('--report cannot be combined with --apply')
+        return report_existing(args.report,args.verbose)
     if os.geteuid() == 0: ap.error('Run as the software maintenance account, not root')
     cse_gid = maintenance_gid()  # validate before any deployment changes
     os.umask(0o002)
@@ -630,13 +751,37 @@ def main():
     say('Shared permissions target: cse (GID %d); directories 2775, files 0664, executables 0775' % cse_gid)
     say('Roots removed from CSE copy: '+(', '.join(removed) or 'none of the four matched'))
     say('This is local mitigation, not evidence of proxy remediation or a full trust-store refresh.')
+    command_number = 0
+    def record_failure(cmd, stdout, stderr, code, reason=None):
+        nonlocal command_number
+        command_number += 1
+        filename = 'failed-command-%03d.json' % command_number
+        display = shlex.join(list(map(str,cmd))) if '-c' not in cmd else str(cmd[0])+' -I -c <local Python audit>'
+        diagnostic = reason or diagnostic_text(stdout,stderr)
+        event = {'command':display[:500],'detail':diagnostic,'returncode':code,'file':filename,
+                 'phase':row.get('phase','not recorded')}
+        (logdir/filename).write_text(json.dumps(dict(event,argv=list(map(str,cmd)),stdout=stdout,stderr=stderr),indent=2))
+        row.setdefault('command_failures',[]).append(event)
+        return RuntimeError('Command failed during %s (exit %s): %s | %s | full output: %s' %
+                            (event['phase'],code,display[:180],diagnostic,logdir/filename))
     def run(cmd, allow_failure=False):
         detail('$ '+shlex.join(map(str,cmd)))
-        r = subprocess.run(list(map(str,cmd)),env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-        log.write(r.stdout+r.stderr)
-        if r.returncode and not allow_failure: raise RuntimeError('Command failed; see private run.log')
+        try:
+            r = subprocess.run(list(map(str,cmd)),env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        except OSError as exc:
+            raise record_failure(cmd,'',str(exc),None) from exc
+        log.write(r.stdout+r.stderr+'\n')
+        if r.returncode and not allow_failure:
+            raise record_failure(cmd,r.stdout,r.stderr,r.returncode)
         return r
-    def runjson(cmd): return json.loads(run(cmd).stdout)
+    def runjson(cmd):
+        r = run(cmd)
+        try: data = json.loads(r.stdout)
+        except ValueError as exc:
+            raise record_failure(cmd,r.stdout,r.stderr,r.returncode,'Invalid JSON output: '+diagnostic_text(r.stdout,r.stderr)) from exc
+        if isinstance(data,dict) and data.get('success') is False:
+            raise record_failure(cmd,r.stdout,r.stderr,r.returncode)
+        return data
     trustdir = base/'etc/cse-trust'; bundle = trustdir/'ca-bundle.pem'; empty = trustdir/'empty-ca-dir'
     values = {k:str(bundle) for k in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','CURL_CA_BUNDLE','PIP_CERT')}
     values['SSL_CERT_DIR'] = str(empty)
@@ -678,6 +823,7 @@ def main():
             skipped_paths.append({'path':str(prefix),'stage':'environment','reason':reason,'prefix':str(prefix)})
             say('SKIP ENVIRONMENT: '+str(prefix)+': '+reason);continue
         try:
+            row['phase'] = 'read conda package metadata'
             meta = records(prefix)
             targets,allowed,specs = plan_specs(meta,args.upgrade_conda)
             row['package_targets'] = [{'name':n,'current':meta[n]['version'],'request':('>='+MINIMUM[n] if n in MINIMUM else ('>=26.9.4' if n == 'conda' else 'compatible conda-forge build'))} for n in sorted(targets)]
@@ -685,20 +831,24 @@ def main():
             audit = {'packages':{},'bundles':{}}
             py = prefix/'bin/python'
             if 'python' in meta:
+                row['phase'] = 'local Python package audit'
                 audit = runjson([py,'-I','-c',AUDIT])
                 (logdir/('%03d-before-audit.json'%i)).write_text(json.dumps(audit,indent=2))
                 unmanaged={n for n in MINIMUM if n in audit['packages'] and n not in meta and version(audit['packages'][n]) < version(MINIMUM[n])}
                 if unmanaged:
+                    row['non_conda_tools'] = [{'name':n,'current':audit['packages'][n],'minimum':MINIMUM[n],**audit.get('provenance',{}).get(n,{})} for n in sorted(unmanaged)]
                     row['issues'].append('Outdated non-conda tools require reviewed conda-forge migration: '+', '.join(sorted(unmanaged)))
                 if 'pip' in audit['packages'] and audit['python'] < [3,10] and version(audit['packages']['pip']) < version(MINIMUM['pip']):
                     row['issues'].append('Old pip on Python <3.10 needs a reviewed compatible remediation')
             if args.apply:
+                if row['issues']: raise RuntimeError('Package review required; no package/configuration/permission changes attempted for this prefix')
+                row['phase'] = 'save configuration and conda package inventory'
                 for relative in ('.condarc','conda-meta/state','conda-meta/history'):
                     p=prefix/relative
                     if p.is_file(): (logdir/('%03d-before-'%i+relative.replace('/','_'))).write_bytes(p.read_bytes())
                 (logdir/('%03d-before-explicit.txt'%i)).write_text(run([conda,'list','-p',prefix,'--explicit']).stdout)
-                if row['issues']: raise RuntimeError('Package review required; prefix left unchanged (see reasons above)')
                 if targets:
+                    row['phase'] = 'solve package update (dry run)'
                     cmd=[conda,'install','-p',prefix,'--solver','classic','--freeze-installed','--json']+CHANNEL_ARGS+specs
                     if args.offline: cmd.append('--offline')
                     plan=runjson(cmd+['--dry-run'])
@@ -714,11 +864,14 @@ def main():
                     exact=[n+'='+v+'='+b for n,(v,b) in sorted(final.items())]
                     execution=[conda,'install','-p',prefix,'--solver','classic','--freeze-installed','--json','--yes']+CHANNEL_ARGS+exact
                     if args.offline: execution.append('--offline')
+                    row['phase'] = 'install validated package plan'
                     row['changes_started']=True
                     runjson(execution)
+                row['phase'] = 'configure prefix trust'
                 row['changes_started']=True
                 run([conda,'config','--file',prefix/'.condarc','--set','ssl_verify',bundle])
                 run([conda,'env','config','vars','set','-p',prefix]+[k+'='+v for k,v in values.items()])
+                row['phase'] = 'verify updated packages and trust bundles'
                 after_meta=records(prefix)
                 row['package_changes'] = [{'name':n,'before':meta.get(n,{}).get('version','absent'),'after':r['version']} for n,r in sorted(after_meta.items()) if n not in meta or (r['version'],r['build']) != (meta[n]['version'],meta[n]['build'])]
                 row['trust_configuration'] = 'configured to use'
@@ -751,6 +904,7 @@ def main():
                 detail('Would configure conda/activation to use: '+str(bundle))
             for n in ('pixi',):
                 if n in meta or n in audit['packages']:row['issues'].append(n+' needs separate embedded-tool/dependency review')
+            row['phase'] = 'normalize shared permissions'
             row['permissions'] = {}
             permissions = public_permissions(prefix,base,args.apply,detail,row['skipped_paths'],args.exclude,row['permissions'])
             skipped_paths.extend(row['skipped_paths'])
@@ -774,6 +928,7 @@ def main():
         if args.verbose:
             for r in skipped_paths: say('  %s | owner=%s | %s | %s' % (r['stage'],r['owner'],r['path'],r['reason']))
     say('Full summary: '+str(logdir/'summary.json'))
+    if any(r['status']=='incomplete' for r in results): say('Explain this run without retrying: python3 patch_miniforge_trust.py --report '+shlex.quote(str(logdir)))
     if args.apply:say('For the current shell after loading your module: . '+shlex.quote(str(trustdir/'use-ca.sh')))
     say('No external test endpoints were contacted. OS/proxy trust unchanged.')
     log.close()
