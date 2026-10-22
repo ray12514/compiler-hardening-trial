@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 2 (2026-10-22).
+"""CSE Miniforge certificate maintenance, revision 3 (2026-10-22).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -54,17 +54,19 @@ Activation variables override previous values only in managed environments and
 conda restores activation-managed variables on deactivation. Review other apps
 and independently configured bundles; nothing here changes proxy upstream trust.
 
-Permission policy: world read/traverse, preserve executable bits, remove world
-write; retain current-group write and same-group maintenance in group-writable
-prefixes. UID ownership and parents preserved. In a group-writable prefix, files owned by
-the maintenance account are normalized to the prefix group and directories gain
-setgid so future files inherit that group. Other group ownership is preserved.
-Symlinks not followed; hardlinks
-broken before chmod; known secret files excluded. Foreign-owned modes/ACLs needing
-attention are reported (group membership cannot grant chmod privilege). Private
-parent traversal blockers are reported, not widened. Extended POSIX ACLs are left
-unchanged. Unknown credentials inside shared trees cannot be detected: --exclude
-private prefixes. No chmod of the package cache or unrelated nested prefixes.
+Permission policy: the exact lowercase group cse is required. Its numeric GID
+is resolved locally on each host; the current account must be a member. Shared
+directories become cse:2775, ordinary files cse:0664, existing executables
+cse:0775. UID ownership is preserved. Membership in other groups is still used
+to discover maintainable prefixes, but never selects the output group. This
+policy applies to eligible selected prefixes, not arbitrary parent directories.
+Symlinks are not followed. Hardlinks are broken before group/mode changes so
+other environments and caches keep their metadata. Known private/secret paths
+and privileged files are excluded; foreign-owned files needing changes and
+extended ACLs are reported for owner/admin review. Group membership does not
+allow chmod/chgrp of another owner's files. Parent traversal blockers are
+reported, not widened. Unknown credentials cannot be detected: exclude private
+prefixes. Package-cache contents and unrelated nested prefixes are not changed.
 
 Logs and configuration backups default to a persistent private directory in your
 home (or --log-dir), outside managed trees. They are NOT a package/filesystem
@@ -122,6 +124,8 @@ MANAGEMENT_DEPS = MANAGERS | {'conda','conda-self','conda-package-handling',
  'typing_extensions','urllib3','yaml-cpp','zstandard','zstd'}
 PIP_WHEEL = 'https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl'
 PIP_HASH = 'fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70'
+MAINTENANCE_GROUP = 'cse'
+
 SECRETS = {'.condarc','.netrc','.pypirc','.ssh','.aws','.azure','.config','.git',
            '.env','credentials','tokens','secrets'}
 
@@ -155,12 +159,20 @@ def system_bundle():
     raise RuntimeError('Cannot locate host PEM bundle; supply --ca-bundle PATH')
 
 
-def public_mode(mode, is_dir, preserve_group_write=False):
-    mode |= 0o600
-    mode |= 0o055 if is_dir else (0o055 if mode & 0o111 else 0o044)
+def maintenance_gid():
+    try:
+        gid = grp.getgrnam(MAINTENANCE_GROUP).gr_gid
+    except KeyError:
+        raise RuntimeError("Required group 'cse' does not exist on this host")
+    if gid not in groups():
+        raise RuntimeError("Current account must be a member of group 'cse'; check your login's group membership")
+    return gid
+
+
+def public_mode(mode, is_dir):
     if is_dir:
-        mode |= 0o100
-    return mode & ~(0o002 if preserve_group_write else 0o022)
+        return 0o2775 | (mode & stat.S_ISVTX)
+    return 0o775 if mode & 0o111 else 0o664
 
 
 def secret(p):
@@ -169,8 +181,7 @@ def secret(p):
 
 def public_permissions(prefix, base, apply, say):
     problems, changed = [], 0
-    prefix_stat = prefix.stat()
-    shared_gid = prefix_stat.st_gid if prefix_stat.st_gid in groups() and prefix_stat.st_mode & stat.S_IWGRP else None
+    shared_gid = maintenance_gid()
     def visit(p):
         nonlocal changed
         st = p.lstat()
@@ -181,17 +192,16 @@ def public_permissions(prefix, base, apply, say):
         if hasattr(os, 'listxattr') and 'system.posix_acl_access' in os.listxattr(str(p)):
             problems.append('Extended ACL needs review: ' + str(p)); return
         old = stat.S_IMODE(st.st_mode)
-        new = public_mode(old, stat.S_ISDIR(st.st_mode), st.st_gid in groups())
-        desired_gid = shared_gid if shared_gid is not None and st.st_uid == os.geteuid() else st.st_gid
-        if shared_gid is not None and desired_gid == shared_gid:
-            new |= stat.S_IWGRP
-            if stat.S_ISDIR(st.st_mode): new |= stat.S_ISGID
+        if stat.S_ISREG(st.st_mode) and old & (stat.S_ISUID | stat.S_ISGID):
+            problems.append('Privileged file needs manual review: ' + str(p)); return
+        new = public_mode(old, stat.S_ISDIR(st.st_mode))
+        desired_gid = shared_gid
         if old == new and desired_gid == st.st_gid:
             return
         if st.st_uid != os.geteuid():
             # A group maintainer can replace files but cannot chmod another UID's files.
             # Do not take ownership by replacing them merely for permissions.
-            problems.append('Owner must adjust mode: ' + str(p)); return
+            problems.append("Owner must set group cse and required permissions: " + str(p)); return
         changed += 1
         if apply:
             if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
@@ -287,9 +297,8 @@ def atomic_write(p, data, mode=0o644):
     fd, tmp = tempfile.mkstemp(prefix='.cse-trust-', dir=str(p.parent))
     try:
         with os.fdopen(fd, 'w') as f: f.write(data)
-        if p.exists(): os.chown(tmp, -1, p.stat().st_gid)
-        else: os.chown(tmp, -1, p.parent.stat().st_gid)
-        os.chmod(tmp, mode)
+        os.chown(tmp, -1, maintenance_gid())
+        os.chmod(tmp, public_mode(mode, False))
         os.replace(tmp, str(p))
     finally:
         if os.path.exists(tmp): os.unlink(tmp)
@@ -421,7 +430,8 @@ def main():
     ap.add_argument('--log-dir',type=Path)
     args = ap.parse_args()
     if os.geteuid() == 0: ap.error('Run as the software maintenance account, not root')
-    os.umask(0o022)
+    cse_gid = maintenance_gid()  # validate before any deployment changes
+    os.umask(0o002)
     env = safe_environment()
     base = find_base(args.miniforge,env); conda = base/'bin/conda'
     if not maintainable(base): raise RuntimeError('No user/group maintenance access to base')
@@ -439,6 +449,7 @@ def main():
     say('Mode: '+('APPLY' if args.apply else 'LOCAL PREVIEW; no network operations'))
     say('Base: '+str(base)); say('Source CA: '+str(source));say('Private logs: '+str(logdir))
     say('Current UID/groups: %s / %s' % (os.geteuid(),','.join(map(str,sorted(groups())))))
+    say('Shared permissions target: cse (GID %d); directories 2775, files 0664, executables 0775' % cse_gid)
     say('Roots removed from CSE copy: '+(', '.join(removed) or 'none of the four matched'))
     say('This is local mitigation, not evidence of proxy remediation or a full trust-store refresh.')
     def run(cmd, allow_failure=False):
@@ -456,14 +467,20 @@ def main():
     if args.apply:
         trustdir.mkdir(mode=0o755,parents=True,exist_ok=True)
         if not maintainable(trustdir): raise RuntimeError('No maintenance access to CSE trust directory')
+        if trustdir.stat().st_uid == os.geteuid():
+            os.chown(str(trustdir), -1, cse_gid); os.chmod(str(trustdir), 0o2775)
         lockfile = open(str(trustdir/'maintenance.lock'),'a')
         fcntl.flock(lockfile.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+        if os.fstat(lockfile.fileno()).st_uid == os.geteuid():
+            os.fchown(lockfile.fileno(), -1, cse_gid); os.fchmod(lockfile.fileno(), 0o664)
         marker = trustdir/'managed-by-patch-miniforge-trust'
         if bundle.exists() and not marker.is_file(): raise RuntimeError('Refusing to replace an unmanaged CA bundle')
         for p in (bundle,trustdir/'use-ca.sh'):
             if p.exists(): (logdir/('before-'+p.name)).write_bytes(p.read_bytes())
         if not marker.exists(): atomic_write(marker,'CSE trust maintenance v2\n')
-        empty.mkdir(mode=0o755,exist_ok=True)
+        empty.mkdir(mode=0o2775,exist_ok=True)
+        if empty.stat().st_uid == os.geteuid():
+            os.chown(str(empty), -1, cse_gid); os.chmod(str(empty), 0o2775)
         if any(empty.iterdir()): raise RuntimeError('Expected dedicated empty CA directory')
         atomic_write(bundle,bundle_text)
         atomic_write(trustdir/'use-ca.sh','# Source after loading your CSE module.\n'+''.join('export %s=%s\n'%(k,shlex.quote(v)) for k,v in values.items()))
