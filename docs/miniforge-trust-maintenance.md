@@ -41,15 +41,15 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
   > ./patch_miniforge_trust.py
 ```
 
-### Reproduce the certificate-stage revision exactly
+### Reproduce the installed-source revision exactly
 
-The script was updated at commit `38c953d2bb03697c6afd2a8d75734c379548b8d4`.
+The script was updated at commit `0e2dee721cc8b5ed7c2dd1610d625b23ac8887d1`.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
 ```bash
 git -C "$cse_fetch_dir/repo" fetch --depth 1 origin \
-  38c953d2bb03697c6afd2a8d75734c379548b8d4
+  0e2dee721cc8b5ed7c2dd1610d625b23ac8887d1
 ```
 
 Then replace `HEAD:scripts/patch_miniforge_trust.py` with
@@ -57,7 +57,7 @@ Then replace `HEAD:scripts/patch_miniforge_trust.py` with
 `rev-parse FETCH_HEAD` for the provenance record. Verify this exact script revision:
 
 ```bash
-echo '40f78b72458da81a64b4fc6394a43c15799c33258ac7490c8be7b3c9ffe8a857  patch_miniforge_trust.py' |
+echo 'abd8f0a15087584506e81a2eb1c84eb58418718e7269ab153cac07cbd6e5b713  patch_miniforge_trust.py' |
   sha256sum --check
 ```
 
@@ -287,8 +287,26 @@ python3 patch_miniforge_trust.py /actual/path/to/miniforge \
 ```
 
 Conda remains the package manager. Anaconda `defaults` repositories are a separate
-package source. The default requested channel is conda-forge; additional approved
-community channels or mirrors can now be named explicitly with repeatable `--channel`:
+package source and remain excluded.
+
+For each selected environment, the script now reads its installed conda package
+records (`conda-meta/*.json`) and automatically reuses their identifiable non-default
+channels. Recorded channel fields are preferred, with package URLs as a fallback.
+Platform directories and archive filenames are removed from URLs while mirror hosts
+and channel label paths are retained. Named channels use the site's current alias
+and custom-channel mappings. Sources from one environment do not carry over to another.
+
+Where a package's source is identifiable and permitted, its requested spec is qualified
+with that channel, for example `https://conda.anaconda.org/bioconda::PACKAGE>=VERSION`.
+This preserves the source instead of silently moving the package to the first channel.
+The final execution specs also retain identifiable solver-selected sources. If that
+source lacks a compatible fixed build, the update is reported incomplete. The script
+does not bypass dependency checks or switch the package's source to force success.
+
+Conda-forge remains an available fallback for dependencies and packages without an
+identifiable source. Unknown metadata, development records and PyPI/wheel origins are
+not guessed as conda channels. Additional channels can still be supplied explicitly
+with repeatable `--channel` when needed:
 
 ```bash
 python3 patch_miniforge_trust.py /actual/path/to/miniforge \
@@ -296,21 +314,25 @@ python3 patch_miniforge_trust.py /actual/path/to/miniforge \
   --ca-bundle /actual/path/to/CSE-existing-bundle.pem
 ```
 
-Use a channel only if approved for your site. The script resolves explicit channel
-names through the configured alias/custom-channel/multichannel mappings locally.
-All install/solve commands use `--override-channels` and strict channel priority;
-additional configured channels are not silently adopted. `defaults`, known Anaconda
-repository URLs and aliases resolving to those URLs are rejected. Channel-qualified
-configuration/prefix pins outside the explicit requested list are reported before
-solving; existing site pins are not discarded. Solver LINK/FETCH records referencing
-known Anaconda defaults locations are rejected before executing the install.
+You do not need `--channel bioconda` if bioconda is already recorded in that environment.
+The preview/progress and final summary show selected channel URLs, target package
+sources and excluded Anaconda/default origins. `summary.json` records
+`package_origins`, `requested_channels`, `excluded_installed_sources` and
+`unknown_package_origins` for each prefix.
 
-Installed channel metadata is historical evidence and is listed separately from
-requested channels. A historical channel name in an error or package record does not
-by itself prove that this run contacted it. Exact pinned builds from an omitted
-community channel may be unavailable until you include its approved channel. Unknown
-site mirrors cannot be classified by ownership from their URL alone; approve their
-upstream contents through your normal site process.
+All install/solve commands use `--override-channels` and strict channel priority.
+Unrelated channels from configuration are not silently adopted. Known Anaconda default
+URLs and aliases resolving to them are excluded even if recorded in installed packages.
+A misleading channel label does not override a known default-repository archive URL.
+Defaults-qualified pins still block the prefix instead of causing default downloads;
+other channel-qualified pins must resolve into that environment's selected source set.
+Existing site pins are retained. Solver LINK/FETCH records referencing known Anaconda
+defaults locations are rejected before executing the install.
+
+An excluded historical source is reported; it is not a claim that the source was
+contacted by this run. An unknown private mirror's upstream contents cannot be inferred
+from its URL alone. This automatic reuse assumes the recorded non-default sources
+were permitted for these existing environments; site source controls still apply.
 There is no PyPI or pip-install fallback. External conda plugins are disabled during
 maintenance subprocesses to prevent conda-pypi from introducing another package source.
 For disconnected operation, add `--offline`; the necessary packages from the requested approved channels must
@@ -473,7 +495,8 @@ foreign-owner reporting, hardlink isolation, secret exclusions, discovery, pinni
 CA filtering, quiet/verbose output, owner report grouping, final-summary reasons,
 permission preview counts, read-only legacy-log reporting, structured command-failure
 records, mixed-package review ordering, access-path snapshots, certificate-only
-operations, actual-bundle inspection, exact-prefix scope, channel-source guards and
+operations, actual-bundle inspection, exact-prefix scope, channel-source guards, per-environment installed-source discovery,
+source-qualified update specs and
 simulated preview/offline apply. Actual SUSE/RHEL deployment remains
 a target-system validation task.
 
