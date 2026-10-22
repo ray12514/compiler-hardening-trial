@@ -41,15 +41,15 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
   > ./patch_miniforge_trust.py
 ```
 
-### Reproduce the conda-forge-only revision exactly
+### Reproduce the skip-inaccessible revision exactly
 
-The script was updated at commit `f82b63ebc7cd313b897996293e41d00c9a0e73d1`.
+The script was updated at commit `031c5b34a2cb463f8ddf0ba95d10e244b0fce153`.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
 ```bash
 git -C "$cse_fetch_dir/repo" fetch --depth 1 origin \
-  f82b63ebc7cd313b897996293e41d00c9a0e73d1
+  031c5b34a2cb463f8ddf0ba95d10e244b0fce153
 ```
 
 Then replace `HEAD:scripts/patch_miniforge_trust.py` with
@@ -57,7 +57,7 @@ Then replace `HEAD:scripts/patch_miniforge_trust.py` with
 `rev-parse FETCH_HEAD` for the provenance record. Verify this exact script revision:
 
 ```bash
-echo '17da94bee4fd95c45bd224dd37166a32133d80a847e2b1d6008ffe4c63dd9af6  patch_miniforge_trust.py' |
+echo 'e1fca95d313a6d7ef904f47485229990988fb49c8e5b6c96728885768947698b  patch_miniforge_trust.py' |
   sha256sum --check
 ```
 
@@ -138,6 +138,45 @@ its descendants are also excluded. These options are repeatable.
 All eligible selected prefixes are treated as shared. Run once per distinct installation,
 on the relevant system. The script does not discover or log in to remote machines.
 
+## Inaccessible and colleague-owned test directories
+
+An inaccessible environment or child directory does not abort the rest of the run.
+Discovery handles access failures per candidate. Permission traversal handles failures
+per file/subtree and continues with available siblings. The script does not change
+permissions to gain access to an unreadable directory. A leading dot does not itself
+exclude a directory: accessible eligible hidden paths follow the same rules as others.
+
+You can intentionally leave a colleague's test tree alone, even when it is accessible:
+
+```bash
+python3 patch_miniforge_trust.py /actual/path/to/miniforge \
+  --ca-bundle /actual/path/to/CSE-existing-bundle.pem \
+  --exclude /actual/path/to/miniforge/.colleague-test
+```
+
+Exclusions apply to discovery and nested permission traversal. Add `--apply` only after
+reviewing the preview. If `conda env list` fails, discovery attempts the local
+`~/.conda/environments.txt` registry and still scans available configured scan roots
+and the base installation's `envs` directory.
+
+The final console report and private logs identify:
+- `skipped`: an environment could not be inspected/maintained and was not updated.
+- `updated-with-skips` / `previewed-with-skips`: selected work completed, but listed
+  file/subtree permissions could not be normalized. Do not treat the skipped paths as
+  remediated.
+- `incomplete`: a package update, verification, or another required operation failed,
+  or an environment became inaccessible after changes started.
+
+`skipped-paths.txt` and `skipped-paths.json` contain full paths, stages and reasons.
+`summary.json` lists each selected prefix and status. Discovery cannot identify what
+is inside an unreadable directory; such a directory is recorded as an uninspected
+path rather than asserted to be a conda environment.
+
+Access/ownership/ACL skips alone are nonfatal warnings (exit 0), and available
+environments continue. Actual package/check failures remain exit 2 after the remaining
+environments have been attempted. Necessary base/CA-source/group validation and lock
+failures still stop the run before it can safely proceed.
+
 ## Required cse permissions
 
 | Item | Group | Mode |
@@ -198,9 +237,10 @@ Tcl/Lua conventions. The script does not edit an unknown modulefile.
 ## Results and limits
 
 The printed private log directory contains `run.log`, configuration/history records,
-solver plans and `summary.json`. Exit 0 means the selected operation completed without
-reported issues; exit 2 means skipped/incomplete work or a failure. Preview success is
-not a claim that a future dependency solve will succeed.
+solver plans, `summary.json`, `skipped-paths.txt` and `skipped-paths.json`. Exit 0 allows
+reported access/ownership skips; inspect the summary before declaring an installation
+fully remediated. Exit 2 means incomplete package/check work or a critical startup
+failure. Preview success is not a claim that a future dependency solve will succeed.
 
 No incident-root match in a bundle is a screening result, not proof of full chain
 rejection. Optionally use approved local test chains with `--chains-dir /path/to/chains`;
