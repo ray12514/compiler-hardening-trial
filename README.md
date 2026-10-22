@@ -106,3 +106,8 @@ It configures the actual recipe for both arms with system compilers and neutral
 flags in a disposable container with networking disabled, and checks that MPI,
 parallel test targets and regular tools remain enabled. Target GCC hardening,
 package builds/tests and fabric qualification remain separate checks.
+
+## Miniforge certificate maintenance
+
+For the standalone CSE Miniforge certificate-maintenance script, see
+[SSH retrieval, preview, updates and cse permissions](docs/miniforge-trust-maintenance.md).
