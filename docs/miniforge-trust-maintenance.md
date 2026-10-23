@@ -41,15 +41,15 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
   > ./patch_miniforge_trust.py
 ```
 
-### Reproduce the structured-channel revision exactly
+### Reproduce the full-base-update revision exactly
 
-The script was updated at commit `509f631e1a0a121056eda53aaef73504d79c562e`.
+The script was updated at commit `3cfb223ceb8ca59a128523627df0d187a75bc9a0`.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
 ```bash
 git -C "$cse_fetch_dir/repo" fetch --depth 1 origin \
-  509f631e1a0a121056eda53aaef73504d79c562e
+  3cfb223ceb8ca59a128523627df0d187a75bc9a0
 ```
 
 Then replace `HEAD:scripts/patch_miniforge_trust.py` with
@@ -57,7 +57,7 @@ Then replace `HEAD:scripts/patch_miniforge_trust.py` with
 `rev-parse FETCH_HEAD` for the provenance record. Verify this exact script revision:
 
 ```bash
-echo '1865f556530dd82bcfa2baa2f2368c4f2d7ef52704ce0668c46f18d513791154  patch_miniforge_trust.py' |
+echo '7d87e5f2e621368af92d90e288e477c0bb592d85e961390c3bab545ad9964edb  patch_miniforge_trust.py' |
   sha256sum --check
 ```
 
@@ -202,6 +202,43 @@ and this report path are printed without `--verbose`. This makes the metadata be
 a constructed channel visible without searching through a traceback. No `.condarc`
 files are automatically rewritten to repair this error. Do not remove the normal
 hosting domain or add Anaconda `defaults` in response to the generic conda message.
+
+## Full updates are permitted in the base environment
+
+Revision 12 treats the Miniforge base as a full conda package-update scope. It no
+longer rejects changes to `krb5`, NumPy, matplotlib, matplotlib-base, Python or other
+base packages as unrelated. The base solve uses `--update-all` with no script-generated
+version/build pins on application packages. Installed incident-related packages retain
+explicit minimum constraints, and installed conda is targeted at >=26.9.4 automatically.
+Conda resolves compatible versions using the permitted channels and retained site pins;
+this does not promise every package will reach the newest version on every channel.
+
+Use the same base-only command to isolate this work:
+
+```bash
+python3 patch_miniforge_trust.py /actual/path/to/miniforge \
+  --base-only --ca-bundle /actual/path/to/CSE-existing-bundle.pem --apply
+```
+
+The validated solver plan is saved, then executed with exact final versions/builds.
+New dependencies and updates to any base package are permitted. The Anaconda defaults
+source exclusion, installed-source selection, dependency solving and rejection of
+package removal without replacement remain in force. No `--no-deps` or `--clobber`
+bypass is used. Base updates can include major Python/application version changes.
+
+Before executing the plan, all originally installed incident-related conda packages
+must remain present at or above the script's minimums. The script repeats that check
+against installed records afterward, including conda's requested minimum. The final
+summary prints `Verified required minimums`, and `summary.json` stores the actual
+versions and minimums in `security_verification`. An unmet or missing required package
+is incomplete, even if other base packages updated. Runtime embedded-bundle and startup
+checks still apply separately. This verifies package minimums, not proxy protection.
+
+Non-base environments retain the narrower maintenance policy and exact application/
+Python pins. `--upgrade-conda` enables conda updates in those prefixes. The existing
+mixed pip/uv ownership review also remains; a full conda solve does not authorize
+silently overwriting non-conda tools. Preview remains local-only and lists requests;
+apply performs the solve and records exact changes.
 
 ## Work on the base, then one environment
 
@@ -402,9 +439,10 @@ already be cached or available through the site mirror mapping.
 Outdated pip-managed tools are reported for reviewed migration, without overwriting
 pip-owned files automatically.
 
-Conda itself is retained by default; add `--upgrade-conda` to request conda >=26.9.4.
-Python and scientific packages keep their installed versions/builds. A blocked
-dependency plan is reported rather than forcing a broad environment upgrade.
+The base permits a full compatible package update, including conda >=26.9.4.
+Other prefixes retain conda by default; add `--upgrade-conda` there to request that
+minimum. Non-base Python and scientific packages keep their installed versions/builds.
+Blocked dependency plans and unmet security minimums remain incomplete.
 
 ## Environment scope
 
@@ -558,7 +596,8 @@ CA filtering, quiet/verbose output, owner report grouping, final-summary reasons
 permission preview counts, read-only legacy-log reporting, structured command-failure
 records, mixed-package review ordering, access-path snapshots, certificate-only
 operations, actual-bundle inspection, exact-prefix scope, channel-source guards, per-environment installed-source discovery,
-source-qualified update specs, malformed/host-only metadata recovery, structured alias/custom-channel config and
+source-qualified update specs, malformed/host-only metadata recovery, structured alias/custom-channel config, full-base update policy, mandatory minimum
+verification and
 simulated preview/offline apply. Actual SUSE/RHEL deployment remains
 a target-system validation task.
 
