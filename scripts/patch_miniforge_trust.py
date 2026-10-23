@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 11 (2026-10-23).
+"""CSE Miniforge certificate maintenance, revision 12 (2026-10-23).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -47,11 +47,13 @@ and stdout/stderr; final summaries include the underlying error rather than a wr
 
 Default package targets: existing ca-certificates>=2026.10.19 (conda-forge),
 certifi>=2026.10.19, pip>=26.2.2, uv>=0.13.4, and sigstore>=4.5.1 where
-installed through conda. --upgrade-conda also requests
-conda>=26.9.4 where installed. Related mamba/solver packages are requested together
-when installed. Python and non-management packages are pinned to version+build.
-If pins or the mirror block the remediation, report failure instead of upgrading
-Python/scientific packages. --freeze-installed and the classic solver are used.
+installed through conda. Base also requests conda>=26.9.4 where installed;
+--upgrade-conda requests that minimum in non-base prefixes. Related mamba/solver packages are requested together
+when installed. The base prefix permits all installed conda packages, including Python, conda,
+NumPy, matplotlib and Kerberos dependencies, to update compatibly. Its solve uses
+--update-all and security minimum constraints, then executes the validated exact plan.
+Non-base prefixes retain Python/application version+build pins and --freeze-installed.
+All use the classic solver. Blocked dependency/mirror plans are reported.
 Python <3.11 with conda-forge certifi may need a reviewed backport or replacement
 prefix. Existing conda may be retained per the conda maintainers' CA-only guidance.
 Outdated pip-managed tools are reported for reviewed migration to conda-forge,
@@ -485,7 +487,12 @@ def discover(base, conda, env, includes, scans, excludes, skipped=None):
     return sorted([p for p in paths if not excluded(p)],key=lambda p:(p != base,str(p)))
 
 
-def plan_specs(meta, upgrade_conda):
+def plan_specs(meta, upgrade_conda, broad=False):
+    if broad:
+        # Base is explicitly authorized for a full compatible conda update.
+        targets=set(meta)
+        specs=[n+'>='+MINIMUM[n] if n in MINIMUM else ('conda>=26.9.4' if n=='conda' else n) for n in sorted(targets)]
+        return targets,None,specs
     targets = set(meta) & (set(MINIMUM) | MANAGERS)
     if upgrade_conda and 'conda' in meta: targets.add('conda')
     specs = [n + '>=' + MINIMUM[n] if n in MINIMUM else
@@ -510,11 +517,24 @@ def check_plan(plan, allowed):
                     raise RuntimeError('Rejected plan source from Anaconda defaults: '+str(record[key]))
     linked = {r['name'] for r in actions.get('LINK',[])}
     unlinked = {r['name'] for r in actions.get('UNLINK',[])}
-    if (linked | unlinked) - allowed:
+    if allowed is not None and (linked | unlinked) - allowed:
         raise RuntimeError('Rejected unrelated package changes: ' + ', '.join(sorted((linked|unlinked)-allowed)))
     if unlinked - linked:
         raise RuntimeError('Rejected package removal without replacement: ' + ', '.join(sorted(unlinked-linked)))
     return sorted(linked | unlinked)
+
+
+def verify_minimums(before, after, upgrade_conda=False):
+    required={n:minimum for n,minimum in MINIMUM.items() if n in before}
+    if upgrade_conda and 'conda' in before: required['conda']='26.9.4'
+    verified={}
+    for name,minimum in sorted(required.items()):
+        if name not in after: raise RuntimeError('Required package missing after update: '+name)
+        current=after[name]['version']
+        if version(current)<version(minimum):
+            raise RuntimeError('Package below required minimum: %s=%s; need >=%s'%(name,current,minimum))
+        verified[name]={'version':current,'minimum':minimum}
+    return verified
 
 
 def verify_chains(openssl, bundle, chains, env, run):
@@ -599,12 +619,15 @@ def final_summary(results, apply, bundle, say):
         if row.get('requested_channels'): say('  Channels used: '+', '.join(row['requested_channels']))
         if row.get('unknown_package_origins'): say('  Missing/invalid origins: %d; details: %s'%(len(row['unknown_package_origins']),row.get('channel_records_file','not recorded')))
         if row.get('excluded_installed_sources'): say('  Excluded installed sources: '+', '.join(sorted({r['source'] for r in row['excluded_installed_sources']})))
+        if row.get('package_policy'):say('  Package policy: '+row['package_policy'])
         for target in row.get('package_targets',[]):
             say('  Package target: %s %s -> %s | source=%s' % (target['name'],target['current'],target['request'],target.get('source','not recorded')))
         for change in row.get('package_plan',[]):
             say('  Solver plan: %s %s -> %s (build %s)' % (change['name'],change['before'],change['after'],change['build']))
         for change in row.get('package_changes',[]):
             say('  Verified package: %s %s -> %s' % (change['name'],change['before'],change['after']))
+        if row.get('security_verification'):
+            say('  Verified required minimums: '+', '.join('%s=%s (>= %s)'%(n,v['version'],v['minimum']) for n,v in sorted(row['security_verification'].items())))
         stats = row.get('permissions',{})
         if stats:
             say('  Permissions: %d paths %s; %d group changes planned to cse; %d mode changes planned; %d parent access warnings' % (
@@ -1041,7 +1064,7 @@ def main():
     ap.add_argument('--report',type=Path,metavar='LOG_DIR_OR_latest',help='Read an existing summary/run.log and explain failures; no updates, group checks or network')
     ap.add_argument('--verbose',action='store_true',help='Show per-path permission details and subprocess commands; full details are always logged')
     ap.add_argument('--offline', action='store_true',help='Apply using cache/file channels; never retrieve online')
-    ap.add_argument('--upgrade-conda',action='store_true',help='Also upgrade installed conda; default retain its version/build')
+    ap.add_argument('--upgrade-conda',action='store_true',help='Also upgrade conda in non-base prefixes; base updates conda automatically')
     ap.add_argument('--ca-bundle',type=Path,help='Source site PEM; default detect from conda/current configuration')
     ap.add_argument('--extra-ca',type=Path,action='append',default=[])
     ap.add_argument('--include',type=Path,action='append',default=[])
@@ -1204,7 +1227,11 @@ def main():
                         pin=pin.split('#',1)[0].strip()
                         if '::' in pin and not allowed_pin_origin(pin.split('::',1)[0],channel_names,channel_urls,config):
                             raise RuntimeError('Channel-qualified prefix pin outside requested channels: '+pin)
-            targets,allowed,specs = plan_specs(meta,args.upgrade_conda)
+            broad = prefix == base
+            upgrade_conda = args.upgrade_conda or broad
+            row['package_policy']='all base packages may update' if broad else 'targeted maintenance; application packages pinned'
+            say('Package policy: '+row['package_policy'])
+            targets,allowed,specs = plan_specs(meta,upgrade_conda,broad=broad)
             specs=qualify_specs(specs,origins)
             row['package_targets'] = [{'name':n,'current':meta[n]['version'],'request':('>='+MINIMUM[n] if n in MINIMUM else ('>=26.9.4' if n == 'conda' else 'compatible build from installed source')),'source':origins.get(n,'fallback/explicit allowed channels')} for n in sorted(targets)]
             detail('Package targets: '+(', '.join(sorted(targets)) or 'none'))
@@ -1218,7 +1245,7 @@ def main():
                 if unmanaged:
                     row['non_conda_tools'] = [{'name':n,'current':audit['packages'][n],'minimum':MINIMUM[n],**audit.get('provenance',{}).get(n,{})} for n in sorted(unmanaged)]
                     row['issues'].append('Outdated non-conda tools require reviewed conda-forge migration: '+', '.join(sorted(unmanaged)))
-                if 'pip' in audit['packages'] and audit['python'] < [3,10] and version(audit['packages']['pip']) < version(MINIMUM['pip']):
+                if not broad and 'pip' in audit['packages'] and audit['python'] < [3,10] and version(audit['packages']['pip']) < version(MINIMUM['pip']):
                     row['issues'].append('Old pip on Python <3.10 needs a reviewed compatible remediation')
             if args.apply:
                 if row['issues']: raise RuntimeError('Package review required; no package/configuration/permission changes attempted for this prefix')
@@ -1229,13 +1256,13 @@ def main():
                 (logdir/('%03d-before-explicit.txt'%i)).write_text(run([conda,'list','-p',prefix,'--explicit']).stdout)
                 if targets:
                     row['phase'] = 'solve package update (dry run)'
-                    cmd=[conda,'install','-p',prefix,'--solver','classic','--freeze-installed','--json']+channel_args+specs
+                    cmd=[conda,'install','-p',prefix,'--solver','classic','--json']+(['--update-all'] if broad else ['--freeze-installed'])+channel_args+specs
                     if args.offline: cmd.append('--offline')
                     plan=runjson(cmd+['--dry-run'])
                     (logdir/('%03d-plan.json'%i)).write_text(json.dumps(plan,indent=2))
                     changed=check_plan(plan,allowed)
                     row['package_plan'] = [{'name':r['name'],'before':meta.get(r['name'],{}).get('version','absent'),'after':r['version'],'build':r.get('build_string') or r.get('build')} for r in plan.get('actions',{}).get('LINK',[])]
-                    detail('Validated management changes: '+(', '.join(changed) or 'none'))
+                    detail('Validated package changes: '+(', '.join(changed) or 'none'))
                     # Lock the planned final versions/builds before the execution solve.
                     final={n:(r['version'],r['build']) for n,r in meta.items()}
                     final_origins=dict(origins)
@@ -1244,8 +1271,9 @@ def main():
                         _,_,_,planned_origins,_,_=environment_channels({r['name']:r},args.channel,config)
                         if r['name'] in planned_origins:final_origins[r['name']]=planned_origins[r['name']]
                     if any(not b for v,b in final.values()):raise RuntimeError('Plan omitted build identifiers')
+                    verify_minimums(meta,{n:{'version':v} for n,(v,b) in final.items()},upgrade_conda)
                     exact=qualify_specs([n+'='+v+'='+b for n,(v,b) in sorted(final.items())],final_origins)
-                    execution=[conda,'install','-p',prefix,'--solver','classic','--freeze-installed','--json','--yes']+channel_args+exact
+                    execution=[conda,'install','-p',prefix,'--solver','classic','--json','--yes']+([] if broad else ['--freeze-installed'])+channel_args+exact
                     if args.offline: execution.append('--offline')
                     row['phase'] = 'install validated package plan'
                     row['changes_started']=True
@@ -1258,10 +1286,7 @@ def main():
                 after_meta=records(prefix)
                 row['package_changes'] = [{'name':n,'before':meta.get(n,{}).get('version','absent'),'after':r['version']} for n,r in sorted(after_meta.items()) if n not in meta or (r['version'],r['build']) != (meta[n]['version'],meta[n]['build'])]
                 row['trust_configuration'] = 'configured to use'
-                if args.upgrade_conda and 'conda' in meta and version(after_meta['conda']['version']) < (26,9,4):
-                    raise RuntimeError('Conda still below the requested minimum')
-                for n in set(MINIMUM)&set(meta):
-                    if version(after_meta[n]['version'])<version(MINIMUM[n]):raise RuntimeError('Package still below minimum: '+n)
+                row['security_verification']=verify_minimums(meta,after_meta,upgrade_conda)
                 if 'python' in meta:
                     after=runjson([py,'-I','-c',AUDIT])
                     for n in ('pip','certifi','uv','sigstore'):
