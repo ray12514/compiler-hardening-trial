@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 9 (2026-10-22).
+"""CSE Miniforge certificate maintenance, revision 10 (2026-10-23).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -597,6 +597,7 @@ def final_summary(results, apply, bundle, say):
         say('%s | %s | owner=%s group=%s' % (row['prefix'],row['status'],owner.get('owner','unknown'),owner.get('group','unknown')))
         if row.get('installed_channels'): say('  Installed channel metadata (historical): '+', '.join(row['installed_channels']))
         if row.get('requested_channels'): say('  Channels used: '+', '.join(row['requested_channels']))
+        if row.get('unknown_package_origins'): say('  Missing/invalid origins: %d; details: %s'%(len(row['unknown_package_origins']),row.get('channel_records_file','not recorded')))
         if row.get('excluded_installed_sources'): say('  Excluded installed sources: '+', '.join(sorted({r['source'] for r in row['excluded_installed_sources']})))
         for target in row.get('package_targets',[]):
             say('  Package target: %s %s -> %s | source=%s' % (target['name'],target['current'],target['request'],target.get('source','not recorded')))
@@ -652,6 +653,8 @@ def failure_category(text):
         return 'Filesystem access', 'Check the exact denied path, its parent traversal, ACLs, mount policy and cache location; environment ownership alone is insufficient.'
     if any(x in value for x in ('certificate_verify_failed','sslerror','ssl verification','certificate verify failed','proxyerror')):
         return 'TLS/proxy access', 'Review CA/proxy configuration and the specific endpoint; do not disable TLS verification.'
+    if any(x in value for x in ('unavailableinvalidchannel','channelnotfound','channel is not accessible','invalid requested channel','invalid resolved channel')):
+        return 'Invalid channel URL/name', 'Use the exact Channels selected/used list and channel-records JSON to identify an empty, malformed or obsolete source. The conda-forge URL includes /conda-forge; do not remove its hosting domain.'
     if any(x in value for x in ('packagesnotfound','unsatisfiable','conflict','could not solve')):
         return 'Package availability/dependencies', 'Check approved conda-forge mirror availability and installed pins/Python compatibility.'
     if any(x in value for x in ('connectionerror','condahttperror','timed out','name resolution','network is unreachable')):
@@ -792,12 +795,45 @@ def forbidden_channel(value):
         parsed.hostname=='conda.anaconda.org' and parsed.path.strip('/').split('/')[0]=='anaconda')
 
 
+def invalid_channel_reason(value):
+    value=str(value or '').strip()
+    if not value or value.lower() in ('none','null','<unknown>','unknown'):
+        return 'missing channel name'
+    if value.split('/',1)[0].lower() in ('none','null','<unknown>','unknown'):
+        return 'placeholder value is not a channel name'
+    if value.startswith(('Channel(', '{', '[')) or ('::' in value and '://' not in value) or any(c.isspace() for c in value):
+        return 'channel is a representation or package spec rather than a channel name/URL'
+    if value.rstrip('/') in ('conda.anaconda.org','anaconda.org','www.anaconda.org'):
+        return 'public channel host has no channel name'
+    if '://' in value:
+        parsed=urlsplit(value)
+        if parsed.scheme not in ('http','https','file'):
+            return 'unsupported channel URL scheme'
+        if parsed.scheme!='file' and not parsed.hostname:
+            return 'channel URL has no hostname'
+        path=[part for part in parsed.path.split('/') if part]
+        if parsed.hostname in ('conda.anaconda.org','anaconda.org','www.anaconda.org'):
+            if path[:1]==['t']:path=path[2:]
+            if not path or is_channel_subdir(path[0]) or path[0] in ('label','None','null'):
+                return 'public channel URL has no channel name (expected /conda-forge or another channel)'
+        if parsed.path.endswith(('.conda','.tar.bz2','.whl')):
+            return 'package archive URL is not a channel root'
+    return None
+
+
+def is_channel_subdir(value):
+    return bool(re.fullmatch(r'(?:noarch|linux-[\w]+|osx-[\w]+|win-[\w]+|freebsd-[\w]+|zos-[\w]+)',str(value)))
+
+
 def requested_channels(extras, config):
     """Resolve the explicit allowlist locally, so Anaconda defaults cannot hide in aliases."""
     custom = config.get('custom_channels') or {}
     multi = config.get('custom_multichannels') or {}
     alias = config.get('channel_alias') or 'https://conda.anaconda.org'
     def resolve(name,seen=()):
+        name=str(name).strip()
+        problem=invalid_channel_reason(name)
+        if problem:raise RuntimeError('Invalid requested channel %r: %s'%(name,problem))
         if forbidden_channel(name): raise RuntimeError('Anaconda defaults channel is excluded: '+str(name))
         if name in seen: raise RuntimeError('Recursive channel alias: '+name)
         if name in multi:
@@ -812,12 +848,18 @@ def requested_channels(extras, config):
             # custom_channels maps a channel name to the base location, without
             # that channel name (the conda configuration contract).
             key=next((k for k in sorted(custom,key=len,reverse=True) if name==k or name.startswith(k+'/')),None)
-            urls=[str(custom[key] if key else alias).rstrip('/')+'/'+name]
+            location=custom[key] if key else alias
+            if not isinstance(location,str) or not location.strip() or '://' not in location:
+                raise RuntimeError('Invalid channel alias/custom location for %r: expected a URL, got %r'%(name,location))
+            urls=[location.rstrip('/')+'/'+name]
         for url in urls:
+            problem=invalid_channel_reason(url)
+            if problem:raise RuntimeError('Invalid resolved channel %r: %s'%(url,problem))
             if forbidden_channel(url): raise RuntimeError('Channel resolves to excluded Anaconda defaults: '+url)
         return urls
     names=list(dict.fromkeys(['conda-forge']+list(extras)))
     urls=list(dict.fromkeys(url for name in names for url in resolve(name)))
+    if not urls:raise RuntimeError('Requested channels resolved to an empty channel set')
     for pin in config.get('pinned_packages') or []:
         if '::' in pin:
             origin=pin.split('::',1)[0]
@@ -831,31 +873,35 @@ def requested_channels(extras, config):
 
 
 def recorded_origin(record):
-    """Normalize conda channel metadata without losing label paths or mirror hosts."""
-    missing={'','<unknown>','unknown','none','@','pypi','pypi_0'}
+    """Normalize installed sources; fall back to archive URL if the channel is unusable."""
+    missing={'','<unknown>','unknown','none','null','@','pypi','pypi_0'}
     channel=record.get('channel')
-    if isinstance(channel,dict): channel=channel.get('base_url') or channel.get('name')
-    channel=str(channel or '').strip()
-    value=channel if channel.lower() not in missing else str(record.get('url') or '').strip()
-    if value.lower() in missing or (value.startswith('<') and value.endswith('>')): return None
-    if urlsplit(value).path.endswith('.whl'): return None
-    # A recorded archive URL includes its platform directory and filename.
-    if '://' in value:
-        parsed=urlsplit(value)
-        path=parsed.path.rstrip('/')
-        if path.endswith(('.conda','.tar.bz2')):path=path.rsplit('/',1)[0]
-        last=path.rsplit('/',1)[-1]
-        if last==record.get('subdir') or re.fullmatch(r'(?:noarch|linux-[\w]+|osx-[\w]+|win-[\w]+|freebsd-[\w]+|zos-[\w]+)',last):
-            path=path.rsplit('/',1)[0]
-        # Query strings often sign an archive download; never turn those into
-        # repository credentials. A channel endpoint requiring them needs --channel.
-        value=urlunsplit((parsed.scheme,parsed.netloc,path,'',''))
-    else:
-        value=value.rstrip('/')
-        last=value.rsplit('/',1)[-1]
-        if '/' in value and (last==record.get('subdir') or re.fullmatch(r'(?:noarch|linux-[\w]+|osx-[\w]+|win-[\w]+)',last)):
-            value=value.rsplit('/',1)[0]
-    return value
+    if isinstance(channel,dict):
+        raw=channel.get('base_url')
+        if not raw:
+            name=str(channel.get('name') or '').strip()
+            location=str(channel.get('location') or '').strip().rstrip('/')
+            raw=(str(channel.get('scheme') or 'https')+'://'+location+'/'+name
+                 if name and location and '://' not in name else name)
+        channel=raw
+    for candidate in (channel,record.get('url')):
+        value=str(candidate or '').strip()
+        if value.lower() in missing or (value.startswith('<') and value.endswith('>')):continue
+        if value.startswith(('conda.anaconda.org/','anaconda.org/')):value='https://'+value
+        if urlsplit(value).path.endswith('.whl'):continue
+        if '://' in value:
+            parsed=urlsplit(value)
+            path=parsed.path.rstrip('/')
+            if path.endswith(('.conda','.tar.bz2')):path=path.rsplit('/',1)[0]
+            # Only strip real platform names. Malformed subdir metadata must not
+            # strip the actual channel name (e.g. subdir='conda-forge').
+            if is_channel_subdir(path.rsplit('/',1)[-1]):path=path.rsplit('/',1)[0]
+            value=urlunsplit((parsed.scheme,parsed.netloc,path,'',''))
+        else:
+            value=value.rstrip('/')
+            if '/' in value and is_channel_subdir(value.rsplit('/',1)[-1]):value=value.rsplit('/',1)[0]
+        if not invalid_channel_reason(value):return value
+    return None
 
 
 def environment_channels(meta, extras, config):
@@ -1116,7 +1162,13 @@ def main():
             row['unknown_package_origins']=unknown_origins
             say('Environment channels from installed records: '+', '.join(channel_urls))
             if excluded_origins:say('Excluded Anaconda/default sources: '+', '.join(sorted({r['source'] for r in excluded_origins})))
-            if unknown_origins:detail('Unknown/non-channel package origins (no source inferred): '+', '.join(unknown_origins))
+            channel_records=[{'package':n,'recorded_channel':r.get('channel'),'recorded_url':r.get('url'),'recorded_subdir':r.get('subdir'),'normalized_origin':recorded_origin(r),'selected_origin':origins.get(n)} for n,r in sorted(meta.items())]
+            channel_report=logdir/('%03d-channel-records.json'%i)
+            channel_report.write_text(json.dumps(channel_records,indent=2))
+            row['channel_records_file']=str(channel_report)
+            if unknown_origins:
+                say('No usable channel origin for %d package(s); no malformed source added. Fallback/explicit channels apply. Details: %s'%(len(unknown_origins),channel_report))
+                detail('Unknown/non-channel package origins (no source inferred): '+', '.join(unknown_origins))
             for pinfile in (prefix/'conda-meta/pinned',):
                 if pinfile.is_file():
                     for pin in pinfile.read_text().splitlines():
