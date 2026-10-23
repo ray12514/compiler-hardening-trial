@@ -52,6 +52,36 @@ class ChannelRegressionTests(unittest.TestCase):
  def test_pypi_metadata_not_inferred(self):
   for record in ({'channel':'pypi'},{'url':'https://files.pythonhosted.org/pkg.whl'},{}):self.assertIsNone(m.recorded_origin(record))
 
+class StructuredChannelConfigTests(unittest.TestCase):
+ def alias(self):
+  return {'auth':None,'location':'conda.anaconda.org','name':'','package_filename':None,'platform':None,'scheme':'https','token':None}
+ def test_reported_alias_object_with_blank_name(self):
+  config={'channel_alias':self.alias()}
+  self.assertEqual(m.requested_channels([],config)[1],['https://conda.anaconda.org/conda-forge'])
+ def test_resolved_custom_object_does_not_duplicate_channel_name(self):
+  channel=dict(self.alias(),name='conda-forge')
+  config={'channel_alias':self.alias(),'custom_channels':{'conda-forge':channel}}
+  self.assertEqual(m.requested_channels([],config)[1],['https://conda.anaconda.org/conda-forge'])
+ def test_string_and_structured_config_are_equivalent(self):
+  raw={'channel_alias':'https://mirror.example/base','custom_channels':{'conda-forge':'https://mirror.example/packages'}}
+  resolved={'channel_alias':dict(self.alias(),location='mirror.example',name='base'),'custom_channels':{'conda-forge':dict(self.alias(),location='mirror.example/packages',name='conda-forge')}}
+  self.assertEqual(m.requested_channels(['bioconda'],raw)[1],m.requested_channels(['bioconda'],resolved)[1])
+ def test_structured_custom_label_suffix(self):
+  config={'custom_channels':{'bioconda':dict(self.alias(),location='mirror.example/channels',name='bioconda')}}
+  self.assertIn('https://mirror.example/channels/bioconda/label/test',m.requested_channels(['bioconda/label/test'],config)[1])
+ def test_multichannel_entries_can_be_objects(self):
+  config={'custom_multichannels':{'science':[dict(self.alias(),name='bioconda'),dict(self.alias(),name='nvidia')]}}
+  self.assertEqual(m.requested_channels(['science'],config)[1],['https://conda.anaconda.org/conda-forge','https://conda.anaconda.org/bioconda','https://conda.anaconda.org/nvidia'])
+ def test_auth_token_and_mirror_location_retained(self):
+  value=dict(self.alias(),auth='user:secret',token='test-token',location='mirror.example/base',name='conda-forge')
+  self.assertEqual(m.channel_value_url(value),'https://user:secret@mirror.example/base/t/test-token/conda-forge')
+ def test_default_repository_still_blocked_in_objects(self):
+  config={'custom_channels':{'conda-forge':dict(self.alias(),location='repo.anaconda.com',name='pkgs/main')}}
+  with self.assertRaisesRegex(RuntimeError,'excluded Anaconda defaults'):m.requested_channels([],config)
+ def test_alias_base_valid_but_installed_host_only_not_channel(self):
+  value=self.alias();self.assertEqual(m.channel_value_url(value),'https://conda.anaconda.org')
+  self.assertIsNone(m.recorded_origin({'channel':value}))
+
 class ChannelFlowTests(unittest.TestCase):
  def test_preview_and_apply_with_host_only_record(self):
   for apply in (False,True):
@@ -61,7 +91,7 @@ class ChannelFlowTests(unittest.TestCase):
     metadata=base/'conda-meta/ca.json';metadata.write_text(json.dumps(record));calls=[]
     def fake(cmd,**kw):
      calls.append(cmd)
-     if '--show' in cmd:result={}
+     if '--show' in cmd:result={'channel_alias':{'auth':None,'location':'conda.anaconda.org','name':'','package_filename':None,'platform':None,'scheme':'https','token':None},'custom_channels':{'conda-forge':{'auth':None,'location':'conda.anaconda.org','name':'conda-forge','platform':None,'scheme':'https','token':None}}}
      elif '--dry-run' in cmd:result={'success':True,'actions':{'LINK':[{'name':'ca-certificates','version':'2026.10.19','build':'0','channel':'conda-forge'}]}}
      elif 'install' in cmd:record['version']='2026.10.19';metadata.write_text(json.dumps(record));result={'success':True}
      elif '--explicit' in cmd:return subprocess.CompletedProcess(cmd,0,'@EXPLICIT\n','')
