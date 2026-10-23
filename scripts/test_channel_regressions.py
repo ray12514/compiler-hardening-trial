@@ -108,4 +108,58 @@ class ChannelFlowTests(unittest.TestCase):
      sources=[cmd[i+1] for i,value in enumerate(cmd) if value=='--channel']
      self.assertTrue(all(value in ('conda-forge','https://conda.anaconda.org/conda-forge') for value in sources))
 
+class BaseUpdatePolicyTests(unittest.TestCase):
+ def test_base_plan_unpins_applications_and_updates_conda(self):
+  meta={n:{'version':v,'build':'0'} for n,v in [('conda','24.11.2'),('python','3.12.8'),('numpy','1.0'),('pip','24.3.1')]}
+  targets,allowed,specs=m.plan_specs(meta,False,broad=True)
+  self.assertIsNone(allowed);self.assertEqual(targets,set(meta));self.assertIn('numpy',specs);self.assertIn('python',specs);self.assertIn('conda>=26.9.4',specs);self.assertIn('pip>='+m.MINIMUM['pip'],specs)
+ def test_other_prefix_retains_pins(self):
+  meta={n:{'version':v,'build':'0'} for n,v in [('conda','24.11.2'),('python','3.12.8'),('numpy','1.0'),('pip','24.3.1')]}
+  targets,allowed,specs=m.plan_specs(meta,False)
+  self.assertIn('numpy=1.0=0',specs);self.assertIn('python=3.12.8=0',specs);self.assertIn('conda=24.11.2=0',specs)
+ def test_broad_plan_accepts_numpy_matplotlib_kerberos(self):
+  plan={'actions':{'LINK':[{'name':n} for n in ('numpy','matplotlib','matplotlib-base','krb5')]}}
+  self.assertEqual(len(m.check_plan(plan,None)),4)
+  with self.assertRaisesRegex(RuntimeError,'unrelated'):m.check_plan(plan,{'pip'})
+ def test_broad_still_rejects_removal_or_defaults(self):
+  for plan in ({'actions':{'UNLINK':[{'name':'certifi'}]}},{'actions':{'LINK':[{'name':'numpy','channel':'defaults'}]}}):
+   with self.assertRaises(RuntimeError):m.check_plan(plan,None)
+ def test_minimum_checks_reject_missing_or_old_packages(self):
+  before={'pip':{'version':'24.3.1'},'certifi':{'version':'2024.12.14'}}
+  for after in ({'pip':{'version':m.MINIMUM['pip']}},{'pip':{'version':'24.3.1'},'certifi':{'version':m.MINIMUM['certifi']}}):
+   with self.assertRaises(RuntimeError):m.verify_minimums(before,after)
+  after={n:{'version':m.MINIMUM[n]} for n in before}
+  self.assertEqual(set(m.verify_minimums(before,after)),set(before))
+ def run_update(self,broad,stale=False):
+  with tempfile.TemporaryDirectory() as directory:
+   p=pathlib.Path(directory);base=p/'mf';(base/'bin').mkdir(parents=True);(base/'bin/conda').touch()
+   prefix=base if broad else p/'env';(prefix/'conda-meta').mkdir(parents=True);(prefix/'conda-meta/history').touch()
+   installed={'ca-certificates':{'name':'ca-certificates','version':'2025.1.31','build':'0'},'numpy':{'name':'numpy','version':'1.0','build':'0'}}
+   def save():
+    for n,r in installed.items():(prefix/'conda-meta'/(n+'.json')).write_text(json.dumps(r))
+   save();calls=[]
+   links=[{'name':'ca-certificates','version':m.MINIMUM['ca-certificates'],'build':'0'}]+[{'name':n,'version':'2.0','build':'0'} for n in ('numpy','matplotlib','matplotlib-base','krb5')]
+   def fake(cmd,**kw):
+    calls.append(cmd)
+    if '--show' in cmd:out={}
+    elif '--dry-run' in cmd:out={'success':True,'actions':{'LINK':links}}
+    elif 'install' in cmd:
+     for r in links:
+      if not (stale and r['name']=='ca-certificates'):installed[r['name']]=dict(r)
+     save();out={'success':True}
+    elif '--explicit' in cmd:return subprocess.CompletedProcess(cmd,0,'@EXPLICIT\n','')
+    else:out={'success':True}
+    return subprocess.CompletedProcess(cmd,0,json.dumps(out),'')
+   argv=['script',str(base),'--apply','--log-dir',str(p/'logs')]+(['--base-only'] if broad else ['--only',str(prefix)])
+   with patch.object(m.sys,'argv',argv),patch.object(m.os,'geteuid',return_value=123),patch.object(m,'maintenance_gid',return_value=0),patch.object(m,'maintainable',return_value=True),patch.object(m,'choose_source',return_value=p/'source'),patch.object(m,'filtered_bundle',return_value=('PEM',[])),patch.object(m,'atomic_write',side_effect=lambda path,data:pathlib.Path(path).write_text(data)),patch.object(m.subprocess,'run',side_effect=fake),patch.object(m,'public_permissions',return_value=[]),patch('sys.stdout',io.StringIO()):result=m.main()
+   return result,json.loads((p/'logs/summary.json').read_text())[0],[c for c in calls if 'install' in c]
+ def test_full_base_flow_and_narrow_environment_flow(self):
+  result,row,commands=self.run_update(True)
+  self.assertEqual(result,0);self.assertEqual(row['status'],'updated');self.assertIn('--update-all',commands[0]);self.assertFalse(any('--freeze-installed' in c for c in commands));self.assertIn('ca-certificates',row['security_verification']);self.assertEqual(len(commands),2)
+  result,row,commands=self.run_update(False)
+  self.assertEqual(result,2);self.assertEqual(len(commands),1);self.assertIn('unrelated',' '.join(row['issues']))
+ def test_stale_security_package_cannot_report_updated(self):
+  result,row,commands=self.run_update(True,stale=True)
+  self.assertEqual(result,2);self.assertEqual(row['status'],'incomplete');self.assertIn('below required minimum',' '.join(row['issues']))
+
 if __name__=='__main__': unittest.main()
