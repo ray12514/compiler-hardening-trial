@@ -41,15 +41,15 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
   > ./patch_miniforge_trust.py
 ```
 
-### Reproduce the channel-validation revision exactly
+### Reproduce the structured-channel revision exactly
 
-The script was updated at commit `2b32d35a2040de84842a26ad01fa4ea6a13ea84d`.
+The script was updated at commit `509f631e1a0a121056eda53aaef73504d79c562e`.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
 ```bash
 git -C "$cse_fetch_dir/repo" fetch --depth 1 origin \
-  2b32d35a2040de84842a26ad01fa4ea6a13ea84d
+  509f631e1a0a121056eda53aaef73504d79c562e
 ```
 
 Then replace `HEAD:scripts/patch_miniforge_trust.py` with
@@ -57,7 +57,7 @@ Then replace `HEAD:scripts/patch_miniforge_trust.py` with
 `rev-parse FETCH_HEAD` for the provenance record. Verify this exact script revision:
 
 ```bash
-echo 'e27aa716cc2207943cd7c8c65120c68ba39801a2709d48e10d6a5a3d31c24c58  patch_miniforge_trust.py' |
+echo '1865f556530dd82bcfa2baa2f2368c4f2d7ef52704ce0668c46f18d513791154  patch_miniforge_trust.py' |
   sha256sum --check
 ```
 
@@ -140,6 +140,30 @@ The new bundle takes effect for the current shell only when you source the print
 `use-ca.sh` after loading your module, or implement the equivalent module settings.
 An application may still use its own trust configuration. This stage does not replace
 outdated CA packages, pip's embedded bundles, system trust, or proxy upstream policy.
+
+## Startup error: expected a URL, got auth/location/name fields
+
+Revision 10 incorrectly required `channel_alias` and `custom_channels` values from
+`conda config --show --json` to be URL strings. Conda can instead return serialized
+Channel objects containing `scheme`, `location`, `name`, `auth`, `token`, `platform`
+and `package_filename`. A blank `name` is valid for a channel alias: the requested
+channel name is appended to that base. For example, an alias object with
+`scheme=https`, `location=conda.anaconda.org` and a blank name resolves conda-forge to
+`https://conda.anaconda.org/conda-forge`. It is not a malformed installed package source.
+
+Revision 11 accepts both URL strings and structured Channel objects. Structured custom
+channels already include their names, so the resolver does not append the name twice.
+Mirror paths and supplied auth/token fields are retained. Structured multichannel
+members are also supported. Known Anaconda defaults repositories remain excluded.
+This is a script compatibility correction; it does not require editing a working
+`.condarc`. That specific startup exception occurs before certificate/package writes
+in the failed invocation, although earlier runs may already have written CSE trust files.
+
+Retrieve revision 11 and repeat your previous base-only preview. The published regression
+suite (`scripts/test_channel_regressions.py`) covers the reported blank-name alias
+object, raw/resolved configuration equivalence, custom channels, mirror paths, labels,
+multichannels, source exclusions and simulated preview/apply with structured config.
+These local tests do not establish access to repositories from your HPC system.
 
 ## HTTP 404 with a blank channel name
 
@@ -534,7 +558,7 @@ CA filtering, quiet/verbose output, owner report grouping, final-summary reasons
 permission preview counts, read-only legacy-log reporting, structured command-failure
 records, mixed-package review ordering, access-path snapshots, certificate-only
 operations, actual-bundle inspection, exact-prefix scope, channel-source guards, per-environment installed-source discovery,
-source-qualified update specs, malformed/host-only metadata recovery and
+source-qualified update specs, malformed/host-only metadata recovery, structured alias/custom-channel config and
 simulated preview/offline apply. Actual SUSE/RHEL deployment remains
 a target-system validation task.
 
