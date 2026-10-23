@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 10 (2026-10-23).
+"""CSE Miniforge certificate maintenance, revision 11 (2026-10-23).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -653,7 +653,7 @@ def failure_category(text):
         return 'Filesystem access', 'Check the exact denied path, its parent traversal, ACLs, mount policy and cache location; environment ownership alone is insufficient.'
     if any(x in value for x in ('certificate_verify_failed','sslerror','ssl verification','certificate verify failed','proxyerror')):
         return 'TLS/proxy access', 'Review CA/proxy configuration and the specific endpoint; do not disable TLS verification.'
-    if any(x in value for x in ('unavailableinvalidchannel','channelnotfound','channel is not accessible','invalid requested channel','invalid resolved channel')):
+    if any(x in value for x in ('unavailableinvalidchannel','channelnotfound','channel is not accessible','invalid requested channel','invalid resolved channel','invalid channel alias/custom')):
         return 'Invalid channel URL/name', 'Use the exact Channels selected/used list and channel-records JSON to identify an empty, malformed or obsolete source. The conda-forge URL includes /conda-forge; do not remove its hosting domain.'
     if any(x in value for x in ('packagesnotfound','unsatisfiable','conflict','could not solve')):
         return 'Package availability/dependencies', 'Check approved conda-forge mirror availability and installed pins/Python compatibility.'
@@ -825,13 +825,43 @@ def is_channel_subdir(value):
     return bool(re.fullmatch(r'(?:noarch|linux-[\w]+|osx-[\w]+|win-[\w]+|freebsd-[\w]+|zos-[\w]+)',str(value)))
 
 
+def channel_value_url(value):
+    """Conda config JSON can serialize Channel values as objects, not strings.
+
+    A blank name is valid for channel_alias (a base location), whereas a full
+    public channel still needs a name. Validation belongs to the calling context.
+    """
+    if isinstance(value,str):return value.strip().rstrip('/')
+    if not isinstance(value,dict):return None
+    if value.get('base_url'):
+        return channel_value_url(value['base_url'])
+    scheme=str(value.get('scheme') or 'https')
+    location=str(value.get('location') or '').strip().rstrip('/')
+    name=str(value.get('name') or '').strip().strip('/')
+    if not location:
+        if scheme=='file' and name:return 'file:///'+name
+        return name if '://' in name else None
+    base=location if '://' in location else scheme+'://'+location
+    parsed=urlsplit(base)
+    netloc=parsed.netloc
+    auth=value.get('auth')
+    if auth and '@' not in netloc:netloc=str(auth)+'@'+netloc
+    parts=[parsed.path.rstrip('/')]
+    token=value.get('token')
+    if token:parts.extend(('t',str(token).strip('/')))
+    if name:parts.append(name)
+    path='/'.join(part.strip('/') for part in parts if part)
+    return urlunsplit((parsed.scheme,netloc,('/'+path) if path else '',parsed.query,parsed.fragment))
+
+
 def requested_channels(extras, config):
     """Resolve the explicit allowlist locally, so Anaconda defaults cannot hide in aliases."""
     custom = config.get('custom_channels') or {}
     multi = config.get('custom_multichannels') or {}
     alias = config.get('channel_alias') or 'https://conda.anaconda.org'
     def resolve(name,seen=()):
-        name=str(name).strip()
+        name=channel_value_url(name) if isinstance(name,dict) else str(name).strip()
+        if not name:raise RuntimeError('Invalid requested channel object: missing location/name')
         problem=invalid_channel_reason(name)
         if problem:raise RuntimeError('Invalid requested channel %r: %s'%(name,problem))
         if forbidden_channel(name): raise RuntimeError('Anaconda defaults channel is excluded: '+str(name))
@@ -848,10 +878,16 @@ def requested_channels(extras, config):
             # custom_channels maps a channel name to the base location, without
             # that channel name (the conda configuration contract).
             key=next((k for k in sorted(custom,key=len,reverse=True) if name==k or name.startswith(k+'/')),None)
-            location=custom[key] if key else alias
-            if not isinstance(location,str) or not location.strip() or '://' not in location:
-                raise RuntimeError('Invalid channel alias/custom location for %r: expected a URL, got %r'%(name,location))
-            urls=[location.rstrip('/')+'/'+name]
+            configured=custom[key] if key else alias
+            location=channel_value_url(configured)
+            if not location or '://' not in location:
+                raise RuntimeError('Invalid channel alias/custom location for %r: cannot resolve its URL from the configuration value'%(name,))
+            if key and isinstance(configured,dict) and (configured.get('name') or configured.get('base_url')):
+                # Resolved custom Channel objects already include their name.
+                # Raw .condarc custom-channel strings contain only the location.
+                urls=[location.rstrip('/')+name[len(key):]]
+            else:
+                urls=[location.rstrip('/')+'/'+name]
         for url in urls:
             problem=invalid_channel_reason(url)
             if problem:raise RuntimeError('Invalid resolved channel %r: %s'%(url,problem))
@@ -876,14 +912,7 @@ def recorded_origin(record):
     """Normalize installed sources; fall back to archive URL if the channel is unusable."""
     missing={'','<unknown>','unknown','none','null','@','pypi','pypi_0'}
     channel=record.get('channel')
-    if isinstance(channel,dict):
-        raw=channel.get('base_url')
-        if not raw:
-            name=str(channel.get('name') or '').strip()
-            location=str(channel.get('location') or '').strip().rstrip('/')
-            raw=(str(channel.get('scheme') or 'https')+'://'+location+'/'+name
-                 if name and location and '://' not in name else name)
-        channel=raw
+    if isinstance(channel,dict): channel=channel_value_url(channel)
     for candidate in (channel,record.get('url')):
         value=str(candidate or '').strip()
         if value.lower() in missing or (value.startswith('<') and value.endswith('>')):continue
