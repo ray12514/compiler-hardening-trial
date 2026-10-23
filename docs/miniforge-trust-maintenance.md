@@ -41,15 +41,15 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
   > ./patch_miniforge_trust.py
 ```
 
-### Reproduce the installed-source revision exactly
+### Reproduce the channel-validation revision exactly
 
-The script was updated at commit `0e2dee721cc8b5ed7c2dd1610d625b23ac8887d1`.
+The script was updated at commit `2b32d35a2040de84842a26ad01fa4ea6a13ea84d`.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
 ```bash
 git -C "$cse_fetch_dir/repo" fetch --depth 1 origin \
-  0e2dee721cc8b5ed7c2dd1610d625b23ac8887d1
+  2b32d35a2040de84842a26ad01fa4ea6a13ea84d
 ```
 
 Then replace `HEAD:scripts/patch_miniforge_trust.py` with
@@ -57,7 +57,7 @@ Then replace `HEAD:scripts/patch_miniforge_trust.py` with
 `rev-parse FETCH_HEAD` for the provenance record. Verify this exact script revision:
 
 ```bash
-echo 'abd8f0a15087584506e81a2eb1c84eb58418718e7269ab153cac07cbd6e5b713  patch_miniforge_trust.py' |
+echo 'e27aa716cc2207943cd7c8c65120c68ba39801a2709d48e10d6a5a3d31c24c58  patch_miniforge_trust.py' |
   sha256sum --check
 ```
 
@@ -140,6 +140,44 @@ The new bundle takes effect for the current shell only when you source the print
 `use-ca.sh` after loading your module, or implement the equivalent module settings.
 An application may still use its own trust configuration. This stage does not replace
 outdated CA packages, pip's embedded bundles, system trust, or proxy upstream policy.
+
+## HTTP 404 with a blank channel name
+
+`conda.anaconda.org` is the normal public host for conda-forge. The channel root is
+`https://conda.anaconda.org/conda-forge`; the bare host is not a named public channel.
+A channel object showing `auth=None` does not itself indicate an authentication error.
+A blank channel name plus a host-only URL can explain an invalid-channel 404.
+
+Revision 9 could admit a host-only installed channel record, and could strip a real
+channel name when a malformed `subdir` field matched that name. Revision 10 rejects
+host-only public origins and strips only recognized platform names. For an unusable
+channel field, it attempts recovery from the recorded package archive URL. Structured
+channel metadata retains its location and name together. If neither source is usable,
+the malformed source is not passed to conda; the permitted fallback/explicit channels
+remain available. Explicit malformed channels or alias/custom mappings fail locally
+with an actionable error instead of generating a repository request.
+
+After retrieving the fixed script, inspect the base scope first:
+
+```bash
+python3 patch_miniforge_trust.py /actual/path/to/miniforge \
+  --base-only --ca-bundle /actual/path/to/CSE-existing-bundle.pem
+```
+
+The preview is local-only. Check `Environment channels from installed records:` and
+`Channels used:`; for a conda-forge-only base the list should contain the full
+`https://conda.anaconda.org/conda-forge` URL (or your configured site mirror equivalent).
+Add `--apply` to attempt the validated solve/update after reviewing that preview.
+A preview does not test repository availability. Valid, fully named historical channels
+can still return 404 if they were removed, made private, or changed on the mirror;
+that requires the exact failing URL and cannot be inferred from a host-only error.
+
+Each new package run saves `NNN-channel-records.json` with the package name, original
+channel/URL/subdir, normalized origin and selected origin. Missing/unusable source counts
+and this report path are printed without `--verbose`. This makes the metadata behind
+a constructed channel visible without searching through a traceback. No `.condarc`
+files are automatically rewritten to repair this error. Do not remove the normal
+hosting domain or add Anaconda `defaults` in response to the generic conda message.
 
 ## Work on the base, then one environment
 
@@ -496,7 +534,7 @@ CA filtering, quiet/verbose output, owner report grouping, final-summary reasons
 permission preview counts, read-only legacy-log reporting, structured command-failure
 records, mixed-package review ordering, access-path snapshots, certificate-only
 operations, actual-bundle inspection, exact-prefix scope, channel-source guards, per-environment installed-source discovery,
-source-qualified update specs and
+source-qualified update specs, malformed/host-only metadata recovery and
 simulated preview/offline apply. Actual SUSE/RHEL deployment remains
 a target-system validation task.
 
