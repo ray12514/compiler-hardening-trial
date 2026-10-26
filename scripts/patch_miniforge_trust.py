@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 12 (2026-10-23).
+"""CSE Miniforge certificate maintenance, revision 13 (2026-10-26).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -49,7 +49,11 @@ Default package targets: existing ca-certificates>=2026.10.19 (conda-forge),
 certifi>=2026.10.19, pip>=26.2.2, uv>=0.13.4, and sigstore>=4.5.1 where
 installed through conda. Base also requests conda>=26.9.4 where installed;
 --upgrade-conda requests that minimum in non-base prefixes. Related mamba/solver packages are requested together
-when installed. The base prefix permits all installed conda packages, including Python, conda,
+when installed. If base conda is below the required minimum, apply first solves,
+installs and verifies a targeted conda/CA-package bootstrap with that same conda
+executable. Only then does it solve the full base update. The bootstrap preserves
+the installed Miniforge release/prefix; no installer is downloaded or replaced.
+The base prefix permits all installed conda packages, including Python, conda,
 NumPy, matplotlib and Kerberos dependencies, to update compatibly. Its solve uses
 --update-all and security minimum constraints, then executes the validated exact plan.
 Non-base prefixes retain Python/application version+build pins and --freeze-installed.
@@ -141,6 +145,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
+CONDA_MINIMUM = '26.9.4'
 ROOTS = {
  '7DD78D5F4F13459A83DFF9ABBBA62EDBAF6F2D102BF257FD712F4D9F2746ED8D': 'emSign Root TLS CA - G3',
  'F2EDAAFF3D9B701FB4D14C9F285F8C0BAD90FC3BCC1FA07D47F4718EDABA34A5': 'emSign Root CS CA - G3',
@@ -491,12 +496,12 @@ def plan_specs(meta, upgrade_conda, broad=False):
     if broad:
         # Base is explicitly authorized for a full compatible conda update.
         targets=set(meta)
-        specs=[n+'>='+MINIMUM[n] if n in MINIMUM else ('conda>=26.9.4' if n=='conda' else n) for n in sorted(targets)]
+        specs=[n+'>='+MINIMUM[n] if n in MINIMUM else ('conda>='+CONDA_MINIMUM if n=='conda' else n) for n in sorted(targets)]
         return targets,None,specs
     targets = set(meta) & (set(MINIMUM) | MANAGERS)
     if upgrade_conda and 'conda' in meta: targets.add('conda')
     specs = [n + '>=' + MINIMUM[n] if n in MINIMUM else
-             ('conda>=26.9.4' if n == 'conda' else n) for n in sorted(targets)]
+             ('conda>='+CONDA_MINIMUM if n == 'conda' else n) for n in sorted(targets)]
     allowed = targets | MANAGEMENT_DEPS
     if not upgrade_conda: allowed -= {'conda','conda-self'}
     # Scientific packages, Python and ABI always keep exact installed builds.
@@ -524,9 +529,74 @@ def check_plan(plan, allowed):
     return sorted(linked | unlinked)
 
 
+def exact_plan_specs(meta, plan, origins, extras, config):
+    """Bind the validated final package versions/builds and allowed sources."""
+    final={n:(r['version'],r['build']) for n,r in meta.items()}
+    final_origins=dict(origins)
+    for record in plan.get('actions',{}).get('LINK',[]):
+        name=record['name']
+        final[name]=(record['version'],record.get('build_string') or record.get('build'))
+        _,_,_,planned_origins,_,_=environment_channels({name:record},extras,config)
+        if name in planned_origins:final_origins[name]=planned_origins[name]
+    if any(not build for value,build in final.values()):
+        raise RuntimeError('Plan omitted build identifiers')
+    exact=qualify_specs([name+'='+value+'='+build for name,(value,build) in sorted(final.items())],final_origins)
+    return final,exact
+
+
+def conda_bootstrap_status(meta):
+    current=meta.get('conda',{}).get('version')
+    return {'status':'not-installed' if current is None else
+            ('would-update' if version(current)<version(CONDA_MINIMUM) else 'not-needed'),
+            'before':current,'minimum':CONDA_MINIMUM}
+
+
+def bootstrap_conda(base, meta, channel_args, origins, extras, config, offline,
+                    runjson, logdir, row, say):
+    """Upgrade the loaded base's manager before asking it to update all packages."""
+    status=row['conda_bootstrap']
+    if status['status']!='would-update':return meta
+    required={'conda':CONDA_MINIMUM,'ca-certificates':MINIMUM['ca-certificates'],
+              'certifi':MINIMUM['certifi']}
+    specs=qualify_specs([name+'>='+value for name,value in sorted(required.items())],origins)
+    common=[base/'bin/conda','install','-p',base,'--solver','classic','--json']+channel_args
+    if offline:common.append('--offline')
+    def verify(metadata):
+        for name,minimum in required.items():
+            current=metadata.get(name,{}).get('version')
+            if current is None or version(current)<version(minimum):
+                raise RuntimeError('Conda bootstrap did not meet required minimum: %s>=%s'%(name,minimum))
+    say('Conda bootstrap: %s -> >=%s before the full base solve'%(status['before'],CONDA_MINIMUM))
+    try:
+        row['phase']='solve base conda bootstrap (dry run)'
+        plan=runjson(common+specs+['--dry-run'])
+        plan_file=logdir/'base-conda-bootstrap-plan.json'
+        plan_file.write_text(json.dumps(plan,indent=2))
+        check_plan(plan,None)  # Base dependencies may move; source/removal guards still apply.
+        final,exact=exact_plan_specs(meta,plan,origins,extras,config)
+        verify({name:{'version':value} for name,(value,build) in final.items()})
+        status['plan_file']=str(plan_file)
+        status['package_plan']=[{'name':r['name'],'version':r['version'],
+                                'build':r.get('build_string') or r.get('build')}
+                               for r in plan.get('actions',{}).get('LINK',[])]
+        row['phase']='install validated base conda bootstrap'
+        row['changes_started']=True
+        execution=runjson(common+['--yes']+exact)
+        (logdir/'base-conda-bootstrap-install.json').write_text(json.dumps(execution,indent=2))
+        check_plan(execution,None)
+        after=records(base)
+        verify(after)
+        status.update(status='updated',after=after['conda']['version'])
+        say('Conda bootstrap verified: conda=%s; continuing the base update'%status['after'])
+        return after
+    except Exception as exc:
+        status.update(status='incomplete',reason=str(exc))
+        raise
+
+
 def verify_minimums(before, after, upgrade_conda=False):
     required={n:minimum for n,minimum in MINIMUM.items() if n in before}
-    if upgrade_conda and 'conda' in before: required['conda']='26.9.4'
+    if upgrade_conda and 'conda' in before: required['conda']=CONDA_MINIMUM
     verified={}
     for name,minimum in sorted(required.items()):
         if name not in after: raise RuntimeError('Required package missing after update: '+name)
@@ -628,6 +698,10 @@ def final_summary(results, apply, bundle, say):
             say('  Verified package: %s %s -> %s' % (change['name'],change['before'],change['after']))
         if row.get('security_verification'):
             say('  Verified required minimums: '+', '.join('%s=%s (>= %s)'%(n,v['version'],v['minimum']) for n,v in sorted(row['security_verification'].items())))
+        if row.get('conda_bootstrap'):
+            bootstrap=row['conda_bootstrap']
+            say('  Conda bootstrap: %s | before=%s | after=%s | minimum=%s'%(
+                bootstrap['status'],bootstrap['before'],bootstrap.get('after','not changed/verified'),bootstrap['minimum']))
         stats = row.get('permissions',{})
         if stats:
             say('  Permissions: %d paths %s; %d group changes planned to cse; %d mode changes planned; %d parent access warnings' % (
@@ -740,6 +814,10 @@ def report_existing(directory, verbose=False):
         print('\n%s | %s | owner=%s' % (row['prefix'],row['status'],row.get('ownership',{}).get('owner','unknown')))
         print('  Category: '+category)
         print('  Changes started: '+str(row.get('changes_started','not recorded'))+' (not a transaction/rollback guarantee)')
+        if row.get('conda_bootstrap'):
+            bootstrap=row['conda_bootstrap']
+            print('  Conda bootstrap: %s | before=%s | after=%s'%(
+                bootstrap['status'],bootstrap['before'],bootstrap.get('after','not changed/verified')))
         for issue in issues:
             if 'Command failed; see private run.log' not in issue: print('  Reason: '+issue)
         for event in evidence:
@@ -1058,7 +1136,7 @@ def main():
     ap.add_argument('--inspect-trust',action='store_true',help='Read actual CSE/base CA files and configuration; no updates')
     ap.add_argument('--trust-only',action='store_true',help='Only prepare/write the CSE bundle and shell snippet; no package/environment permission changes')
     scope=ap.add_mutually_exclusive_group()
-    scope.add_argument('--base-only',action='store_true',help='Select only the Miniforge base prefix')
+    scope.add_argument('--base-only',action='store_true',help='Select only the loaded base; bootstrap older conda before the full update')
     scope.add_argument('--only',type=Path,action='append',default=[],help='Select only this exact environment; repeatable; still uses the base conda/CSE bundle')
     ap.add_argument('--channel',action='append',default=[],help='Additional approved community channel or mirror; repeatable; Anaconda defaults excluded')
     ap.add_argument('--report',type=Path,metavar='LOG_DIR_OR_latest',help='Read an existing summary/run.log and explain failures; no updates, group checks or network')
@@ -1206,6 +1284,7 @@ def main():
         try:
             row['phase'] = 'read conda package metadata'
             meta = records(prefix)
+            initial_meta = meta
             row['installed_channels']=sorted({str(r.get('channel') or r.get('url') or 'unknown') for r in meta.values()})
             channel_names,channel_urls,channel_args,origins,excluded_origins,unknown_origins=environment_channels(meta,args.channel,config)
             row['requested_channels']=channel_urls
@@ -1231,9 +1310,13 @@ def main():
             upgrade_conda = args.upgrade_conda or broad
             row['package_policy']='all base packages may update' if broad else 'targeted maintenance; application packages pinned'
             say('Package policy: '+row['package_policy'])
+            if broad:
+                row['conda_bootstrap']=conda_bootstrap_status(meta)
+                say('Conda bootstrap: '+row['conda_bootstrap']['status']+
+                    ' | current='+str(row['conda_bootstrap']['before'])+' | minimum='+CONDA_MINIMUM)
             targets,allowed,specs = plan_specs(meta,upgrade_conda,broad=broad)
             specs=qualify_specs(specs,origins)
-            row['package_targets'] = [{'name':n,'current':meta[n]['version'],'request':('>='+MINIMUM[n] if n in MINIMUM else ('>=26.9.4' if n == 'conda' else 'compatible build from installed source')),'source':origins.get(n,'fallback/explicit allowed channels')} for n in sorted(targets)]
+            row['package_targets'] = [{'name':n,'current':meta[n]['version'],'request':('>='+MINIMUM[n] if n in MINIMUM else ('>='+CONDA_MINIMUM if n == 'conda' else 'compatible build from installed source')),'source':origins.get(n,'fallback/explicit allowed channels')} for n in sorted(targets)]
             detail('Package targets: '+(', '.join(sorted(targets)) or 'none'))
             audit = {'packages':{},'bundles':{}}
             py = prefix/'bin/python'
@@ -1254,6 +1337,14 @@ def main():
                     p=prefix/relative
                     if p.is_file(): (logdir/('%03d-before-'%i+relative.replace('/','_'))).write_bytes(p.read_bytes())
                 (logdir/('%03d-before-explicit.txt'%i)).write_text(run([conda,'list','-p',prefix,'--explicit']).stdout)
+                if broad:
+                    meta=bootstrap_conda(base,meta,channel_args,origins,args.channel,config,
+                                         args.offline,runjson,logdir,row,say)
+                    # The next solve must use the updated installed records, not
+                    # exact pins for the older manager we just replaced.
+                    _,_,channel_args,origins,_,_=environment_channels(meta,args.channel,config)
+                    targets,allowed,specs=plan_specs(meta,upgrade_conda,broad=True)
+                    specs=qualify_specs(specs,origins)
                 if targets:
                     row['phase'] = 'solve package update (dry run)'
                     cmd=[conda,'install','-p',prefix,'--solver','classic','--json']+(['--update-all'] if broad else ['--freeze-installed'])+channel_args+specs
@@ -1264,15 +1355,8 @@ def main():
                     row['package_plan'] = [{'name':r['name'],'before':meta.get(r['name'],{}).get('version','absent'),'after':r['version'],'build':r.get('build_string') or r.get('build')} for r in plan.get('actions',{}).get('LINK',[])]
                     detail('Validated package changes: '+(', '.join(changed) or 'none'))
                     # Lock the planned final versions/builds before the execution solve.
-                    final={n:(r['version'],r['build']) for n,r in meta.items()}
-                    final_origins=dict(origins)
-                    for r in plan.get('actions',{}).get('LINK',[]):
-                        final[r['name']]=(r['version'],r.get('build_string') or r.get('build'))
-                        _,_,_,planned_origins,_,_=environment_channels({r['name']:r},args.channel,config)
-                        if r['name'] in planned_origins:final_origins[r['name']]=planned_origins[r['name']]
-                    if any(not b for v,b in final.values()):raise RuntimeError('Plan omitted build identifiers')
+                    final,exact=exact_plan_specs(meta,plan,origins,args.channel,config)
                     verify_minimums(meta,{n:{'version':v} for n,(v,b) in final.items()},upgrade_conda)
-                    exact=qualify_specs([n+'='+v+'='+b for n,(v,b) in sorted(final.items())],final_origins)
                     execution=[conda,'install','-p',prefix,'--solver','classic','--json','--yes']+([] if broad else ['--freeze-installed'])+channel_args+exact
                     if args.offline: execution.append('--offline')
                     row['phase'] = 'install validated package plan'
@@ -1284,7 +1368,7 @@ def main():
                 run([conda,'env','config','vars','set','-p',prefix]+[k+'='+v for k,v in values.items()])
                 row['phase'] = 'verify updated packages and trust bundles'
                 after_meta=records(prefix)
-                row['package_changes'] = [{'name':n,'before':meta.get(n,{}).get('version','absent'),'after':r['version']} for n,r in sorted(after_meta.items()) if n not in meta or (r['version'],r['build']) != (meta[n]['version'],meta[n]['build'])]
+                row['package_changes'] = [{'name':n,'before':initial_meta.get(n,{}).get('version','absent'),'after':r['version']} for n,r in sorted(after_meta.items()) if n not in initial_meta or (r['version'],r['build']) != (initial_meta[n]['version'],initial_meta[n]['build'])]
                 row['trust_configuration'] = 'configured to use'
                 row['security_verification']=verify_minimums(meta,after_meta,upgrade_conda)
                 if 'python' in meta:

@@ -162,4 +162,87 @@ class BaseUpdatePolicyTests(unittest.TestCase):
   result,row,commands=self.run_update(True,stale=True)
   self.assertEqual(result,2);self.assertEqual(row['status'],'incomplete');self.assertIn('below required minimum',' '.join(row['issues']))
 
+class CondaBootstrapTests(unittest.TestCase):
+ def run_loaded_base(self,apply=True,current=False,fail_bootstrap=False,offline=False,stale_bootstrap=False):
+  with tempfile.TemporaryDirectory() as directory:
+   root=pathlib.Path(directory);base=root/'loaded-miniforge'
+   (base/'bin').mkdir(parents=True);(base/'bin/conda').touch()
+   (base/'conda-meta').mkdir();(base/'conda-meta/history').touch()
+   minimums={'conda':'26.9.4','ca-certificates':m.MINIMUM['ca-certificates'],'certifi':m.MINIMUM['certifi']}
+   installed={n:{'name':n,'version':v,'build':'0','channel':'conda-forge'} for n,v in
+              [('conda','26.9.4' if current else '24.11.2'),('ca-certificates','2025.1.31'),('certifi','2025.1.31'),('numpy','1.0')]}
+   def save():
+    for name,record in installed.items():(base/'conda-meta'/(name+'.json')).write_text(json.dumps(record))
+   save();calls=[]
+   def fake(cmd,**kwargs):
+    cmd=list(map(str,cmd));calls.append((cmd,dict(kwargs.get('env',{}))))
+    if cmd[1:]==['info','--base']:return subprocess.CompletedProcess(cmd,0,str(base)+'\n','')
+    if '--show' in cmd:output={}
+    elif '--explicit' in cmd:return subprocess.CompletedProcess(cmd,0,'@EXPLICIT\n','')
+    elif 'install' in cmd:
+     is_old=m.version(installed['conda']['version'])<m.version('26.9.4')
+     if '--update-all' in cmd and is_old:
+      return subprocess.CompletedProcess(cmd,1,'','Conda must be updated before solving the base package update')
+     if '--dry-run' in cmd:
+      links=[dict(installed[n],version=v) for n,v in minimums.items()]
+      if '--update-all' in cmd:links.append(dict(installed['numpy'],version='2.0'))
+      output={'success':True,'actions':{'LINK':links}}
+     else:
+      if is_old and fail_bootstrap:return subprocess.CompletedProcess(cmd,1,'','Conda bootstrap installation failed')
+      for name,value in minimums.items():
+       if not (is_old and stale_bootstrap):installed[name]['version']=value
+      if any('numpy=2.0=' in value for value in cmd):installed['numpy']['version']='2.0'
+      save();output={'success':True}
+    else:output={'success':True}
+    return subprocess.CompletedProcess(cmd,0,json.dumps(output),'')
+   argv=['patch_miniforge_trust.py','--base-only','--log-dir',str(root/'logs')]+(['--apply'] if apply else [])+(['--offline'] if offline else [])
+   with patch.object(m.sys,'argv',argv),patch.dict(m.os.environ,{'CONDA_EXE':str(base/'bin/conda')}),patch.object(m.os,'geteuid',return_value=123),patch.object(m,'maintenance_gid',return_value=0),patch.object(m,'maintainable',return_value=True),patch.object(m,'choose_source',return_value=root/'source.pem'),patch.object(m,'filtered_bundle',return_value=('PEM',[])),patch.object(m,'atomic_write',side_effect=lambda path,data:pathlib.Path(path).write_text(data)),patch.object(m.subprocess,'run',side_effect=fake),patch.object(m,'public_permissions',return_value=[]),patch('sys.stdout',io.StringIO()):
+    result=m.main()
+   summary=json.loads((root/'logs/summary.json').read_text())[0]
+   return result,summary,calls,installed,json.loads((root/'logs/certificate-status.json').read_text())
+ def test_loaded_old_conda_is_upgraded_before_full_base_solve(self):
+  result,row,calls,installed,cert=self.run_loaded_base()
+  self.assertEqual(result,0,row['issues']);self.assertEqual(row['status'],'updated')
+  installs=[(cmd,env) for cmd,env in calls if 'install' in cmd]
+  self.assertEqual(len(installs),4)
+  self.assertNotIn('--update-all',installs[0][0]);self.assertIn('--dry-run',installs[0][0])
+  self.assertIn('--update-all',installs[2][0]);self.assertIn('--dry-run',installs[2][0])
+  self.assertEqual(installed['conda']['version'],'26.9.4');self.assertEqual(installed['numpy']['version'],'2.0')
+  self.assertEqual(row['conda_bootstrap']['status'],'updated');self.assertEqual(cert['status'],'written')
+  self.assertTrue(any(change['name']=='conda' and change['before']=='24.11.2' for change in row['package_changes']))
+  for cmd,env in installs:
+   self.assertTrue(env['CONDA_SSL_VERIFY'].endswith('/etc/cse-trust/ca-bundle.pem'))
+   self.assertEqual(env['REQUESTS_CA_BUNDLE'],env['CONDA_SSL_VERIFY'])
+   self.assertNotIn('ssl_verify=false',' '.join(cmd).lower())
+   self.assertNotIn('miniforge3',' '.join(cmd));self.assertNotIn('conda init',' '.join(cmd))
+ def test_preview_never_bootstraps_or_contacts_package_channels(self):
+  result,row,calls,installed,cert=self.run_loaded_base(apply=False)
+  self.assertEqual(result,0);self.assertFalse(any('install' in cmd for cmd,env in calls))
+  self.assertEqual(installed['conda']['version'],'24.11.2');self.assertEqual(cert['status'],'planned')
+  self.assertEqual(row['conda_bootstrap']['status'],'would-update')
+ def test_failed_bootstrap_stops_before_full_base_update(self):
+  result,row,calls,installed,cert=self.run_loaded_base(fail_bootstrap=True)
+  self.assertEqual(result,2);self.assertEqual(row['status'],'incomplete')
+  self.assertFalse(any('--update-all' in cmd for cmd,env in calls))
+  self.assertEqual(installed['conda']['version'],'24.11.2');self.assertEqual(cert['status'],'written')
+  self.assertEqual(row['conda_bootstrap']['status'],'incomplete')
+ def test_current_conda_skips_bootstrap(self):
+  result,row,calls,installed,cert=self.run_loaded_base(current=True)
+  self.assertEqual(result,0,row['issues'])
+  self.assertEqual(len([cmd for cmd,env in calls if 'install' in cmd]),2)
+  self.assertEqual(row['conda_bootstrap']['status'],'not-needed')
+ def test_success_output_without_new_installed_conda_cannot_continue(self):
+  result,row,calls,installed,cert=self.run_loaded_base(stale_bootstrap=True)
+  self.assertEqual(result,2);self.assertEqual(row['conda_bootstrap']['status'],'incomplete')
+  self.assertFalse(any('--update-all' in cmd for cmd,env in calls))
+  self.assertIn('did not meet required minimum',' '.join(row['issues']))
+ def test_bootstrap_honors_offline_and_channel_guards(self):
+  result,row,calls,installed,cert=self.run_loaded_base(offline=True)
+  self.assertEqual(result,0,row['issues'])
+  for cmd,env in calls:
+   if 'install' not in cmd:continue
+   self.assertIn('--offline',cmd);self.assertEqual(env['CONDA_OFFLINE'],'true')
+   self.assertIn('--override-channels',cmd);self.assertIn('--strict-channel-priority',cmd)
+   self.assertEqual(env['CONDA_NO_PLUGINS'],'true')
+
 if __name__=='__main__': unittest.main()

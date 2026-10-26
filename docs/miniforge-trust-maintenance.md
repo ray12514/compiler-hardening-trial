@@ -5,6 +5,58 @@ It updates selected shared conda environments and builds a CSE-managed, incident
 CA bundle from your existing site PEM. It leaves the OS and the inspection proxy unchanged.
 No external incident test endpoint is contacted.
 
+## Update Conda in the loaded installation first
+
+Revision 13 keeps the existing Miniforge installation and discovers it from the
+loaded module's `CONDA_EXE` or `conda` on `PATH`. No system name or explicit base
+path is needed. After retrieving the current script, load your normal Miniforge
+module and preview only its base environment:
+
+```bash
+python3 patch_miniforge_trust.py --base-only
+```
+
+Then apply that scope:
+
+```bash
+python3 patch_miniforge_trust.py --base-only --apply
+```
+
+The script detects the currently selected existing CA bundle as before. Use the
+existing `--ca-bundle /path/to/CSE-existing-bundle.pem` option when a particular
+site bundle is required. It reads that source and writes the filtered copy to
+`BASE/etc/cse-trust/ca-bundle.pem`; it does not edit administrator trust files.
+The CSE bundle and verified-TLS environment are prepared before either package
+transaction. Afterward, source the printed `use-ca.sh` path in the current shell.
+
+If installed base Conda is below `26.9.4`, apply first requests `conda>=26.9.4`,
+`ca-certificates>=2026.10.19`, and `certifi>=2026.10.19`. This is a separate
+targeted bootstrap solve/install, without `--update-all`; compatible dependencies
+can change as part of that transaction. The bootstrap uses the same allowed
+channels, source selection, classic solver, exact-plan checks, and `--offline`
+policy as the remaining work. It does not run a Miniforge installer, change its
+Spack version pin, remove the prefix, or replace the distribution.
+
+Only after the installed Conda and CA-package minimums are verified does the
+script run the existing full base update. A failed or unverified bootstrap stops
+that prefix before the full update. A sufficiently new Conda skips the bootstrap.
+Preview stays local-only and reports `would-update` or `not-needed`; it does not
+solve, install, or contact package channels. `--trust-only` continues to perform
+certificate-only work without invoking Conda or updating packages.
+
+Private logs retain `base-conda-bootstrap-plan.json`,
+`base-conda-bootstrap-install.json`, and a separate `conda_bootstrap` result in
+`summary.json`. If the later full update fails, the report distinguishes a
+completed Conda bootstrap from incomplete base-package work. The package-change
+summary compares against the original pre-bootstrap inventory, so the manager
+upgrade remains visible. A Conda package update changes contents of the existing
+base tree; if that tree was installed by Spack, retain these maintenance records
+because its Spack DAG hash does not change with this package transaction.
+
+Other environments are not updated by `--base-only`. The normal existing
+discovery/`--only` workflow remains available for a subsequent separately selected
+environment, and user instructions can be prepared after the base is tested.
+
 ## Retrieve just the script over SSH
 
 Use your usual GitHub SSH key and configuration. This retrieves a shallow Git repository
@@ -41,9 +93,11 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
   > ./patch_miniforge_trust.py
 ```
 
-### Reproduce the full-base-update revision exactly
+### Reproduce the earlier revision 12 exactly
 
 The script was updated at commit `3cfb223ceb8ca59a128523627df0d187a75bc9a0`.
+That historical revision performs the full base update but does not have the
+separate Conda bootstrap above. Use the current `main` retrieval for revision 13.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
@@ -205,7 +259,8 @@ hosting domain or add Anaconda `defaults` in response to the generic conda messa
 
 ## Full updates are permitted in the base environment
 
-Revision 12 treats the Miniforge base as a full conda package-update scope. It no
+Revision 13 first bootstraps an older Conda as described above, then retains
+revision 12's full conda package-update scope for the Miniforge base. It no
 longer rejects changes to `krb5`, NumPy, matplotlib, matplotlib-base, Python or other
 base packages as unrelated. The base solve uses `--update-all` with no script-generated
 version/build pins on application packages. Installed incident-related packages retain
@@ -597,7 +652,8 @@ permission preview counts, read-only legacy-log reporting, structured command-fa
 records, mixed-package review ordering, access-path snapshots, certificate-only
 operations, actual-bundle inspection, exact-prefix scope, channel-source guards, per-environment installed-source discovery,
 source-qualified update specs, malformed/host-only metadata recovery, structured alias/custom-channel config, full-base update policy, mandatory minimum
-verification and
+verification, module-based bootstrap ordering, failed/stale bootstrap guards,
+offline bootstrap policy, preservation of original before/after inventories, and
 simulated preview/offline apply. Actual SUSE/RHEL deployment remains
 a target-system validation task.
 
