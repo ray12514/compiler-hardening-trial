@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 15 (2026-10-27).
+"""CSE Miniforge certificate maintenance, revision 16 (2026-10-27).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -8,6 +8,7 @@ Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --apply --offline     # approved cached packages
   python3 patch_miniforge_trust.py --apply --upgrade-conda
   python3 patch_miniforge_trust.py --report latest        # explain saved logs only
+  python3 patch_miniforge_trust.py --diagnose latest      # dry-run failed solve with conflict details and access checks
   python3 patch_miniforge_trust.py --inspect-trust        # inspect actual CA files
   python3 patch_miniforge_trust.py --base-only            # preview base only
   python3 patch_miniforge_trust.py --only /path/to/env    # preview one prefix
@@ -825,7 +826,7 @@ def failure_category(text):
         return 'Invalid channel URL/name', 'Use the exact Channels selected/used list and channel-records JSON to identify an empty, malformed or obsolete source. The conda-forge URL includes /conda-forge; do not remove its hosting domain.'
     if any(x in value for x in ('packagesnotfound','unsatisfiable','conflict','could not solve',
                                 'no stable conda release','newest available conda')):
-        return 'Package availability/dependencies', 'Check approved conda-forge mirror availability and installed pins/Python compatibility.'
+        return 'Package availability/dependencies', 'Use --diagnose LOG_DIR for a dry-run conflict explanation and current access checks. The strict-priority note alone does not identify a package or establish that permissions caused this failure.'
     if any(x in value for x in ('connectionerror','condahttperror','timed out','name resolution','network is unreachable')):
         return 'Repository/network access', 'Check the approved mirror/proxy route or offline cache availability.'
     if any(x in value for x in ('jsondecodeerror','invalid json','not valid json','no json')):
@@ -853,13 +854,17 @@ def legacy_failure_details(logtext, prefix):
             'phase':'legacy log (inferred command; return code not recorded)'}
 
 
-def report_existing(directory, verbose=False):
+def report_directory(directory):
     if str(directory)=='latest':
         root = Path.home()/'.cse-trust-logs'
         candidates = [p for p in root.iterdir() if p.is_dir() and (p/'summary.json').is_file()]
         if not candidates: raise RuntimeError('No completed summary found under '+str(root))
         directory = max(candidates,key=lambda p:p.name)
-    directory = Path(directory).expanduser().resolve(strict=True)
+    return Path(directory).expanduser().resolve(strict=True)
+
+
+def report_existing(directory, verbose=False):
+    directory = report_directory(directory)
     results = json.loads((directory/'summary.json').read_text())
     logtext = (directory/'run.log').read_text(errors='replace') if (directory/'run.log').is_file() else ''
     print('READ-ONLY REPORT: '+str(directory))
@@ -917,6 +922,130 @@ def report_existing(directory, verbose=False):
     print('updated-with-skips means work completed with access/permission exceptions; it is not a failed package update.')
     print('Legacy diagnostics are best-effort evidence from saved logs, not a new system test.')
     return 0
+
+
+CONFLICT_DIAGNOSTIC = r'''
+import sys
+from conda.resolve import Resolve
+from conda.cli.main import main
+if not sys.argv[1:] or sys.argv[1] != 'install' or '--dry-run' not in sys.argv or '--yes' in sys.argv:
+    raise RuntimeError('Diagnostic process requires an install dry run without --yes')
+original = Resolve.build_conflict_map
+def compatible(self, specs, specs_to_add=None, history_specs=None):
+    return original(self, specs, set(specs_to_add) if specs_to_add is not None else None, history_specs)
+Resolve.build_conflict_map = compatible
+sys.exit(main(*sys.argv[1:]))
+'''
+
+
+def diagnostic_argv(base, prefix, argv, requested):
+    """Rebuild only our install command; saved logs are data, never shell code."""
+    if len(argv)<2 or Path(argv[0]).resolve()!=(base/'bin/conda').resolve() or argv[1]!='install':
+        raise RuntimeError('Saved failure is not an install from the currently selected base')
+    switches={'--json','--offline','--override-channels','--strict-channel-priority',
+              '--update-deps','--update-all','--freeze-installed','--dry-run'}
+    output=['install'];channels=set(requested);specs=[];prefixes=[];i=2
+    while i<len(argv):
+        value=argv[i];i+=1
+        if value=='--yes':continue
+        if value in switches:output.append(value);continue
+        if value in ('-p','--solver','--channel'):
+            if i==len(argv):raise RuntimeError('Incomplete saved command option: '+value)
+            argument=argv[i];i+=1
+            if value=='-p':prefixes.append(Path(argument).resolve())
+            elif value=='--solver' and argument!='classic':raise RuntimeError('Diagnostic supports the classic solver only')
+            elif value=='--channel':
+                if invalid_channel_reason(argument) or forbidden_channel(argument):raise RuntimeError('Invalid diagnostic channel')
+                channels.add(argument)
+            output.extend((value,argument));continue
+        if value.startswith('-') or any(c in value for c in '\n\r\x00') or not re.fullmatch(r'(?:.+::)?[\w][\w.-]*(?:[<>=!~].*)?',value):
+            raise RuntimeError('Unsupported saved install argument: '+repr(value))
+        specs.append(value);output.append(value)
+    if prefixes!=[prefix.resolve()] or '--override-channels' not in output or '--strict-channel-priority' not in output:
+        raise RuntimeError('Saved command lacks the expected exact prefix and channel policy')
+    for spec in specs:
+        if '::' in spec:
+            origin=spec.rsplit('::',1)[0]
+            if origin not in channels or forbidden_channel(origin):raise RuntimeError('Diagnostic package source outside saved channels')
+    if not specs:raise RuntimeError('Saved command has no package specifications')
+    if '--dry-run' not in output:output.append('--dry-run')
+    if '--json' not in output:output.append('--json')
+    return output
+
+
+def diagnose_existing(directory, base, offline=False):
+    directory=report_directory(directory)
+    rows=json.loads((directory/'summary.json').read_text())
+    selected=None
+    for row in reversed(rows):
+        for event in reversed(row.get('command_failures',[])):
+            filename=event.get('file','')
+            if not re.fullmatch(r'failed-command-\d+\.json',filename):continue
+            path=(directory/filename).resolve()
+            if path.parent!=directory:raise RuntimeError('Failure record points outside the log directory')
+            record=json.loads(path.read_text());argv=record.get('argv',[])
+            if len(argv)>1 and argv[1]=='install':selected=(row,record);break
+        if selected:break
+    if not selected:raise RuntimeError('No saved install failure to diagnose; use --report for access/configuration failures')
+    row,record=selected;prefix=Path(row['prefix']).resolve()
+    if any(p==directory or p in directory.parents for p in (base,prefix)):
+        raise RuntimeError('Diagnostic logs must be outside the managed prefix trees')
+    argv=diagnostic_argv(base,prefix,record['argv'],row.get('requested_channels',[]))
+    if offline and '--offline' not in argv:argv.append('--offline')
+    print('DIAGNOSTIC DRY RUN: '+str(prefix),flush=True)
+    print('Detailed hints enabled with a process-local tuple compatibility fix; installed Conda files are not patched.',flush=True)
+    print('No package transaction, CA/configuration update, chmod or chgrp will run. Conda may refresh its repodata cache.',flush=True)
+    print('Current UID/groups: %s / %s'%(os.geteuid(),sorted(groups())))
+    try:print('cse membership confirmed; GID '+str(maintenance_gid()))
+    except RuntimeError as exc:print('cse access note: '+str(exc))
+    env=safe_environment()
+    try:
+        info=json.loads(capture([base/'bin/python','-I','-B','-m','conda','info','--json'],env))
+        caches=[Path(p) for p in info.get('pkgs_dirs',[])]
+    except (RuntimeError,ValueError) as exc:
+        caches=[base/'pkgs'];print('Package-cache discovery failed: '+str(exc))
+    for path in dict.fromkeys([base,prefix,prefix/'conda-meta',prefix/'.condarc']+caches):
+        print_access(access_snapshot(path),print)
+    print('Group write/traverse access can permit package replacement without file ownership; chmod/chgrp of foreign-owned files still needs the owner/admin.',flush=True)
+    env.update(CONDA_UNSATISFIABLE_HINTS='true',CONDA_DRY_RUN='true',PYTHONDONTWRITEBYTECODE='1',
+               CONDA_OFFLINE='true' if '--offline' in argv else 'false')
+    bundle=base/'etc/cse-trust/ca-bundle.pem';empty=base/'etc/cse-trust/empty-ca-dir'
+    if not bundle.is_file() or not empty.is_dir():
+        raise RuntimeError('The managed CA bundle/empty CA directory used by apply is unavailable; inspect trust before diagnosing package access')
+    for key in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','CURL_CA_BUNDLE','PIP_CERT'):env[key]=str(bundle)
+    if any(empty.iterdir()):raise RuntimeError('Expected dedicated empty CA directory')
+    env['SSL_CERT_DIR']=str(empty)
+    command=[str(base/'bin/python'),'-I','-B','-c',CONFLICT_DIAGNOSTIC]+argv
+    finished=threading.Event();started=time.monotonic()
+    def progress():
+        while not finished.wait(30):print('Still diagnosing dependencies (%ds elapsed)'%(time.monotonic()-started),flush=True)
+    heartbeat=threading.Thread(target=progress,daemon=True);heartbeat.start()
+    print('Running the saved request with the same pins and strict channel priority; diagnostic limit 120 seconds.',flush=True)
+    try:
+        result=subprocess.run(command,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=120)
+        stdout,stderr,code=result.stdout,result.stderr,result.returncode
+    except subprocess.TimeoutExpired as exc:
+        def decoded(value):return value.decode(errors='replace') if isinstance(value,bytes) else (value or '')
+        stdout,stderr,code=decoded(exc.stdout),decoded(exc.stderr)+'\nConflict diagnostics timed out after 120 seconds.',None
+    except OSError as exc:
+        stdout,stderr,code='',type(exc).__name__+': '+str(exc),None
+    finally:finished.set();heartbeat.join()
+    report=directory/('solver-diagnostic-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')+'.json')
+    payload={'argv':[str(base/'bin/conda')]+argv,'phase':record.get('phase'),'returncode':code,
+             'stdout':stdout,'stderr':stderr,'prefix_access':access_snapshot(prefix),'dry_run':True}
+    fd=os.open(str(report),os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+    with os.fdopen(fd,'w') as stream:json.dump(payload,stream,indent=2)
+    try:
+        data=json.loads(stdout)
+        if not isinstance(data,dict):raise ValueError('Expected JSON object')
+        message=data.get('message') or diagnostic_text(stdout,stderr)
+    except ValueError:
+        data={};message=diagnostic_text(stdout,stderr)
+    print(str(message)[:16000],flush=True)
+    print('Full diagnostic: '+str(report),flush=True)
+    solved=code==0 and data.get('success') is True
+    print('Result: '+('dry-run plan solved; no upgrade installed' if solved else 'solve/access failure; no package transaction attempted'))
+    return 0 if solved else 2
 
 
 def access_snapshot(path):
@@ -1215,6 +1344,7 @@ def main():
     scope.add_argument('--all-envs',action='store_true',help='Opt into discovery and maintenance of all eligible environments; default is base only')
     ap.add_argument('--channel',action='append',default=[],help='Additional approved community channel or mirror; repeatable; Anaconda defaults excluded')
     ap.add_argument('--report',type=Path,metavar='LOG_DIR_OR_latest',help='Read an existing summary/run.log and explain failures; no updates, group checks or network')
+    ap.add_argument('--diagnose',type=Path,metavar='LOG_DIR_OR_latest',help='Repeat the saved failed solve as a dry run with detailed conflicts and access checks; may refresh repodata')
     ap.add_argument('--verbose',action='store_true',help='Show per-path permission details and subprocess commands; full details are always logged')
     ap.add_argument('--offline', action='store_true',help='Apply using cache/file channels; never retrieve online')
     ap.add_argument('--upgrade-conda',action='store_true',help='Also upgrade conda in non-base prefixes; base updates conda automatically')
@@ -1228,6 +1358,10 @@ def main():
     args = ap.parse_args()
     if (args.include or args.scan_root) and not args.all_envs:
         ap.error('--include and --scan-root require --all-envs; use --only for exact prefixes')
+    if args.diagnose:
+        if args.apply or args.report or args.inspect_trust or args.trust_only:
+            ap.error('--diagnose cannot be combined with apply/report/trust modes')
+        return diagnose_existing(args.diagnose,find_base(args.miniforge,safe_environment()),args.offline)
     if args.report:
         if args.apply or args.inspect_trust or args.trust_only: ap.error('--report cannot be combined with apply/trust modes')
         return report_existing(args.report,args.verbose)

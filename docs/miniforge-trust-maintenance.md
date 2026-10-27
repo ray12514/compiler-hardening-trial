@@ -7,7 +7,7 @@ No external incident test endpoint is contacted.
 
 ## Update Conda in the loaded installation first
 
-Revision 15 keeps the existing Miniforge installation and discovers it from the
+Revision 16 keeps the existing Miniforge installation and discovers it from the
 loaded module's `CONDA_EXE` or `conda` on `PATH`. No system name or explicit base
 path is needed. The default scope is now **the loaded base only**. Discovery and
 updates of other environments require `--all-envs`; `--only PATH` selects exact
@@ -104,6 +104,64 @@ to see whether it occurred during bootstrap or the subsequent full base update.
 After bypassing the crash, review any remaining dependency failure and explicit
 site pins using the saved command output; do not remove pins merely to hide it.
 
+### A generic `UnsatisfiableError` gives no conflicting package names
+
+The note that strict priority "may have removed packages required for
+satisfiability" is generic. It does not identify a conflicting package or prove
+that channel priority caused this failure. Revision 15 deliberately disabled
+conflict hints to bypass the upstream TypeError, so changing the global Conda
+setting or exporting `CONDA_UNSATISFIABLE_HINTS=true` did not enable them inside
+the maintenance script.
+
+Revision 16 adds a diagnostic for the saved failed package request. With the same
+Miniforge module loaded, run:
+
+```bash
+python3 patch_miniforge_trust.py --diagnose latest
+```
+
+Or replace `latest` with the apply run's exact private log directory. Use the
+positional Miniforge path when no module is loaded. This mode:
+
+- Validates the saved install command against the selected base and prefix,
+  removes `--yes`, and forces `--dry-run` both in arguments and environment.
+- Keeps the saved strict channel policy, explicit pins and package requests.
+- Enables detailed hints in a separate Python process, with the tuple converted
+  to the set expected by Conda's conflict reporter. Installed Conda files are not
+  edited; the compatibility adjustment exists only in that diagnostic process.
+- Prints your UID/groups and effective access to the base, target prefix,
+  `conda-meta`, `.condarc` and the package caches reported by Conda.
+- Saves the complete explanation to a private `solver-diagnostic-*.json` file in
+  the existing log directory. No package transaction, trust/configuration update,
+  chmod or chgrp runs. Conda may refresh its repodata cache.
+
+The diagnostic has a 120-second limit and prints progress every 30 seconds.
+Exit 2 means the solve/access failure remains or diagnostics timed out; it is not
+a failed installation attempt. Exit 0 means only that the dry-run plan now solves.
+Add `--offline` to use cached/file-channel metadata only. `--diagnose` cannot be
+combined with `--apply` or the other report/trust modes. A saved preview has no
+failed package command; select the actual failed apply run in that case.
+
+Read the named conflict chains rather than assuming every listed package must
+be upgraded independently. No automatic pin removal or relaxed-priority retry
+is performed.
+
+### Shared group access versus owning the files
+
+You do not need to own every installed file to perform a group-maintainable
+package transaction. Membership in `cse`, effective group/ACL write and traversal
+access to the affected directories, writable package metadata and usable caches
+can permit it. ACLs, sticky directories, file modes and mount policy can still
+block particular operations. The script's initial base/prefix checks do not prove
+that every later file write will succeed.
+
+Changing modes or groups on a foreign-owned file is a separate owner/admin
+operation. Permission normalization reports those paths as skips rather than
+attempting to take ownership. An `UnsatisfiableError` alone is not evidence of an
+ownership failure; look for a named denied/not-writable path and its access
+snapshot. Neither recursive ownership changes nor running the whole maintenance
+script as root is needed merely to investigate the solver message.
+
 Private logs retain `base-conda-bootstrap-search.json`, `base-conda-bootstrap-plan.json`,
 `base-conda-bootstrap-install.json`, and a separate `conda_bootstrap` result in
 `summary.json`. If the later full update fails, the report distinguishes a
@@ -157,7 +215,7 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
 
 The script was updated at commit `3cfb223ceb8ca59a128523627df0d187a75bc9a0`.
 That historical revision performs the full base update but does not have the
-separate Conda bootstrap above. Use the current `main` retrieval for revision 15.
+separate Conda bootstrap above. Use the current `main` retrieval for revision 16.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
@@ -319,7 +377,7 @@ hosting domain or add Anaconda `defaults` in response to the generic conda messa
 
 ## Full updates are permitted in the base environment
 
-Revision 15 first checks/bootstraps Conda as described above, then retains
+Revision 16 first checks/bootstraps Conda as described above, then retains
 revision 12's full conda package-update scope for the Miniforge base. It no
 longer rejects changes to `krb5`, NumPy, matplotlib, matplotlib-base, Python or other
 base packages as unrelated. The base solve uses `--update-all` with no script-generated
