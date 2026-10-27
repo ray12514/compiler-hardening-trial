@@ -61,7 +61,7 @@ class DiagnosticTests(unittest.TestCase):
     self.assertEqual(m.diagnose_existing(logs,base,True),2)
    command=run.call_args.args[0];env=run.call_args.kwargs['env']
    self.assertIn('--dry-run',command);self.assertNotIn('--yes',command);self.assertIn('-B',command)
-   self.assertEqual(env['CONDA_DRY_RUN'],'true');self.assertEqual(env['CONDA_UNSATISFIABLE_HINTS'],'true')
+   self.assertEqual(env['CONDA_DRY_RUN'],'true');self.assertEqual(env['CONDA_UNSATISFIABLE_HINTS'],'false')
    self.assertEqual(env['CONDA_SSL_VERIFY'],str(base/'etc/cse-trust/ca-bundle.pem'))
    self.assertEqual(marker.read_text(),'unchanged');write.assert_not_called();permissions.assert_not_called()
    reports=list(logs.glob('solver-diagnostic-*.json'));self.assertEqual(len(reports),1)
@@ -126,6 +126,21 @@ else:
   result=subprocess.run([os.environ['CSE_CONDA_PYTHON'],'-I','-c',probe],env=env,text=True,
                         stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True,timeout=30)
   self.assertEqual(json.loads(result.stdout)['exception'],'UnsatisfiableError',result.stdout+result.stderr)
+
+class LibmambaRuntimeTests(unittest.TestCase):
+ def test_only_install_and_probe_commands_use_the_restricted_runtime(self):
+  base=pathlib.Path('/test/base')
+  command=[base/'bin/conda','install','-p',base,'--solver','libmamba','--json','--dry-run']
+  wrapped=m.solver_invocation(base,command)
+  self.assertEqual(wrapped[:5],[str(base/'bin/python'),'-I','-B','-c',m.LIBMAMBA_CLI])
+  self.assertEqual(wrapped[5:],list(map(str,command[1:])))
+  self.assertEqual(m.solver_invocation(base,[base/'bin/conda','info','--json']),[str(base/'bin/conda'),'info','--json'])
+ @unittest.skipUnless(os.environ.get('CSE_CONDA_PYTHON'),'Set CSE_CONDA_PYTHON to test the installed solver allowlist')
+ def test_real_runtime_loads_only_the_explicit_solver_hook(self):
+  result=subprocess.run([os.environ['CSE_CONDA_PYTHON'],'-I','-B','-c',m.LIBMAMBA_CLI,'__cse_solver_probe__'],
+                        env=m.safe_environment(),text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True,timeout=30)
+  data=json.loads(result.stdout);self.assertEqual(data['solver'],'libmamba')
+  self.assertEqual(data['external_plugins'],['cse-libmamba-solver-only'])
 
 class ChannelRegressionTests(unittest.TestCase):
  def test_host_only_installed_origin_ignored(self):
@@ -211,7 +226,8 @@ class ChannelFlowTests(unittest.TestCase):
     metadata=base/'conda-meta/ca.json';metadata.write_text(json.dumps(record));calls=[]
     def fake(cmd,**kw):
      calls.append(cmd)
-     if '--show' in cmd:result={'channel_alias':{'auth':None,'location':'conda.anaconda.org','name':'','package_filename':None,'platform':None,'scheme':'https','token':None},'custom_channels':{'conda-forge':{'auth':None,'location':'conda.anaconda.org','name':'conda-forge','platform':None,'scheme':'https','token':None}}}
+     if '__cse_solver_probe__' in cmd:result={'success':True,'solver':'libmamba'}
+     elif '--show' in cmd:result={'channel_alias':{'auth':None,'location':'conda.anaconda.org','name':'','package_filename':None,'platform':None,'scheme':'https','token':None},'custom_channels':{'conda-forge':{'auth':None,'location':'conda.anaconda.org','name':'conda-forge','platform':None,'scheme':'https','token':None}}}
      elif '--dry-run' in cmd:result={'success':True,'actions':{'LINK':[{'name':'ca-certificates','version':'2026.10.19','build':'0','channel':'conda-forge'}]}}
      elif 'install' in cmd:record['version']='2026.10.19';metadata.write_text(json.dumps(record));result={'success':True}
      elif '--explicit' in cmd:return subprocess.CompletedProcess(cmd,0,'@EXPLICIT\n','')
@@ -261,7 +277,8 @@ class BaseUpdatePolicyTests(unittest.TestCase):
    links=[{'name':'ca-certificates','version':m.MINIMUM['ca-certificates'],'build':'0'}]+[{'name':n,'version':'2.0','build':'0'} for n in ('numpy','matplotlib','matplotlib-base','krb5')]
    def fake(cmd,**kw):
     calls.append(cmd)
-    if '--show' in cmd:out={}
+    if '__cse_solver_probe__' in cmd:out={'success':True,'solver':'libmamba'}
+    elif '--show' in cmd:out={}
     elif '--dry-run' in cmd:out={'success':True,'actions':{'LINK':links}}
     elif 'install' in cmd:
      for r in links:
@@ -282,191 +299,129 @@ class BaseUpdatePolicyTests(unittest.TestCase):
   result,row,commands=self.run_update(True,stale=True)
   self.assertEqual(result,2);self.assertEqual(row['status'],'incomplete');self.assertIn('below required minimum',' '.join(row['issues']))
 
-class CondaBootstrapTests(unittest.TestCase):
- def test_bootstrap_relaxes_installer_history_for_runtime_dependency_closure(self):
-  meta={'conda':{'depends':['requests >=2','python >=3.11']},
-        'python':{'depends':['libgcc >=15']},'requests':{'depends':['urllib3 >=2']},
-        'urllib3':{'depends':[]},'libgcc':{'depends':['libgomp >=15']},
-        'libgomp':{'depends':['libgcc >=15']},'numpy':{'depends':['python >=3.11']}}
-  self.assertEqual(m.bootstrap_dependencies(meta),set(meta)-{'numpy'})
- def run_loaded_base(self,apply=True,current=False,fail_bootstrap=False,offline=False,stale_bootstrap=False,
-                     available=None,default_scope=False,all_envs=False,only=False,downgrade_full=False,manager_stack=False,
-                     stale_plan=False,dry_run_install=False):
+class BaseTransactionTests(unittest.TestCase):
+ def run_loaded_base(self,apply=True,current=False,fail_install=False,offline=False,stale_install=False,
+                     available=None,default_scope=False,all_envs=False,only=False,stale_plan=False,
+                     manager_stack=False,dry_run_install=False,missing_solver=False):
   with tempfile.TemporaryDirectory() as directory:
    root=pathlib.Path(directory);base=root/'loaded-miniforge'
    (base/'bin').mkdir(parents=True);(base/'bin/conda').touch()
    (base/'conda-meta').mkdir();(base/'conda-meta/history').touch()
    other=base/'envs/untouched';(other/'conda-meta').mkdir(parents=True)
-   (other/'conda-meta/history').write_text('unchanged')
-   (other/'.condarc').write_text('ssl_verify: /site/other.pem\n')
+   (other/'conda-meta/history').write_text('unchanged');(other/'.condarc').write_text('ssl_verify: /site/other.pem\n')
    (other/'ssl').mkdir();(other/'ssl/cert.pem').write_text('original PEM')
    original_other={str(p.relative_to(other)):p.read_bytes() for p in other.rglob('*') if p.is_file()}
    available=['26.9.4'] if available is None else available
    latest=max([v for v in available if v.replace('.','').isdigit()] or ['0'],key=m.version)
-   minimums={'conda':latest,'ca-certificates':m.MINIMUM['ca-certificates'],'certifi':m.MINIMUM['certifi']}
    installed={n:{'name':n,'version':v,'build':'0','channel':'conda-forge'} for n,v in
-              [('conda',current if isinstance(current,str) else '26.9.4' if current else '24.11.2'),('ca-certificates','2025.1.31'),('certifi','2025.1.31'),('numpy','1.0')]}
+              [('conda',current if isinstance(current,str) else '26.9.4' if current else '24.11.2'),('ca-certificates','2024.12.14'),('certifi','2024.12.14'),('numpy','1.0')]}
+   updates={'conda':max((installed['conda']['version'],latest),key=m.version),
+            'ca-certificates':m.MINIMUM['ca-certificates'],'certifi':m.MINIMUM['certifi'],'numpy':'2.0'}
    if manager_stack:
     for name in ('mamba','libmamba','libmambapy','conda-libmamba-solver'):
-     installed[name]={'name':name,'version':'1.5.12','build':'0','channel':'conda-forge'}
-     minimums[name]='2.5.0'
-    installed['python']={'name':'python','version':'3.12.9','build':'0','channel':'conda-forge'}
-    minimums['python']='3.14.0'
+     installed[name]={'name':name,'version':'1.5.12','build':'0','channel':'conda-forge'};updates[name]='2.5.0'
+    for name,value in [('python','3.12.8'),('jupyter_core','5.7.2'),('libboost-python','1.85.0')]:
+     installed[name]={'name':name,'version':value,'build':'old','channel':'conda-forge'}
+     updates[name]={'python':'3.14.0','jupyter_core':'5.9.1','libboost-python':'1.88.0'}[name]
    def save():
     for name,record in installed.items():(base/'conda-meta'/(name+'.json')).write_text(json.dumps(record))
    save();calls=[]
    def fake(cmd,**kwargs):
     cmd=list(map(str,cmd));calls.append((cmd,dict(kwargs.get('env',{}))))
     if cmd[1:]==['info','--base']:return subprocess.CompletedProcess(cmd,0,str(base)+'\n','')
-    if '--show' in cmd:output={}
+    if '__cse_solver_probe__' in cmd:output={'success':True,'solver':'classic' if missing_solver else 'libmamba'}
+    elif '--show' in cmd:output={}
     elif 'search' in cmd:output={'conda':[{'name':'conda','version':v,'channel':'conda-forge','build':'0'} for v in available]}
-    elif '-c' in cmd:output={'python':[3,12,9],'packages':{},'bundles':{}}
     elif '--explicit' in cmd:return subprocess.CompletedProcess(cmd,0,'@EXPLICIT\n','')
     elif 'install' in cmd:
-     is_old=m.version(installed['conda']['version'])<m.version('26.9.4')
-     if '--update-all' in cmd and is_old:
-      return subprocess.CompletedProcess(cmd,1,'','Conda must be updated before solving the base package update')
      if '--dry-run' in cmd:
-      links=[dict(installed[n],version=v) for n,v in minimums.items()]
-      if m.version(installed['conda']['version'])>m.version(latest):links[0]['version']=installed['conda']['version']
+      links=[dict(installed[n],version=v) for n,v in updates.items()]
       if stale_plan:links[0]['version']=installed['conda']['version']
-      if '--update-all' in cmd and downgrade_full:links[0]['version']=m.CONDA_MINIMUM
-      if '--update-all' in cmd:links.append(dict(installed['numpy'],version='2.0'))
       output={'success':True,'actions':{'LINK':links}}
      else:
       if dry_run_install:return subprocess.CompletedProcess(cmd,0,json.dumps({'success':True,'dry_run':True}),'')
-      if is_old and fail_bootstrap:return subprocess.CompletedProcess(cmd,1,'','Conda bootstrap installation failed')
-      for name,value in minimums.items():
-       if name=='conda' and m.version(installed[name]['version'])>m.version(value):continue
-       if not (is_old and stale_bootstrap):installed[name]['version']=value
-      if any('numpy=2.0=' in value for value in cmd):installed['numpy']['version']='2.0'
+      if fail_install:return subprocess.CompletedProcess(cmd,1,'','Package installation failed')
+      if not stale_install:
+       for name,value in updates.items():installed[name]['version']=value
       save();output={'success':True}
+    elif '-c' in cmd:output={'python':[3,14,0],'packages':{},'bundles':{}}
     else:output={'success':True}
     return subprocess.CompletedProcess(cmd,0,json.dumps(output),'')
    scope=[] if default_scope else ['--all-envs'] if all_envs else ['--only',str(other)] if only else ['--base-only']
    argv=['patch_miniforge_trust.py']+scope+['--log-dir',str(root/'logs')]+(['--apply'] if apply else [])+(['--offline'] if offline else [])
-   with patch.object(m.sys,'argv',argv),patch.dict(m.os.environ,{'CONDA_EXE':str(base/'bin/conda')}),patch.object(m.os,'geteuid',return_value=123),patch.object(m,'maintenance_gid',return_value=0),patch.object(m,'maintainable',return_value=True),patch.object(m,'choose_source',return_value=root/'source.pem'),patch.object(m,'filtered_bundle',return_value=('PEM',[])),patch.object(m,'atomic_write',side_effect=lambda path,data:pathlib.Path(path).write_text(data)),patch.object(m.subprocess,'run',side_effect=fake),patch.object(m,'public_permissions',return_value=[]),patch('sys.stdout',io.StringIO()):
-    result=m.main()
+   with patch.object(m.sys,'argv',argv),patch.dict(m.os.environ,{'CONDA_EXE':str(base/'bin/conda')}),patch.object(m.os,'geteuid',return_value=123),patch.object(m,'maintenance_gid',return_value=0),patch.object(m,'maintainable',return_value=True),patch.object(m,'choose_source',return_value=root/'source.pem'),patch.object(m,'filtered_bundle',return_value=('PEM',[])),patch.object(m,'atomic_write',side_effect=lambda path,data:pathlib.Path(path).write_text(data)),patch.object(m.subprocess,'run',side_effect=fake),patch.object(m,'public_permissions',return_value=[]),patch('sys.stdout',io.StringIO()):result=m.main()
    rows=json.loads((root/'logs/summary.json').read_text())
    self.assertEqual([r['prefix'] for r in rows],[str(other)] if only else [str(base),str(other)] if all_envs else [str(base)])
    if not all_envs and not only:
     self.assertFalse(any(str(other) in cmd for cmd,env in calls))
     self.assertEqual(original_other,{str(p.relative_to(other)):p.read_bytes() for p in other.rglob('*') if p.is_file()})
-   summary=rows[0]
-   return result,summary,calls,installed,json.loads((root/'logs/certificate-status.json').read_text())
- def test_loaded_old_conda_is_upgraded_before_full_base_solve(self):
-  result,row,calls,installed,cert=self.run_loaded_base()
+   return result,rows[0],calls,installed
+ def test_old_conda_and_base_update_in_one_transaction(self):
+  result,row,calls,installed=self.run_loaded_base(manager_stack=True)
   self.assertEqual(result,0,row['issues']);self.assertEqual(row['status'],'updated')
-  installs=[(cmd,env) for cmd,env in calls if 'install' in cmd]
-  self.assertEqual(len(installs),4)
-  self.assertNotIn('--update-all',installs[0][0]);self.assertIn('--dry-run',installs[0][0])
-  self.assertIn('--update-all',installs[2][0]);self.assertIn('--dry-run',installs[2][0])
+  installs=[cmd for cmd,env in calls if 'install' in cmd]
+  self.assertEqual(len(installs),2);self.assertIn('--dry-run',installs[0]);self.assertIn('--update-all',installs[0])
+  self.assertIn('libmamba',installs[0]);self.assertNotIn('--update-deps',installs[0])
+  for name in ('python','jupyter_core','libboost-python','mamba'):
+   self.assertIn(name,installs[0]);self.assertFalse(any('::'+name in value for value in installs[0]))
   self.assertEqual(installed['conda']['version'],'26.9.4');self.assertEqual(installed['numpy']['version'],'2.0')
-  self.assertEqual(row['conda_bootstrap']['status'],'updated');self.assertEqual(cert['status'],'written')
-  self.assertTrue(any(change['name']=='conda' and change['before']=='24.11.2' for change in row['package_changes']))
-  for cmd,env in installs:
-   self.assertTrue(env['CONDA_SSL_VERIFY'].endswith('/etc/cse-trust/ca-bundle.pem'))
-   self.assertEqual(env['REQUESTS_CA_BUNDLE'],env['CONDA_SSL_VERIFY'])
-   self.assertEqual(env['CONDA_DRY_RUN'],'false')
-   self.assertEqual(env['CONDA_UNSATISFIABLE_HINTS'],'false')
-   self.assertNotIn('ssl_verify=false',' '.join(cmd).lower())
-   self.assertNotIn('miniforge3',' '.join(cmd));self.assertNotIn('conda init',' '.join(cmd))
- def test_preview_never_bootstraps_or_contacts_package_channels(self):
-  result,row,calls,installed,cert=self.run_loaded_base(apply=False)
-  self.assertEqual(result,0);self.assertFalse(any('install' in cmd for cmd,env in calls))
-  self.assertEqual(installed['conda']['version'],'24.11.2');self.assertEqual(cert['status'],'planned')
-  self.assertEqual(row['conda_bootstrap']['status'],'would-update')
- def test_preview_at_minimum_still_explains_newest_check(self):
-  result,row,calls,installed,cert=self.run_loaded_base(apply=False,current=True)
+  self.assertEqual(row['conda_update']['status'],'updated');self.assertNotIn('conda_bootstrap',row)
+ def test_preview_is_local_and_does_not_load_solver_or_search(self):
+  result,row,calls,installed=self.run_loaded_base(apply=False)
   self.assertEqual(result,0)
-  self.assertEqual(row['conda_bootstrap']['status'],'would-check-newest')
-  self.assertFalse(any('search' in cmd or 'install' in cmd for cmd,env in calls))
- def test_failed_bootstrap_stops_before_full_base_update(self):
-  result,row,calls,installed,cert=self.run_loaded_base(fail_bootstrap=True)
-  self.assertEqual(result,2);self.assertEqual(row['status'],'incomplete')
-  self.assertFalse(any('--update-all' in cmd for cmd,env in calls))
-  self.assertEqual(installed['conda']['version'],'24.11.2');self.assertEqual(cert['status'],'written')
-  self.assertEqual(row['conda_bootstrap']['status'],'incomplete')
- def test_current_conda_skips_bootstrap(self):
-  result,row,calls,installed,cert=self.run_loaded_base(current=True)
-  self.assertEqual(result,0,row['issues'])
-  self.assertEqual(len([cmd for cmd,env in calls if 'install' in cmd]),2)
-  self.assertEqual(row['conda_bootstrap']['status'],'not-needed')
- def test_success_output_without_new_installed_conda_cannot_continue(self):
-  result,row,calls,installed,cert=self.run_loaded_base(stale_bootstrap=True)
-  self.assertEqual(result,2);self.assertEqual(row['conda_bootstrap']['status'],'incomplete')
-  self.assertFalse(any('--update-all' in cmd for cmd,env in calls))
-  self.assertIn('did not meet required minimum',' '.join(row['issues']))
-  self.assertIn('in installed: conda=24.11.2',' '.join(row['issues']))
-  self.assertEqual(row['conda_bootstrap']['plan_conda_version'],'26.9.4')
-  self.assertEqual(row['conda_bootstrap']['installed_conda_version'],'24.11.2')
- def test_stale_plan_explains_no_install_attempted(self):
-  result,row,calls,installed,cert=self.run_loaded_base(stale_plan=True)
-  self.assertEqual(result,2);self.assertFalse(any('--yes' in cmd for cmd,env in calls))
-  self.assertIn('in plan: conda=24.11.2',' '.join(row['issues']))
-  self.assertIn('No bootstrap install was attempted',' '.join(row['issues']))
- def test_unexpected_install_dry_run_reports_actual_cause(self):
-  result,row,calls,installed,cert=self.run_loaded_base(dry_run_install=True)
-  self.assertEqual(result,2);self.assertEqual(installed['conda']['version'],'24.11.2')
-  self.assertIn('dry-run result for an install command',' '.join(row['issues']))
-  self.assertFalse(any('--update-all' in cmd for cmd,env in calls))
- def test_inherited_dry_run_does_not_negate_apply(self):
-  with patch.dict(m.os.environ,{'CONDA_DRY_RUN':'true'}):
-   self.assertEqual(m.safe_environment()['CONDA_DRY_RUN'],'false')
- def test_bootstrap_honors_offline_and_channel_guards(self):
-  result,row,calls,installed,cert=self.run_loaded_base(offline=True)
-  self.assertEqual(result,0,row['issues'])
-  for cmd,env in calls:
-   if 'search' in cmd:
-    self.assertIn('--offline',cmd);self.assertIn('--override-channels',cmd)
-    self.assertNotIn('--strict-channel-priority',cmd)
-   if 'install' not in cmd:continue
-   self.assertIn('--offline',cmd);self.assertEqual(env['CONDA_OFFLINE'],'true')
-   self.assertIn('--override-channels',cmd);self.assertIn('--strict-channel-priority',cmd)
-   self.assertEqual(env['CONDA_NO_PLUGINS'],'true')
- def test_security_minimum_does_not_skip_newest_conda(self):
-  result,row,calls,installed,cert=self.run_loaded_base(current=True,available=['26.9.4','26.11.0','27.0.0rc1'])
+  self.assertFalse(any('install' in cmd or 'search' in cmd or '__cse_solver_probe__' in cmd for cmd,env in calls))
+ def test_already_current_conda_still_updates_base(self):
+  result,row,calls,installed=self.run_loaded_base(current=True)
+  self.assertEqual(result,0,row['issues']);self.assertEqual(len([c for c,e in calls if 'install' in c]),2)
+  self.assertEqual(installed['numpy']['version'],'2.0')
+ def test_latest_available_conda_is_requested_and_cannot_be_downgraded(self):
+  result,row,calls,installed=self.run_loaded_base(current=True,available=['26.9.4','26.11.0','27.0.0rc1'])
   self.assertEqual(result,0,row['issues']);self.assertEqual(installed['conda']['version'],'26.11.0')
-  self.assertEqual(row['conda_bootstrap']['latest_available'],'26.11.0')
-  solves=[cmd for cmd,env in calls if 'install' in cmd and '--dry-run' in cmd]
-  self.assertIn('https://conda.anaconda.org/conda-forge::conda==26.11.0',solves[0])
-  self.assertIn('https://conda.anaconda.org/conda-forge::conda>=26.11.0',solves[1])
- def test_full_solve_cannot_undo_latest_bootstrap(self):
-  result,row,calls,installed,cert=self.run_loaded_base(available=['26.11.0'],downgrade_full=True)
-  self.assertEqual(result,2);self.assertEqual(row['conda_bootstrap']['status'],'updated')
-  self.assertEqual(len([cmd for cmd,env in calls if 'install' in cmd and '--yes' in cmd]),1)
- def test_missing_or_stale_available_release_fails_before_install(self):
+  solve=next(c for c,e in calls if 'install' in c);self.assertIn('conda>=26.11.0',solve)
+ def test_newer_installed_conda_is_retained(self):
+  result,row,calls,installed=self.run_loaded_base(current='26.11.0',available=['26.9.4'])
+  self.assertEqual(result,0,row['issues']);self.assertEqual(installed['conda']['version'],'26.11.0')
+ def test_stale_plan_is_rejected_before_install(self):
+  result,row,calls,installed=self.run_loaded_base(stale_plan=True)
+  self.assertEqual(result,2);self.assertFalse(any('--yes' in c for c,e in calls))
+  self.assertIn('conda=24.11.2',' '.join(row['issues']))
+ def test_stale_installed_records_cannot_report_success(self):
+  result,row,calls,installed=self.run_loaded_base(stale_install=True)
+  self.assertEqual(result,2);self.assertEqual(row['conda_update']['status'],'incomplete')
+  self.assertIn('below required minimum',' '.join(row['issues']))
+ def test_install_error_is_reported_without_more_transactions(self):
+  result,row,calls,installed=self.run_loaded_base(fail_install=True)
+  self.assertEqual(result,2);self.assertEqual(installed['conda']['version'],'24.11.2')
+  self.assertEqual(len([c for c,e in calls if 'install' in c]),2)
+ def test_unexpected_dry_run_result_is_rejected(self):
+  result,row,calls,installed=self.run_loaded_base(dry_run_install=True)
+  self.assertEqual(result,2);self.assertIn('dry-run result for an install command',' '.join(row['issues']))
+ def test_missing_solver_fails_before_search_or_install(self):
+  result,row,calls,installed=self.run_loaded_base(missing_solver=True)
+  self.assertEqual(result,2);self.assertFalse(any('install' in c or 'search' in c for c,e in calls))
+  self.assertIn('libmamba',' '.join(row['issues']))
+ def test_missing_or_stale_metadata_fails_before_install(self):
   for available in ([],['24.11.2'],['27.0.0rc1']):
    with self.subTest(available=available):
-    result,row,calls,installed,cert=self.run_loaded_base(available=available,offline=True)
-    self.assertEqual(result,2);self.assertFalse(any('install' in cmd for cmd,env in calls))
-    self.assertEqual(row['conda_bootstrap']['status'],'incomplete')
- def test_newer_installed_conda_is_retained(self):
-  result,row,calls,installed,cert=self.run_loaded_base(current='26.11.0',available=['26.9.4'])
-  self.assertEqual(result,0,row['issues']);self.assertEqual(installed['conda']['version'],'26.11.0')
-  self.assertEqual(row['conda_bootstrap']['status'],'not-needed')
-  solves=[cmd for cmd,env in calls if 'install' in cmd and '--dry-run' in cmd]
-  self.assertEqual(len(solves),1);self.assertIn('https://conda.anaconda.org/conda-forge::conda>=26.11.0',solves[0])
- def test_bootstrap_updates_conflicting_manager_stack_together(self):
-  result,row,calls,installed,cert=self.run_loaded_base(manager_stack=True)
+    result,row,calls,installed=self.run_loaded_base(available=available,offline=True)
+    self.assertEqual(result,2);self.assertFalse(any('install' in c for c,e in calls))
+ def test_offline_channels_plugins_and_tls_are_preserved(self):
+  result,row,calls,installed=self.run_loaded_base(offline=True)
   self.assertEqual(result,0,row['issues'])
-  solve=next(cmd for cmd,env in calls if 'install' in cmd)
-  self.assertIn('--update-deps',solve)
-  self.assertIn('https://conda.anaconda.org/conda-forge::python',solve)
-  for name in ('mamba','libmamba','libmambapy','conda-libmamba-solver'):
-   self.assertIn('https://conda.anaconda.org/conda-forge::'+name,solve)
-   self.assertIn(name,row['conda_bootstrap']['manager_targets'])
- def test_default_scope_leaves_other_environment_untouched(self):
-  result,row,calls,installed,cert=self.run_loaded_base(default_scope=True)
-  self.assertEqual(result,0,row['issues']);self.assertFalse(any('env' in cmd and 'list' in cmd for cmd,env in calls))
- def test_all_environments_requires_explicit_scope(self):
-  result,row,calls,installed,cert=self.run_loaded_base(all_envs=True,apply=False)
-  self.assertEqual(result,0)
- def test_only_does_not_bootstrap_base(self):
-  result,row,calls,installed,cert=self.run_loaded_base(only=True,apply=False)
-  self.assertEqual(result,0);self.assertNotIn('conda_bootstrap',row)
+  for cmd,env in calls:
+   if 'install' not in cmd:continue
+   self.assertIn('--offline',cmd);self.assertIn('--override-channels',cmd);self.assertIn('--strict-channel-priority',cmd)
+   self.assertEqual(env['CONDA_DRY_RUN'],'false');self.assertEqual(env['CONDA_NO_PLUGINS'],'true')
+   self.assertTrue(env['CONDA_SSL_VERIFY'].endswith('/etc/cse-trust/ca-bundle.pem'))
+ def test_default_scope_preserves_sibling_files(self):
+  result,row,calls,installed=self.run_loaded_base(default_scope=True)
+  self.assertEqual(result,0,row['issues'])
+ def test_explicit_all_and_only_scope(self):
+  for options in ({'all_envs':True},{'only':True}):
+   result,row,calls,installed=self.run_loaded_base(apply=False,**options)
+   self.assertEqual(result,0)
  def test_scan_requires_explicit_discovery_scope(self):
   with patch.object(m.sys,'argv',['script','--scan-root','/site']),patch('sys.stderr',io.StringIO()):
    with self.assertRaises(SystemExit):m.main()
 
-if __name__=='__main__': unittest.main()
+if __name__=='__main__':unittest.main()

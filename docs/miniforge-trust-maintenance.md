@@ -5,199 +5,112 @@ It updates selected shared conda environments and builds a CSE-managed, incident
 CA bundle from your existing site PEM. It leaves the OS and the inspection proxy unchanged.
 No external incident test endpoint is contacted.
 
-## Update Conda in the loaded installation first
+## Update Conda and base packages in the existing installation
 
-Revision 17 keeps the existing Miniforge installation and discovers it from the
-loaded module's `CONDA_EXE` or `conda` on `PATH`. No system name or explicit base
-path is needed. The default scope is now **the loaded base only**. Discovery and
-updates of other environments require `--all-envs`; `--only PATH` selects exact
-prefixes. After retrieving the current script, load your normal Miniforge module
-and preview only its base environment:
+Revision 18 keeps the installed Miniforge distribution, prefix, module selection
+and Spack version pin. Miniforge `24.11.2-1` does not itself require a reinstall
+for an in-place Conda/base package update. No installer is downloaded or rerun.
+The default scope is **the loaded base only**. Other environments require an
+explicit `--only PATH` or `--all-envs` selection.
+
+Load the usual Miniforge module and run:
 
 ```bash
 python3 patch_miniforge_trust.py --base-only
-```
-
-Then apply that scope:
-
-```bash
 python3 patch_miniforge_trust.py --base-only --apply
 ```
 
-The script detects the currently selected existing CA bundle as before. Use the
-existing `--ca-bundle /path/to/CSE-existing-bundle.pem` option when a particular
-site bundle is required. It reads that source and writes the filtered copy to
-`BASE/etc/cse-trust/ca-bundle.pem`; it does not edit administrator trust files.
-The CSE bundle and verified-TLS environment are prepared before either package
-transaction. Afterward, source the printed `use-ca.sh` path in the current shell.
+Use `--ca-bundle /path/to/CSE-existing-bundle.pem` when a particular existing site
+bundle is required. The source is read to prepare the managed CSE copy before
+package retrieval. The update then:
 
-Apply first searches the installed Conda package's recorded approved source (or
-the configured conda-forge source when the origin is unknown) for the newest stable
-dotted-numeric release for the current platform. It checks even when installed
-Conda already meets `26.9.4`. The newest available release must meet that security
-minimum; missing/stale metadata fails with its own phase and diagnostic.
-If installed base Conda is older than that release, apply requests that exact version,
-`ca-certificates>=2026.10.19`, and `certifi>=2026.10.19`. This is a separate
-targeted bootstrap solve/install, without `--update-all`; compatible dependencies
-can change as part of that transaction. It explicitly requests installed
-Mamba/libmamba/solver packages together and uses `--update-deps`. For example,
-Mamba 1.5.12 requires `conda >=24,<25`; keeping that manager while requesting
-Conda 26 is incompatible. It also explicitly requests Python so classic Conda
-can move to a supported interpreter/ABI instead of implicitly pinning the old
-Python minor release. Explicit site pins still apply. The bootstrap targets the
-installed management/runtime dependency closure explicitly.
-This relaxes the exact versions recorded by the Miniforge installer before the first
-classic solve; `--update-deps` alone relaxes them only after that initial solve succeeds.
-Unrelated applications are left for the subsequent full base update. The bootstrap uses the same allowed
-channels, source selection, classic solver, exact-plan checks, and `--offline`
-policy as the remaining work. It does not run a Miniforge installer, change its
-Spack version pin, remove the prefix, or replace the distribution.
+1. Loads the installation's bundled **libmamba** solver. External plugin
+   entry-point discovery is blocked; only the installed solver hook is enabled.
+   `conda-pypi` and other external hooks are not enabled.
+2. Checks the approved source's current repodata for the newest stable Conda,
+   retaining the security floor `26.9.4` and any newer installed version.
+3. Solves **one full base update** with `--update-all`, minimum security versions
+   and every installed base package requested without an old version/build lock.
+   Python, Mamba/solver packages, NumPy, Jupyter, Boost and their dependencies can
+   move together. Base requests use approved channel priority rather than
+   historical per-package channel locks. Explicit site pins remain enforced.
+4. Rejects excluded Anaconda defaults sources, unintended removals and unmet
+   security minimums, then installs the validated final versions/builds.
+5. Verifies the installed records before configuring prefix trust and inspecting
+   runtime bundles and shared permissions.
 
-Only after the installed Conda and CA-package bootstrap targets are verified does the
-script run the existing full base update. A failed or unverified bootstrap stops
-that prefix before the full update. Conda at or above the newest available stable
-release skips the bootstrap and is never intentionally downgraded. The full update
-retains the verified Conda version as its minimum. Site pins and dependency conflicts
-are reported; they are not bypassed to force the latest release.
-Preview stays local-only and reports the installed security-minimum state plus the
-policy that newest-version availability is checked during apply; it does not
-solve, install, or contact package channels. `--trust-only` continues to perform
-certificate-only work without invoking Conda or updating packages.
+There is no preliminary manager-only bootstrap and no classic conflict-hint graph
+in this path. A missing/broken installed solver fails before package updates with
+its import/startup error. Read-only planning is limited to 180 seconds (the solver
+probe to 30 seconds). That planning limit does not interrupt an installation
+transaction. Existing `--offline` behavior is preserved.
 
-`--offline` uses cached channel metadata and packages; "newest" then means newest
-visible in that cache. Subprocess phase messages are printed before running each
-command, with an elapsed-time message every 30 seconds while it is still running;
-full command output remains in the private logs.
+Non-base prefixes retain their exact Python/application pins and source-qualified
+requests. Base package contents change within the existing installation; its
+Miniforge module/Spack release label does not change. Keep the maintenance records
+with the installation because the original Spack DAG hash does not describe those
+updated package contents.
 
-An error saying Conda "did not meet required minimum" is a verification failure,
-not the solver's explanation. The message now includes the package, observed
-version, required version, and whether the observation was in the **plan** (no
-bootstrap install attempted) or **installed** records (the command returned but
-the expected version was not found). Both Conda versions are saved in
-`conda_bootstrap` in `summary.json`. Apply overrides inherited `CONDA_DRY_RUN`
-or `.condarc` dry-run settings, while planning commands explicitly use `--dry-run`.
-If an install nevertheless returns a dry-run result, it is reported directly
-instead of proceeding to a misleading minimum-version failure.
+Preview remains local-only and does not load a solver, contact channels or install
+packages. `--trust-only` still prepares only the managed trust files. Successful
+prefixes print the shell snippet to source after loading the module.
 
-### Conda crashes with `unsupported operand type(s) for |: 'set' and 'tuple'`
+Private logs include `base-conda-search.json`, `NNN-plan.json`, command output and
+`conda_update` in `summary.json`, including the original, planned and installed
+Conda versions. Reports still read legacy `conda_bootstrap` records from older runs.
+An install that returns a dry-run result or leaves old installed versions is
+reported as incomplete. Apply overrides inherited dry-run settings.
 
-This can originate in Conda's classic solver, inside
-`conda/resolve.py:build_conflict_map`, while it tries to explain an unsatisfiable
-request. Some `--update-deps` paths pass a tuple of requested specifications to
-code that assumes a set. The resulting TypeError hides the dependency conflict.
+### An update is rejected
 
-Revision 15 sets `CONDA_UNSATISFIABLE_HINTS=false` only in maintenance subprocesses
-to bypass this broken detailed explanation. It preserves normal solver rejection,
-site pins, exact-plan verification and TLS settings. Installed Conda files and the
-parent shell configuration are not patched. A genuinely incompatible request still
-fails with `UnsatisfiableError`; this workaround does not establish that an upgrade
-has completed. It also avoids the expensive conflict-hint graph traversal.
+Use the current script's normal base update first; do not repeat the older
+classic-solver diagnostic for longer and longer periods. Libmamba returns a direct
+package/pin conflict instead of building the classic hint graph. If a configured
+pin conflicts, it remains in force and its requested/pinned specs are reported.
+For example, a pin `certifi==2024.12.14` conflicts with the required updated certifi;
+that pin needs site review rather than an automatic bypass. An installer history
+entry for the old certifi is different from an explicit pin: the full base request
+permits that historical version to update.
 
-For an already downloaded revision 14, the equivalent temporary workaround is:
+The deprecated `.*` version-spec warning alone is not a conflicting-package finding.
+The strict-priority note alone also does not identify the blocker. Actual package
+and source choices still come from the validated solve.
+
+Read an existing run without retrying an installation:
 
 ```bash
-CONDA_UNSATISFIABLE_HINTS=false python3 patch_miniforge_trust.py --base-only --apply
+python3 patch_miniforge_trust.py --report latest
 ```
 
-Saved reports now identify this specific upstream crash. Use `--report latest`
-to see whether it occurred during bootstrap or the subsequent full base update.
-After bypassing the crash, review any remaining dependency failure and explicit
-site pins using the saved command output; do not remove pins merely to hide it.
-
-### A generic `UnsatisfiableError` gives no conflicting package names
-
-The note that strict priority "may have removed packages required for
-satisfiability" is generic. It does not identify a conflicting package or prove
-that channel priority caused this failure. Revision 15 deliberately disabled
-conflict hints to bypass the upstream TypeError, so changing the global Conda
-setting or exporting `CONDA_UNSATISFIABLE_HINTS=true` did not enable them inside
-the maintenance script.
-
-Revision 16 adds a diagnostic for the saved failed package request. With the same
-Miniforge module loaded, run:
+To repeat a saved failed request as a diagnostic dry run:
 
 ```bash
 python3 patch_miniforge_trust.py --diagnose latest
 ```
 
-Or replace `latest` with the apply run's exact private log directory. Use the
-positional Miniforge path when no module is loaded. This mode:
+The diagnostic uses the installed libmamba solver even for a saved classic-solver
+command. It preserves the saved package requests, explicit pins, strict priority
+and managed TLS bundle, strips `--yes`, forces `--dry-run`, prints access snapshots,
+and saves private `solver-diagnostic-*.json` output. No package transaction,
+trust/configuration update, chmod or chgrp runs. Repodata cache refreshes remain
+possible. `--diagnostic-timeout SECONDS` is retained, but extending a classic hint
+analysis is no longer the recommended workflow. A saved preview has no failed
+package command; select the actual failed apply log directory if needed.
 
-- Validates the saved install command against the selected base and prefix,
-  removes `--yes`, and forces `--dry-run` both in arguments and environment.
-- Keeps the saved strict channel policy, explicit pins and package requests.
-- Enables detailed hints in a separate Python process, with the tuple converted
-  to the set expected by Conda's conflict reporter. Installed Conda files are not
-  edited; the compatibility adjustment exists only in that diagnostic process.
-- Prints your UID/groups and effective access to the base, target prefix,
-  `conda-meta`, `.condarc` and the package caches reported by Conda.
-- Saves the complete explanation to a private `solver-diagnostic-*.json` file in
-  the existing log directory. No package transaction, trust/configuration update,
-  chmod or chgrp runs. Conda may refresh its repodata cache.
+### Shared group access versus ownership
 
-The diagnostic defaults to a 600-second limit and prints progress every 30 seconds.
-For a large base or channel index, allow up to 30 minutes:
+The exact group name required by the maintenance script is `cse`. Effective group
+write and traversal access to the affected directories, writable package metadata
+and usable caches can permit package replacement without owning every file.
+ACLs, sticky directories, file modes and mount policy can still block particular
+operations. Initial prefix checks do not prove every later write will succeed.
 
-```bash
-python3 patch_miniforge_trust.py --diagnose latest --diagnostic-timeout 1800
-```
-
-`--diagnostic-timeout` accepts a positive number of seconds and requires
-`--diagnose`. Revision 16's fixed 120-second cap could stop analysis before it
-reached the conflict explanation. Revision 17 records `diagnostic_status`,
-`timeout_seconds` and `elapsed_seconds` in the diagnostic JSON. A timeout is
-printed before the partial Conda output, with a longer retry command, and is not
-reported as a new package conflict or a completed explanation.
-
-Exit 2 means the solve/access failure remains or diagnostics timed out; it is not
-a failed installation attempt. Exit 0 means only that the dry-run plan now solves.
-Add `--offline` to use cached/file-channel metadata only. `--diagnose` cannot be
-combined with `--apply` or the other report/trust modes. A saved preview has no
-failed package command; select the actual failed apply run in that case.
-
-Read the named conflict chains rather than assuming every listed package must
-be upgraded independently. No automatic pin removal or relaxed-priority retry
-is performed.
-
-### A deprecated `.*` version-spec warning appears before a timeout
-
-Conda's warning about `.*` with a relational operator means it normalized an
-old-style version constraint. The warning alone does not identify the conflicting
-package and is not a package transaction failure. If it is followed by
-`DIAGNOSTIC TIMED OUT`, the diagnostic's time limit stopped the analysis; only
-partial output may have been produced. Refresh the script and use the longer
-command above. Keep pins and channel priority unchanged while collecting evidence.
-The complete partial stdout/stderr remains in `solver-diagnostic-*.json` even if
-no package conflict explanation finished.
-
-### Shared group access versus owning the files
-
-You do not need to own every installed file to perform a group-maintainable
-package transaction. Membership in `cse`, effective group/ACL write and traversal
-access to the affected directories, writable package metadata and usable caches
-can permit it. ACLs, sticky directories, file modes and mount policy can still
-block particular operations. The script's initial base/prefix checks do not prove
-that every later file write will succeed.
-
-Changing modes or groups on a foreign-owned file is a separate owner/admin
-operation. Permission normalization reports those paths as skips rather than
-attempting to take ownership. An `UnsatisfiableError` alone is not evidence of an
-ownership failure; look for a named denied/not-writable path and its access
-snapshot. Neither recursive ownership changes nor running the whole maintenance
-script as root is needed merely to investigate the solver message.
-
-Private logs retain `base-conda-bootstrap-search.json`, `base-conda-bootstrap-plan.json`,
-`base-conda-bootstrap-install.json`, and a separate `conda_bootstrap` result in
-`summary.json`. If the later full update fails, the report distinguishes a
-completed Conda bootstrap from incomplete base-package work. The package-change
-summary compares against the original pre-bootstrap inventory, so the manager
-upgrade remains visible. A Conda package update changes contents of the existing
-base tree; if that tree was installed by Spack, retain these maintenance records
-because its Spack DAG hash does not change with this package transaction.
-
-Other environments are not updated by `--base-only`. The normal existing
-discovery/`--only` workflow remains available for a subsequent separately selected
-environment, and user instructions can be prepared after the base is tested.
+Changing modes/groups on foreign-owned files is a separate owner/admin operation;
+normalization reports those paths as skips. An unsatisfiable package solve is not
+by itself evidence of an ownership problem. A write failure should name a denied
+or not-writable path and is reported separately. The diagnostic prints your
+UID/groups and current effective access to the prefix, `conda-meta`, `.condarc`
+and the actual package caches without changing their permissions.
 
 ## Retrieve just the script over SSH
 
@@ -238,8 +151,8 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
 ### Reproduce the earlier revision 12 exactly
 
 The script was updated at commit `3cfb223ceb8ca59a128523627df0d187a75bc9a0`.
-That historical revision performs the full base update but does not have the
-separate Conda bootstrap above. Use the current `main` retrieval for revision 17.
+That historical revision uses classic solving rather than the current single
+libmamba base transaction. Use the current `main` retrieval for revision 18.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
@@ -401,8 +314,8 @@ hosting domain or add Anaconda `defaults` in response to the generic conda messa
 
 ## Full updates are permitted in the base environment
 
-Revision 17 first checks/bootstraps Conda as described above, then retains
-revision 12's full conda package-update scope for the Miniforge base. It no
+Revision 18 updates Conda and the compatible Miniforge base in one libmamba
+transaction, retaining the full base package-update scope. It no
 longer rejects changes to `krb5`, NumPy, matplotlib, matplotlib-base, Python or other
 base packages as unrelated. The base solve uses `--update-all` with no script-generated
 version/build pins on application packages. Installed incident-related packages retain
@@ -591,10 +504,10 @@ Platform directories and archive filenames are removed from URLs while mirror ho
 and channel label paths are retained. Named channels use the site's current alias
 and custom-channel mappings. Sources from one environment do not carry over to another.
 
-Where a package's source is identifiable and permitted, its requested spec is qualified
+In non-base prefixes, where a package's source is identifiable and permitted, its requested spec is qualified
 with that channel, for example `https://conda.anaconda.org/bioconda::PACKAGE>=VERSION`.
-This preserves the source instead of silently moving the package to the first channel.
-The final execution specs also retain identifiable solver-selected sources. If that
+The base instead uses approved channel priority for compatible builds, without
+locking each request to its historical origin. The final execution specs also retain identifiable solver-selected sources. If that
 source lacks a compatible fixed build, the update is reported incomplete. The script
 does not bypass dependency checks or switch the package's source to force success.
 
@@ -628,8 +541,8 @@ An excluded historical source is reported; it is not a claim that the source was
 contacted by this run. An unknown private mirror's upstream contents cannot be inferred
 from its URL alone. This automatic reuse assumes the recorded non-default sources
 were permitted for these existing environments; site source controls still apply.
-There is no PyPI or pip-install fallback. External conda plugins are disabled during
-maintenance subprocesses to prevent conda-pypi from introducing another package source.
+There is no PyPI or pip-install fallback. Solver subprocesses block external plugin
+discovery and explicitly enable only the installed libmamba solver hook.
 For disconnected operation, add `--offline`; the necessary packages from the requested approved channels must
 already be cached or available through the site mirror mapping.
 Outdated pip-managed tools are reported for reviewed migration, without overwriting
@@ -746,7 +659,7 @@ Certificate preparation reads the source PEM and writes a separate managed copy:
 - `MINIFORGE/etc/cse-trust/use-ca.sh`
 
 Writing this shared managed copy is the preparation stage. It happens before the
-bootstrap and can remain after a package failure. Packages may replace their own
+base package transaction and can remain after a package failure. Packages may replace their own
 vendor PEM files inside selected prefixes, and successful selected prefixes receive
 persistent `.condarc` and activation-variable changes; those are final changes,
 not temporary staging. A package-owned source PEM inside a selected prefix can also
@@ -808,22 +721,22 @@ permission preview counts, read-only legacy-log reporting, structured command-fa
 records, mixed-package review ordering, access-path snapshots, certificate-only
 operations, actual-bundle inspection, exact-prefix scope, channel-source guards, per-environment installed-source discovery,
 source-qualified update specs, malformed/host-only metadata recovery, structured alias/custom-channel config, full-base update policy, mandatory minimum
-verification, module-based bootstrap ordering, failed/stale bootstrap guards,
-offline bootstrap policy, preservation of original before/after inventories, and
+verification, one-transaction base updates, stale-plan/installed-version guards,
+offline package policy, preservation of original before/after inventories, and
 simulated preview/offline apply. Tests also cover newest-version selection when
 the minimum is already installed, downgrade guards, stale metadata, and default
 base-only scope with unchanged sibling PEM/configuration files. Actual SUSE/RHEL deployment remains
 a target-system validation task.
 
-To include the real installed classic-solver conflict regression:
+To include the installed solver/allowlist and legacy-classic regressions:
 
 ```bash
 CSE_CONDA_PYTHON=/path/to/miniforge/bin/python \
   python3 -m unittest discover -s scripts -p test_channel_regressions.py
 ```
 
-That check invokes the installed Conda library with a tuple of requested specs and
-requires normal `UnsatisfiableError` rejection instead of the upstream TypeError.
+Those checks verify the restricted libmamba runtime and retain coverage of the
+legacy classic tuple/hint failure path.
 It performs no package transaction or network access. Without `CSE_CONDA_PYTHON`,
 that integration check is skipped.
 
