@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 16 (2026-10-27).
+"""CSE Miniforge certificate maintenance, revision 17 (2026-10-27).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -973,7 +973,8 @@ def diagnostic_argv(base, prefix, argv, requested):
     return output
 
 
-def diagnose_existing(directory, base, offline=False):
+def diagnose_existing(directory, base, offline=False, timeout_seconds=600):
+    if timeout_seconds<=0:raise ValueError('Diagnostic timeout must be a positive number of seconds')
     directory=report_directory(directory)
     rows=json.loads((directory/'summary.json').read_text())
     selected=None
@@ -1020,19 +1021,23 @@ def diagnose_existing(directory, base, offline=False):
     def progress():
         while not finished.wait(30):print('Still diagnosing dependencies (%ds elapsed)'%(time.monotonic()-started),flush=True)
     heartbeat=threading.Thread(target=progress,daemon=True);heartbeat.start()
-    print('Running the saved request with the same pins and strict channel priority; diagnostic limit 120 seconds.',flush=True)
+    print('Running the saved request with the same pins and strict channel priority; diagnostic limit %d seconds.'%timeout_seconds,flush=True)
+    timed_out=False
     try:
-        result=subprocess.run(command,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=120)
+        result=subprocess.run(command,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout_seconds)
         stdout,stderr,code=result.stdout,result.stderr,result.returncode
     except subprocess.TimeoutExpired as exc:
+        timed_out=True
         def decoded(value):return value.decode(errors='replace') if isinstance(value,bytes) else (value or '')
-        stdout,stderr,code=decoded(exc.stdout),decoded(exc.stderr)+'\nConflict diagnostics timed out after 120 seconds.',None
+        stdout,stderr,code=decoded(exc.stdout),decoded(exc.stderr)+'\nConflict diagnostics timed out after %d seconds.'%timeout_seconds,None
     except OSError as exc:
         stdout,stderr,code='',type(exc).__name__+': '+str(exc),None
     finally:finished.set();heartbeat.join()
     report=directory/('solver-diagnostic-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')+'.json')
     payload={'argv':[str(base/'bin/conda')]+argv,'phase':record.get('phase'),'returncode':code,
-             'stdout':stdout,'stderr':stderr,'prefix_access':access_snapshot(prefix),'dry_run':True}
+             'stdout':stdout,'stderr':stderr,'prefix_access':access_snapshot(prefix),'dry_run':True,
+             'diagnostic_status':'timed_out' if timed_out else ('command_error' if code is None else 'completed'),
+             'timeout_seconds':timeout_seconds,'elapsed_seconds':round(time.monotonic()-started,2)}
     fd=os.open(str(report),os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
     with os.fdopen(fd,'w') as stream:json.dump(payload,stream,indent=2)
     try:
@@ -1041,10 +1046,19 @@ def diagnose_existing(directory, base, offline=False):
         message=data.get('message') or diagnostic_text(stdout,stderr)
     except ValueError:
         data={};message=diagnostic_text(stdout,stderr)
+    if timed_out:
+        print('DIAGNOSTIC TIMED OUT after %d seconds; conflict analysis did not complete.'%timeout_seconds,flush=True)
+        print('A deprecated version-spec warning is not a conflicting-package finding. No package transaction was attempted.',flush=True)
+        retry=['python3','patch_miniforge_trust.py',str(base),'--diagnose',str(directory),
+               '--diagnostic-timeout',str(max(1800,timeout_seconds*2))]
+        if offline:retry.append('--offline')
+        print('Retry with more time: '+shlex.join(retry),flush=True)
+        print('Partial Conda output:',flush=True)
     print(str(message)[:16000],flush=True)
     print('Full diagnostic: '+str(report),flush=True)
     solved=code==0 and data.get('success') is True
-    print('Result: '+('dry-run plan solved; no upgrade installed' if solved else 'solve/access failure; no package transaction attempted'))
+    print('Result: '+('diagnostic timed out; no conflict conclusion or package transaction' if timed_out else
+                     'dry-run plan solved; no upgrade installed' if solved else 'solve/access failure; no package transaction attempted'))
     return 0 if solved else 2
 
 
@@ -1345,6 +1359,7 @@ def main():
     ap.add_argument('--channel',action='append',default=[],help='Additional approved community channel or mirror; repeatable; Anaconda defaults excluded')
     ap.add_argument('--report',type=Path,metavar='LOG_DIR_OR_latest',help='Read an existing summary/run.log and explain failures; no updates, group checks or network')
     ap.add_argument('--diagnose',type=Path,metavar='LOG_DIR_OR_latest',help='Repeat the saved failed solve as a dry run with detailed conflicts and access checks; may refresh repodata')
+    ap.add_argument('--diagnostic-timeout',type=int,metavar='SECONDS',help='Time limit for --diagnose; positive seconds (default: 600)')
     ap.add_argument('--verbose',action='store_true',help='Show per-path permission details and subprocess commands; full details are always logged')
     ap.add_argument('--offline', action='store_true',help='Apply using cache/file channels; never retrieve online')
     ap.add_argument('--upgrade-conda',action='store_true',help='Also upgrade conda in non-base prefixes; base updates conda automatically')
@@ -1356,12 +1371,15 @@ def main():
     ap.add_argument('--chains-dir',type=Path,help='Approved local incident chain directory; no downloads')
     ap.add_argument('--log-dir',type=Path)
     args = ap.parse_args()
+    if args.diagnostic_timeout is not None and (not args.diagnose or args.diagnostic_timeout<=0):
+        ap.error('--diagnostic-timeout requires --diagnose and a positive number of seconds')
     if (args.include or args.scan_root) and not args.all_envs:
         ap.error('--include and --scan-root require --all-envs; use --only for exact prefixes')
     if args.diagnose:
         if args.apply or args.report or args.inspect_trust or args.trust_only:
             ap.error('--diagnose cannot be combined with apply/report/trust modes')
-        return diagnose_existing(args.diagnose,find_base(args.miniforge,safe_environment()),args.offline)
+        return diagnose_existing(args.diagnose,find_base(args.miniforge,safe_environment()),args.offline,
+                                 args.diagnostic_timeout if args.diagnostic_timeout is not None else 600)
     if args.report:
         if args.apply or args.inspect_trust or args.trust_only: ap.error('--report cannot be combined with apply/trust modes')
         return report_existing(args.report,args.verbose)

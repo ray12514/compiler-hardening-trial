@@ -7,7 +7,7 @@ No external incident test endpoint is contacted.
 
 ## Update Conda in the loaded installation first
 
-Revision 16 keeps the existing Miniforge installation and discovers it from the
+Revision 17 keeps the existing Miniforge installation and discovers it from the
 loaded module's `CONDA_EXE` or `conda` on `PATH`. No system name or explicit base
 path is needed. The default scope is now **the loaded base only**. Discovery and
 updates of other environments require `--all-envs`; `--only PATH` selects exact
@@ -135,7 +135,20 @@ positional Miniforge path when no module is loaded. This mode:
   the existing log directory. No package transaction, trust/configuration update,
   chmod or chgrp runs. Conda may refresh its repodata cache.
 
-The diagnostic has a 120-second limit and prints progress every 30 seconds.
+The diagnostic defaults to a 600-second limit and prints progress every 30 seconds.
+For a large base or channel index, allow up to 30 minutes:
+
+```bash
+python3 patch_miniforge_trust.py --diagnose latest --diagnostic-timeout 1800
+```
+
+`--diagnostic-timeout` accepts a positive number of seconds and requires
+`--diagnose`. Revision 16's fixed 120-second cap could stop analysis before it
+reached the conflict explanation. Revision 17 records `diagnostic_status`,
+`timeout_seconds` and `elapsed_seconds` in the diagnostic JSON. A timeout is
+printed before the partial Conda output, with a longer retry command, and is not
+reported as a new package conflict or a completed explanation.
+
 Exit 2 means the solve/access failure remains or diagnostics timed out; it is not
 a failed installation attempt. Exit 0 means only that the dry-run plan now solves.
 Add `--offline` to use cached/file-channel metadata only. `--diagnose` cannot be
@@ -145,6 +158,17 @@ failed package command; select the actual failed apply run in that case.
 Read the named conflict chains rather than assuming every listed package must
 be upgraded independently. No automatic pin removal or relaxed-priority retry
 is performed.
+
+### A deprecated `.*` version-spec warning appears before a timeout
+
+Conda's warning about `.*` with a relational operator means it normalized an
+old-style version constraint. The warning alone does not identify the conflicting
+package and is not a package transaction failure. If it is followed by
+`DIAGNOSTIC TIMED OUT`, the diagnostic's time limit stopped the analysis; only
+partial output may have been produced. Refresh the script and use the longer
+command above. Keep pins and channel priority unchanged while collecting evidence.
+The complete partial stdout/stderr remains in `solver-diagnostic-*.json` even if
+no package conflict explanation finished.
 
 ### Shared group access versus owning the files
 
@@ -215,7 +239,7 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
 
 The script was updated at commit `3cfb223ceb8ca59a128523627df0d187a75bc9a0`.
 That historical revision performs the full base update but does not have the
-separate Conda bootstrap above. Use the current `main` retrieval for revision 16.
+separate Conda bootstrap above. Use the current `main` retrieval for revision 17.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
@@ -377,7 +401,7 @@ hosting domain or add Anaconda `defaults` in response to the generic conda messa
 
 ## Full updates are permitted in the base environment
 
-Revision 16 first checks/bootstraps Conda as described above, then retains
+Revision 17 first checks/bootstraps Conda as described above, then retains
 revision 12's full conda package-update scope for the Miniforge base. It no
 longer rejects changes to `krb5`, NumPy, matplotlib, matplotlib-base, Python or other
 base packages as unrelated. The base solve uses `--update-all` with no script-generated
