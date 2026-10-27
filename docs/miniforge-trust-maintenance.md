@@ -7,7 +7,7 @@ No external incident test endpoint is contacted.
 
 ## Update Conda and base packages in the existing installation
 
-Revision 19 keeps the installed Miniforge distribution, prefix, module selection
+Revision 20 keeps the installed Miniforge distribution, prefix, module selection
 and Spack version pin. Miniforge `24.11.2-1` does not itself require a reinstall
 for an in-place Conda/base package update. No installer is downloaded or rerun.
 The default scope is **the loaded base only**. Other environments require an
@@ -20,7 +20,7 @@ python3 patch_miniforge_trust.py --base-only
 python3 patch_miniforge_trust.py --base-only --apply
 ```
 
-`python3 patch_miniforge_trust.py --version` should print revision 19. Each run
+`python3 patch_miniforge_trust.py --version` should print revision 20. Each run
 also records its revision so an older copied script can be identified directly.
 
 Use `--ca-bundle /path/to/CSE-existing-bundle.pem` when a particular existing site
@@ -36,9 +36,11 @@ package retrieval. The update then:
    the installed dependency graph. Installer/full-package maintenance snapshots
    do not turn every old dependency into a permanent application requirement.
    Standalone packages and dependency cycles are retained conservatively.
-   Python, Conda, the solver, installed security targets and explicit pins are
-   protected. Historical version/build requests may update; site pins stay enforced.
-4. Solves **one full base update** with `--update-all --prune`. Python, Mamba,
+   Python, Conda, the solver and installed security targets are retained as
+   unversioned requests or required security minimums.
+4. Solves **one full base update** with `--update-all --prune --no-pin`. All base
+   package pins are ignored, including `conda-meta/pinned`, `pinned_packages`
+   configuration and environment settings. Python, Mamba,
    NumPy, Jupyter, Boost and their dependencies can move together. Base requests
    use approved channel priority rather than historical per-package channel locks.
    Dependencies can be replaced or removed when the updated retained packages no
@@ -85,9 +87,8 @@ Current [conda-forge Boost recipes](https://github.com/conda-forge/boost-feedsto
 explicitly prohibit co-installing the old `boost`/`boost-cpp` names with their new
 `libboost*` counterparts. For installed conda-forge packages, maintenance maps
 `boost` to `libboost-python-devel` and `boost-cpp` to `libboost-devel`, preserving
-headers, libraries and development metadata. A site pin on an old name is retained
-for review instead of bypassed. Other package sources are not assumed to share
-this migration.
+headers, libraries and development metadata. Old base package pins do not block
+this migration. Other package sources are not assumed to share this migration.
 
 An unsatisfiable request or an old version number does not establish that a
 package is deprecated. Unknown application conflicts still fail with the solver's
@@ -101,12 +102,22 @@ every package can move to its individually newest release.
 
 Use the current script's normal base update first; do not repeat the older
 classic-solver diagnostic for longer and longer periods. Libmamba returns a direct
-package/pin conflict instead of building the classic hint graph. If a configured
-pin conflicts, it remains in force and its requested/pinned specs are reported.
-For example, a pin `certifi==2024.12.14` conflicts with the required updated certifi;
-that pin needs site review rather than an automatic bypass. An installer history
-entry for the old certifi is different from an explicit pin: the full base request
-permits that historical version to update.
+dependency conflict instead of building the classic hint graph. Revision 20
+ignores every package pin in the selected base during both planning and exact-plan
+installation. For example, `certifi==2024.12.14` cannot hold certifi below the
+required `2026.10.19` minimum, and a Python/application pin cannot hold that package
+to its old version. This is the normal base behavior; no additional flag is needed.
+
+Ignored pin specs are printed and saved in `ignored_pins` and the base package
+inventory. The original prefix pin file is backed up privately. Stored pin files
+and shared/user configuration are retained, so ordinary Conda commands outside
+this script still use their stored settings. The module/Spack Miniforge release
+selection remains unchanged. A package-version pin is separate from a PEM file.
+Non-base environments retain their existing targeted maintenance and pin policy.
+
+If a base run still reports a configured-pin conflict, first verify revision 20
+and that `--no-pin` appears on both saved install commands. Actual dependency,
+platform and channel compatibility requirements remain enforced.
 
 The deprecated `.*` version-spec warning alone is not a conflicting-package finding.
 The strict-priority note alone also does not identify the blocker. Actual package
@@ -125,7 +136,7 @@ python3 patch_miniforge_trust.py --diagnose latest
 ```
 
 The diagnostic uses the installed libmamba solver even for a saved classic-solver
-command. It preserves the saved package requests, explicit pins, strict priority
+command. It preserves the saved package requests, pin policy, strict priority
 and managed TLS bundle, strips `--yes`, forces `--dry-run`, prints access snapshots,
 and saves private `solver-diagnostic-*.json` output. No package transaction,
 trust/configuration update, chmod or chgrp runs. Repodata cache refreshes remain
@@ -188,7 +199,7 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
 
 The script was updated at commit `3cfb223ceb8ca59a128523627df0d187a75bc9a0`.
 That historical revision uses classic solving rather than the current single
-libmamba base transaction. Use the current `main` retrieval for revision 19.
+libmamba base transaction. Use the current `main` retrieval for revision 20.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
@@ -350,13 +361,13 @@ hosting domain or add Anaconda `defaults` in response to the generic conda messa
 
 ## Full updates are permitted in the base environment
 
-Revision 18 updates Conda and the compatible Miniforge base in one libmamba
+Revision 20 updates Conda and the compatible Miniforge base in one libmamba
 transaction, retaining the full base package-update scope. It no
 longer rejects changes to `krb5`, NumPy, matplotlib, matplotlib-base, Python or other
-base packages as unrelated. The base solve uses `--update-all` with no script-generated
-version/build pins on application packages. Installed incident-related packages retain
+base packages as unrelated. The base solve uses `--update-all --prune --no-pin`
+with all package pins ignored. Installed incident-related packages retain
 explicit minimum constraints, and installed conda is targeted at >=26.9.4 automatically.
-Conda resolves compatible versions using the permitted channels and retained site pins;
+Conda resolves compatible versions using the permitted channels and package dependencies;
 this does not promise every package will reach the newest version on every channel.
 
 Use the same base-only command to isolate this work:
@@ -368,8 +379,8 @@ python3 patch_miniforge_trust.py /actual/path/to/miniforge \
 
 The validated solver plan is saved, then executed with exact final versions/builds.
 New dependencies and updates to any base package are permitted. The Anaconda defaults
-source exclusion, installed-source selection, dependency solving and rejection of
-package removal without replacement remain in force. No `--no-deps` or `--clobber`
+source exclusion, installed-source selection, dependency solving and retained-application
+checks remain in force; unused dependencies and superseded names may leave. No `--no-deps` or `--clobber`
 bypass is used. Base updates can include major Python/application version changes.
 
 Before executing the plan, all originally installed incident-related conda packages
@@ -568,9 +579,10 @@ All install/solve commands use `--override-channels` and strict channel priority
 Unrelated channels from configuration are not silently adopted. Known Anaconda default
 URLs and aliases resolving to them are excluded even if recorded in installed packages.
 A misleading channel label does not override a known default-repository archive URL.
-Defaults-qualified pins still block the prefix instead of causing default downloads;
-other channel-qualified pins must resolve into that environment's selected source set.
-Existing site pins are retained. Solver LINK/FETCH records referencing known Anaconda
+In non-base prefixes, defaults-qualified pins still block the prefix instead of causing
+default downloads; other channel-qualified pins must resolve into that environment's
+selected source set. Base updates ignore all package pins, including their channel
+constraints. Solver LINK/FETCH records referencing known Anaconda
 defaults locations are rejected before executing the install.
 
 An excluded historical source is reported; it is not a claim that the source was
