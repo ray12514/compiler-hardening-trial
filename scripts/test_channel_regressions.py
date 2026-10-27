@@ -97,7 +97,7 @@ class DiagnosticTests(unittest.TestCase):
    self.assertIsNone(report['returncode']);self.assertIn(warning.decode(),report['stderr'])
    self.assertEqual(marker.read_text(),'unchanged')
    self.assertLess(out.getvalue().index('DIAGNOSTIC TIMED OUT after 7 seconds'),out.getvalue().index(warning.decode()))
-   self.assertIn('--diagnostic-timeout 1800',out.getvalue());self.assertIn('no conflict conclusion',out.getvalue())
+   self.assertNotIn('Retry with more time',out.getvalue());self.assertIn('explicit pins',out.getvalue());self.assertIn('no conflict conclusion',out.getvalue())
 
 class ClassicConflictTests(unittest.TestCase):
  def test_maintenance_disables_broken_hints_even_if_inherited_enabled(self):
@@ -141,6 +141,42 @@ class LibmambaRuntimeTests(unittest.TestCase):
                         env=m.safe_environment(),text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True,timeout=30)
   data=json.loads(result.stdout);self.assertEqual(data['solver'],'libmamba')
   self.assertEqual(data['external_plugins'],['cse-libmamba-solver-only'])
+ @unittest.skipUnless(os.environ.get('CSE_CONDA_PYTHON'),'Set CSE_CONDA_PYTHON to test real native pruning')
+ def test_real_install_path_prunes_retired_names_in_the_same_solve(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=pathlib.Path(directory);prefix=root/'prefix';(prefix/'conda-meta').mkdir(parents=True)
+   (prefix/'conda-meta/history').write_text('')
+   channel=root/'channel'
+   def record(name,version,depends=(),constrains=()):
+    return {'name':name,'version':version,'build':'0','build_number':0,'depends':list(depends),
+            'constrains':list(constrains),'subdir':'noarch','channel':channel.as_uri(),'size':1,
+            'md5':'0'*32,'sha256':'0'*64,'noarch':'generic'}
+   installed=[record('app','1',['boost']),record('boost','1',['boost-cpp']),record('boost-cpp','1'),
+              record('libboost-python-devel','1',['libboost-devel']),record('libboost-devel','1')]
+   for r in installed:(prefix/'conda-meta'/(r['name']+'-'+r['version']+'-0.json')).write_text(json.dumps(r))
+   packages=[record('app','2',['libboost-python-devel']),
+             record('libboost-python-devel','2',['libboost-devel'],['boost <0.0a0']),
+             record('libboost-devel','2',[],['boost-cpp <0.0a0']),
+             record('libboost-python-devel','1',['libboost-devel']),record('libboost-devel','1')]
+   for subdir in ('linux-64','noarch'):
+    (channel/subdir).mkdir(parents=True)
+    data={'info':{'subdir':subdir},'packages':{},'packages.conda':{},'repodata_version':1}
+    if subdir=='noarch':data['packages']={r['name']+'-'+r['version']+'-0.tar.bz2':r for r in packages}
+    for name in ('repodata.json','current_repodata.json'):(channel/subdir/name).write_text(json.dumps(data))
+   env=m.safe_environment();env.update(CONDA_OFFLINE='false',CONDA_REGISTER_ENVS='false',
+    CONDA_PKGS_DIRS=str(root/'cache'),CONDA_ENVS_PATH=str(root/'envs'),CONDA_REPODATA_USE_ZST='false')
+   argv=['install','-p',str(prefix),'--solver','libmamba','--json','--dry-run','--update-all','--prune',
+         '--override-channels','--channel',channel.as_uri(),'--strict-channel-priority',
+         'app','libboost-python-devel','libboost-devel']
+   result=subprocess.run([os.environ['CSE_CONDA_PYTHON'],'-I','-B','-c',m.LIBMAMBA_CLI]+argv,
+                         env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=30)
+   self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+   plan=json.loads(result.stdout);actions=plan['actions']
+   linked={r['name'] for r in actions['LINK']};unlinked={r['name'] for r in actions['UNLINK']}
+   self.assertEqual(unlinked-linked,{'boost','boost-cpp'})
+   self.assertEqual(linked,{'app','libboost-python-devel','libboost-devel'})
+   self.assertTrue(all(r['version']=='2' for r in actions['LINK']))
+   self.assertEqual(len(list((prefix/'conda-meta').glob('*.json'))),len(installed))
 
 class ChannelRegressionTests(unittest.TestCase):
  def test_host_only_installed_origin_ignored(self):
@@ -245,6 +281,54 @@ class ChannelFlowTests(unittest.TestCase):
      self.assertTrue(all(value in ('conda-forge','https://conda.anaconda.org/conda-forge') for value in sources))
 
 class BaseUpdatePolicyTests(unittest.TestCase):
+ def test_dependency_graph_preserves_applications_without_forcing_old_dependencies(self):
+  meta={n:{'version':'1','build':'0','depends':deps} for n,deps in {
+   'conda':['python','old-solver-runtime'],'python':['libffi'],'jupyter':['jupyter_core','python'],
+   'jupyter_core':['python'],'numpy':['python','old-blas'],'old-blas':[],'libffi':[],
+   'old-solver-runtime':[],'standalone-tool':[]}.items()}
+  intent=m.base_package_intent(meta)
+  self.assertEqual(set(intent['roots']),{'conda','python','jupyter','numpy','standalone-tool'})
+  targets,allowed,specs=m.plan_specs(meta,False,broad=True)
+  self.assertNotIn('old-blas',specs);self.assertNotIn('old-solver-runtime',specs)
+ def test_dependency_cycles_and_isolated_packages_are_retained(self):
+  meta={n:{'depends':deps} for n,deps in {'a':['b'],'b':['a','child'],'child':[],'isolated':[]}.items()}
+  self.assertEqual(set(m.base_package_intent(meta)['roots']),{'a','b','isolated'})
+ def test_history_keeps_explicit_dependency_requests_and_ignores_full_snapshots(self):
+  meta={'app':{'depends':['dep']},'dep':{'depends':[]}}
+  with tempfile.TemporaryDirectory() as directory:
+   p=pathlib.Path(directory);(p/'conda-meta').mkdir()
+   history=p/'conda-meta/history'
+   snapshot="==> 2024-01-01 <==\n+conda-forge::app-1-0\n+conda-forge::dep-1-0\n# update specs: ['app=1=0', 'dep=1=0']\n"
+   history.write_text(snapshot)
+   self.assertEqual(m.base_package_intent(meta,p)['roots'],['app'])
+   history.write_text(snapshot+"==> 2024-02-01 <==\n# update specs: ['dep>=1']\n")
+   self.assertEqual(m.base_package_intent(meta,p)['roots'],['app','dep'])
+   history.write_text(history.read_text()+"==> 2024-03-01 <==\n# remove specs: ['dep']\n")
+   self.assertEqual(m.base_package_intent(meta,p)['roots'],['app'])
+ def test_explicit_pins_protect_dependencies_from_pruning(self):
+  meta={'app':{'depends':['dep','other']},'dep':{},'other':{}}
+  with tempfile.TemporaryDirectory() as directory:
+   p=pathlib.Path(directory);(p/'conda-meta').mkdir();(p/'conda-meta/pinned').write_text('dep==1 # site pin\n')
+   self.assertEqual(set(m.base_package_intent(meta,p,{'pinned_packages':['other=2']})['roots']),set(meta))
+ def test_boost_migration_preserves_development_functionality_and_respects_pins(self):
+  meta={n:{'channel':'conda-forge','depends':[]} for n in ('boost','boost-cpp')}
+  intent=m.base_package_intent(meta)
+  self.assertEqual(set(intent['roots']),{'libboost-python-devel','libboost-devel'})
+  self.assertEqual({r['name'] for r in intent['replacements']},set(meta))
+  self.assertIn('boost',m.base_package_intent(meta,config={'pinned_packages':['boost==1.82']})['roots'])
+  meta['boost']['channel']='other-channel'
+  self.assertIn('boost',m.base_package_intent(meta)['roots'])
+ def test_pruned_dependency_is_removed_from_exact_execution_specs(self):
+  meta={'app':{'version':'1','build':'old'},'dep':{'version':'1','build':'0'}}
+  plan={'actions':{'UNLINK':[dict(name=n,**r) for n,r in meta.items()],
+                   'LINK':[{'name':'app','version':'2','build':'new','channel':'conda-forge'}]}}
+  self.assertEqual(m.check_plan(plan,None,{'app'}),['app','dep'])
+  final,exact=m.exact_plan_specs(meta,plan,{},[],{})
+  self.assertEqual(final,{'app':('2','new')});self.assertFalse(any('dep=' in spec for spec in exact))
+  with self.assertRaisesRegex(RuntimeError,'removal'):m.check_plan(plan,None,{'dep'})
+  with self.assertRaisesRegex(RuntimeError,'differ'):m.verify_installed_plan(final,dict(meta,app={'version':'2','build':'new'}))
+ def test_missing_retained_application_is_rejected(self):
+  with self.assertRaisesRegex(RuntimeError,'jupyter'):m.verify_retained({'conda':('26.9.4','0')},{'conda','jupyter'})
  def test_base_plan_unpins_applications_and_updates_conda(self):
   meta={n:{'version':v,'build':'0'} for n,v in [('conda','24.11.2'),('python','3.12.8'),('numpy','1.0'),('pip','24.3.1')]}
   targets,allowed,specs=m.plan_specs(meta,False,broad=True)
@@ -302,7 +386,7 @@ class BaseUpdatePolicyTests(unittest.TestCase):
 class BaseTransactionTests(unittest.TestCase):
  def run_loaded_base(self,apply=True,current=False,fail_install=False,offline=False,stale_install=False,
                      available=None,default_scope=False,all_envs=False,only=False,stale_plan=False,
-                     manager_stack=False,dry_run_install=False,missing_solver=False):
+                     manager_stack=False,dry_run_install=False,missing_solver=False,prune_dependency=False,stale_removal=False):
   with tempfile.TemporaryDirectory() as directory:
    root=pathlib.Path(directory);base=root/'loaded-miniforge'
    (base/'bin').mkdir(parents=True);(base/'bin/conda').touch()
@@ -323,7 +407,11 @@ class BaseTransactionTests(unittest.TestCase):
     for name,value in [('python','3.12.8'),('jupyter_core','5.7.2'),('libboost-python','1.85.0')]:
      installed[name]={'name':name,'version':value,'build':'old','channel':'conda-forge'}
      updates[name]={'python':'3.14.0','jupyter_core':'5.9.1','libboost-python':'1.88.0'}[name]
+   if prune_dependency:
+    installed['legacy-runtime']={'name':'legacy-runtime','version':'1','build':'0','channel':'conda-forge'}
+    installed['numpy']['depends']=['legacy-runtime']
    def save():
+    for path in (base/'conda-meta').glob('*.json'):path.unlink()
     for name,record in installed.items():(base/'conda-meta'/(name+'.json')).write_text(json.dumps(record))
    save();calls=[]
    def fake(cmd,**kwargs):
@@ -338,11 +426,13 @@ class BaseTransactionTests(unittest.TestCase):
       links=[dict(installed[n],version=v) for n,v in updates.items()]
       if stale_plan:links[0]['version']=installed['conda']['version']
       output={'success':True,'actions':{'LINK':links}}
+      if prune_dependency:output['actions']['UNLINK']=[dict(installed['legacy-runtime'])]
      else:
       if dry_run_install:return subprocess.CompletedProcess(cmd,0,json.dumps({'success':True,'dry_run':True}),'')
       if fail_install:return subprocess.CompletedProcess(cmd,1,'','Package installation failed')
       if not stale_install:
        for name,value in updates.items():installed[name]['version']=value
+      if prune_dependency and not stale_removal:installed.pop('legacy-runtime')
       save();output={'success':True}
     elif '-c' in cmd:output={'python':[3,14,0],'packages':{},'bundles':{}}
     else:output={'success':True}
@@ -366,6 +456,15 @@ class BaseTransactionTests(unittest.TestCase):
    self.assertIn(name,installs[0]);self.assertFalse(any('::'+name in value for value in installs[0]))
   self.assertEqual(installed['conda']['version'],'26.9.4');self.assertEqual(installed['numpy']['version'],'2.0')
   self.assertEqual(row['conda_update']['status'],'updated');self.assertNotIn('conda_bootstrap',row)
+ def test_full_base_update_prunes_unused_dependencies_and_verifies_actual_removal(self):
+  result,row,calls,installed=self.run_loaded_base(prune_dependency=True)
+  self.assertEqual(result,0,row['issues']);self.assertNotIn('legacy-runtime',installed)
+  self.assertEqual([r['name'] for r in row['package_removals']],['legacy-runtime'])
+  installs=[c for c,e in calls if 'install' in c]
+  self.assertTrue(all('--prune' in c for c in installs))
+  self.assertFalse(any(any('legacy-runtime' in arg for arg in c) for c in installs))
+  result,row,calls,installed=self.run_loaded_base(prune_dependency=True,stale_removal=True)
+  self.assertEqual(result,2);self.assertIn('Installed packages differ',' '.join(row['issues']))
  def test_preview_is_local_and_does_not_load_solver_or_search(self):
   result,row,calls,installed=self.run_loaded_base(apply=False)
   self.assertEqual(result,0)
