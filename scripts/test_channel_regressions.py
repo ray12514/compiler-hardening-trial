@@ -28,6 +28,10 @@ class DiagnosticTests(unittest.TestCase):
            original+['defaults::openssl'],original+['--channel','defaults']]
   for argv in invalid:
    with self.subTest(argv=argv),self.assertRaises(RuntimeError):m.diagnostic_argv(base,prefix,argv,[])
+ def test_saved_base_update_retains_no_pin_policy(self):
+  base=pathlib.Path('/test/base');argv=self.command(base,base)+['--no-pin']
+  converted=m.diagnostic_argv(base,base,argv,[])
+  self.assertIn('--no-pin',converted);self.assertIn('--dry-run',converted);self.assertNotIn('--yes',converted)
  def test_diagnose_rejects_apply_before_any_environment_access(self):
   with patch.object(m.sys,'argv',['script','--diagnose','latest','--apply']),patch('sys.stderr',io.StringIO()),patch.object(m,'find_base') as find:
    with self.assertRaises(SystemExit):m.main()
@@ -178,6 +182,45 @@ class LibmambaRuntimeTests(unittest.TestCase):
    self.assertTrue(all(r['version']=='2' for r in actions['LINK']))
    self.assertEqual(len(list((prefix/'conda-meta').glob('*.json'))),len(installed))
 
+class BasePinRuntimeTests(unittest.TestCase):
+ @unittest.skipUnless(os.environ.get('CSE_CONDA_PYTHON'),'Set CSE_CONDA_PYTHON for native pin regression')
+ def test_native_no_pin_allows_security_and_application_updates_from_every_pin_source(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=pathlib.Path(directory);prefix=root/'prefix';(prefix/'conda-meta').mkdir(parents=True)
+   (prefix/'conda-meta/history').write_text('');channel=root/'channel'
+   def record(name,value):return {'name':name,'version':value,'build':'0','build_number':0,'depends':[],
+    'subdir':'noarch','channel':channel.as_uri(),'size':1,'md5':'0'*32,'sha256':'0'*64,'noarch':'generic'}
+   for r in (record('certifi','2024.12.14'),record('numpy','1.26.4')):
+    (prefix/'conda-meta'/(r['name']+'-'+r['version']+'-0.json')).write_text(json.dumps(r))
+   for subdir in ('linux-64','noarch'):
+    (channel/subdir).mkdir(parents=True);packages={}
+    if subdir=='noarch':
+     for r in (record('certifi','2026.10.23'),record('numpy','1.26.4'),record('numpy','2.0')):
+      packages[r['name']+'-'+r['version']+'-0.tar.bz2']=r
+    data={'info':{'subdir':subdir},'packages':packages,'packages.conda':{},'repodata_version':1}
+    for filename in ('repodata.json','current_repodata.json'):(channel/subdir/filename).write_text(json.dumps(data))
+   argv=['install','-p',str(prefix),'--solver','libmamba','--json','--dry-run','--update-all','--prune',
+         '--override-channels','--channel',channel.as_uri(),'--strict-channel-priority','certifi>=2026.10.19','numpy']
+   for source in ('prefix','config','environment'):
+    with self.subTest(source=source):
+     pinfile=prefix/'conda-meta/pinned';config=root/'condarc'
+     for p in (pinfile,config):
+      if p.exists():p.unlink()
+     env=m.safe_environment();env.update(CONDA_OFFLINE='false',CONDA_REGISTER_ENVS='false',CONDA_PKGS_DIRS=str(root/'cache'),CONDA_REPODATA_USE_ZST='false')
+     pins=['certifi==2024.12.14','numpy==1.26.4']
+     if source=='prefix':pinfile.write_text('\n'.join(pins)+'\n')
+     elif source=='config':config.write_text('pinned_packages:\n'+''.join('  - '+p+'\n' for p in pins));env['CONDARC']=str(config)
+     else:env['CONDA_PINNED_PACKAGES']='&'.join(pins)
+     before={str(p):p.read_bytes() for p in (pinfile,config) if p.exists()}
+     def solve(ignore):
+      return subprocess.run([os.environ['CSE_CONDA_PYTHON'],'-I','-B','-c',m.LIBMAMBA_CLI]+argv+(['--no-pin'] if ignore else []),
+                            env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=30)
+     rejected=solve(False);self.assertNotEqual(rejected.returncode,0);self.assertIn('SpecsConfigurationConflict',rejected.stdout)
+     accepted=solve(True);self.assertEqual(accepted.returncode,0,accepted.stdout+accepted.stderr)
+     links=json.loads(accepted.stdout)['actions']['LINK']
+     self.assertEqual({r['name']:r['version'] for r in links},{'certifi':'2026.10.23','numpy':'2.0'})
+     self.assertEqual(before,{str(p):p.read_bytes() for p in (pinfile,config) if p.exists()})
+
 class ChannelRegressionTests(unittest.TestCase):
  def test_host_only_installed_origin_ignored(self):
   for channel in ('https://conda.anaconda.org','https://conda.anaconda.org/','https://conda.anaconda.org/linux-64','conda.anaconda.org','None','None/linux-64'):
@@ -281,6 +324,14 @@ class ChannelFlowTests(unittest.TestCase):
      self.assertTrue(all(value in ('conda-forge','https://conda.anaconda.org/conda-forge') for value in sources))
 
 class BaseUpdatePolicyTests(unittest.TestCase):
+ def test_base_can_ignore_all_pins_without_retaining_old_dependency_or_boost_names(self):
+  meta={'app':{'depends':['dependency']},'dependency':{},'boost':{'channel':'conda-forge'}}
+  with tempfile.TemporaryDirectory() as directory:
+   p=pathlib.Path(directory);(p/'conda-meta').mkdir();(p/'conda-meta/pinned').write_text('dependency==1\nboost==1.82\n')
+   intent=m.base_package_intent(meta,p,{'pinned_packages':['certifi==2024.12.14']},ignore_pins=True)
+   self.assertEqual(set(intent['roots']),{'app','libboost-python-devel'})
+   self.assertEqual(intent['pinned_packages'],[])
+   self.assertEqual(set(intent['ignored_pins']),{'dependency==1','boost==1.82','certifi==2024.12.14'})
  def test_dependency_graph_preserves_applications_without_forcing_old_dependencies(self):
   meta={n:{'version':'1','build':'0','depends':deps} for n,deps in {
    'conda':['python','old-solver-runtime'],'python':['libffi'],'jupyter':['jupyter_core','python'],
@@ -386,7 +437,7 @@ class BaseUpdatePolicyTests(unittest.TestCase):
 class BaseTransactionTests(unittest.TestCase):
  def run_loaded_base(self,apply=True,current=False,fail_install=False,offline=False,stale_install=False,
                      available=None,default_scope=False,all_envs=False,only=False,stale_plan=False,
-                     manager_stack=False,dry_run_install=False,missing_solver=False,prune_dependency=False,stale_removal=False):
+                     manager_stack=False,dry_run_install=False,missing_solver=False,prune_dependency=False,stale_removal=False,configured_pins=()):
   with tempfile.TemporaryDirectory() as directory:
    root=pathlib.Path(directory);base=root/'loaded-miniforge'
    (base/'bin').mkdir(parents=True);(base/'bin/conda').touch()
@@ -418,7 +469,7 @@ class BaseTransactionTests(unittest.TestCase):
     cmd=list(map(str,cmd));calls.append((cmd,dict(kwargs.get('env',{}))))
     if cmd[1:]==['info','--base']:return subprocess.CompletedProcess(cmd,0,str(base)+'\n','')
     if '__cse_solver_probe__' in cmd:output={'success':True,'solver':'classic' if missing_solver else 'libmamba'}
-    elif '--show' in cmd:output={}
+    elif '--show' in cmd:output={'pinned_packages':list(configured_pins)}
     elif 'search' in cmd:output={'conda':[{'name':'conda','version':v,'channel':'conda-forge','build':'0'} for v in available]}
     elif '--explicit' in cmd:return subprocess.CompletedProcess(cmd,0,'@EXPLICIT\n','')
     elif 'install' in cmd:
@@ -451,11 +502,16 @@ class BaseTransactionTests(unittest.TestCase):
   self.assertEqual(result,0,row['issues']);self.assertEqual(row['status'],'updated')
   installs=[cmd for cmd,env in calls if 'install' in cmd]
   self.assertEqual(len(installs),2);self.assertIn('--dry-run',installs[0]);self.assertIn('--update-all',installs[0])
+  self.assertTrue(all('--no-pin' in cmd for cmd in installs))
   self.assertIn('libmamba',installs[0]);self.assertNotIn('--update-deps',installs[0])
   for name in ('python','jupyter_core','libboost-python','mamba'):
    self.assertIn(name,installs[0]);self.assertFalse(any('::'+name in value for value in installs[0]))
   self.assertEqual(installed['conda']['version'],'26.9.4');self.assertEqual(installed['numpy']['version'],'2.0')
   self.assertEqual(row['conda_update']['status'],'updated');self.assertNotIn('conda_bootstrap',row)
+ def test_ignored_base_channel_pin_does_not_reject_approved_channel_plan(self):
+  result,row,calls,installed=self.run_loaded_base(configured_pins=['defaults::certifi==2024.12.14'])
+  self.assertEqual(result,0,row['issues']);self.assertEqual(row['ignored_pins'],['defaults::certifi==2024.12.14'])
+  self.assertTrue(all('--no-pin' in c for c,e in calls if 'install' in c))
  def test_full_base_update_prunes_unused_dependencies_and_verifies_actual_removal(self):
   result,row,calls,installed=self.run_loaded_base(prune_dependency=True)
   self.assertEqual(result,0,row['issues']);self.assertNotIn('legacy-runtime',installed)

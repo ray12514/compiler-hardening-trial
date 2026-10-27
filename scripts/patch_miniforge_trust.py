@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 19 (2026-10-27).
+"""CSE Miniforge certificate maintenance, revision 20 (2026-10-27).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -60,8 +60,11 @@ Base Conda, Python, solver packages, NumPy, Jupyter, Boost and other installed b
 applications update compatibly in ONE transaction. Retained requests come from
 explicit history and the installed dependency graph, not a mandatory request for
 every old dependency. The solve uses --update-all --prune, security minimums and
-approved channel priority, without historical per-package source locks. Unused
-dependencies may leave; applications and explicit site pins remain protected.
+approved channel priority, without historical per-package source locks. All base
+package pins are ignored with --no-pin, including prefix pin files and
+pinned_packages settings. Python and applications can update together; unused
+dependencies may leave. Stored pin/configuration files and the Miniforge/module/
+Spack release selection are retained. Non-base prefixes keep their pin policy.
 Known conda-forge boost/boost-cpp names migrate to libboost-python-devel and
 libboost-devel, preserving development functionality. Unknown conflicts are not
 treated as proof of deprecation. The exact validated versions/builds and removals
@@ -159,7 +162,7 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 19
+SCRIPT_REVISION = 20
 BASE_REPLACEMENTS = {'boost':('libboost-python-devel',),'boost-cpp':('libboost-devel',)}
 ROOTS = {
  '7DD78D5F4F13459A83DFF9ABBBA62EDBAF6F2D102BF257FD712F4D9F2746ED8D': 'emSign Root TLS CA - G3',
@@ -546,7 +549,7 @@ def history_roots(prefix, meta):
     return roots & set(meta)
 
 
-def base_package_intent(meta, prefix=None, config=None):
+def base_package_intent(meta, prefix=None, config=None, ignore_pins=False):
     """Preserve explicit requests and every source component of the dependency graph.
 
     Keeping source components covers every installed package initially, including
@@ -585,7 +588,7 @@ def base_package_intent(meta, prefix=None, config=None):
     pinfile=prefix/'conda-meta/pinned' if prefix is not None else None
     if pinfile is not None and pinfile.is_file():
         pins.extend(line.split('#',1)[0].strip() for line in pinfile.read_text().splitlines() if line.split('#',1)[0].strip())
-    pinned={spec_name(pin) for pin in pins} & names
+    pinned=({spec_name(pin) for pin in pins} & names) if not ignore_pins else set()
     roots|=explicit | (set(meta) & (set(MINIMUM)|{'conda','python','mamba','conda-libmamba-solver'}))
     roots|=pinned
     # Verified conda-forge naming migration: current recipes prohibit the old
@@ -599,6 +602,7 @@ def base_package_intent(meta, prefix=None, config=None):
             roots.discard(old);roots.update(new)
             migrations.append({'name':old,'replacements':list(new),'reason':'conda-forge Boost package naming migration'})
     return {'roots':sorted(roots),'explicit_requests':sorted(explicit),'pinned_packages':sorted(pinned),
+            'ignored_pins':sorted(set(pins)) if ignore_pins else [],
             'dependencies':sorted(set(meta)-roots-{r['name'] for r in migrations}),
             'replacements':migrations}
 
@@ -885,6 +889,8 @@ def final_summary(results, apply, bundle, say):
         if row.get('unknown_package_origins'): say('  Missing/invalid origins: %d; details: %s'%(len(row['unknown_package_origins']),row.get('channel_records_file','not recorded')))
         if row.get('excluded_installed_sources'): say('  Excluded installed sources: '+', '.join(sorted({r['source'] for r in row['excluded_installed_sources']})))
         if row.get('package_policy'):say('  Package policy: '+row['package_policy'])
+        if row.get('package_pin_policy'):say('  Package pins: '+row['package_pin_policy'])
+        if row.get('ignored_pins'):say('  Ignored base pin specs: '+', '.join(row['ignored_pins']))
         for target in row.get('package_targets',[]):
             say('  Package target: %s %s -> %s | source=%s' % (target['name'],target['current'],target['request'],target.get('source','not recorded')))
         for change in row.get('package_plan',[]):
@@ -1030,6 +1036,8 @@ def report_existing(directory, verbose=False):
                 print('  Newest stable Conda available: %s | source=%s'%(bootstrap['latest_available'],bootstrap['source']))
         for issue in issues:
             if 'Command failed; see private run.log' not in issue: print('  Reason: '+issue)
+        if row.get('package_pin_policy'):print('  Package pins: '+row['package_pin_policy'])
+        if row.get('ignored_pins'):print('  Ignored base pin specs: '+', '.join(row['ignored_pins']))
         for removal in row.get('package_removals',[]):
             print('  %s removal: %s=%s | %s'%(removal.get('status','planned').capitalize(),removal['name'],removal['before'],removal['reason']))
         for event in evidence:
@@ -1062,7 +1070,7 @@ def diagnostic_argv(base, prefix, argv, requested):
     if len(argv)<2 or Path(argv[0]).resolve()!=(base/'bin/conda').resolve() or argv[1]!='install':
         raise RuntimeError('Saved failure is not an install from the currently selected base')
     switches={'--json','--offline','--override-channels','--strict-channel-priority',
-              '--update-deps','--update-all','--freeze-installed','--prune','--dry-run'}
+              '--update-deps','--update-all','--freeze-installed','--prune','--dry-run','--no-pin'}
     output=['install'];channels=set(requested);specs=[];prefixes=[];i=2
     while i<len(argv):
         value=argv[i];i+=1
@@ -1082,6 +1090,8 @@ def diagnostic_argv(base, prefix, argv, requested):
         specs.append(value);output.append(value)
     if prefixes!=[prefix.resolve()] or '--override-channels' not in output or '--strict-channel-priority' not in output:
         raise RuntimeError('Saved command lacks the expected exact prefix and channel policy')
+    if '--no-pin' in output and prefix.resolve()!=base.resolve():
+        raise RuntimeError('Ignoring saved package pins is permitted only for the selected base')
     for spec in specs:
         if '::' in spec:
             origin=spec.rsplit('::',1)[0]
@@ -1142,7 +1152,7 @@ def diagnose_existing(directory, base, offline=False, timeout_seconds=600):
     def progress():
         while not finished.wait(30):print('Still diagnosing dependencies (%ds elapsed)'%(time.monotonic()-started),flush=True)
     heartbeat=threading.Thread(target=progress,daemon=True);heartbeat.start()
-    print('Running the saved request with the same pins and strict channel priority; diagnostic limit %d seconds.'%timeout_seconds,flush=True)
+    print('Running the saved request with its saved pin policy and strict channel priority; diagnostic limit %d seconds.'%timeout_seconds,flush=True)
     timed_out=False
     try:
         result=subprocess.run(command,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout_seconds)
@@ -1656,8 +1666,10 @@ def main():
             row['phase'] = 'read conda package metadata'
             meta = records(prefix)
             initial_meta = meta
+            broad = prefix == base
+            package_config={k:v for k,v in config.items() if k!='pinned_packages'} if broad else config
             row['installed_channels']=sorted({str(r.get('channel') or r.get('url') or 'unknown') for r in meta.values()})
-            channel_names,channel_urls,channel_args,origins,excluded_origins,unknown_origins=environment_channels(meta,args.channel,config)
+            channel_names,channel_urls,channel_args,origins,excluded_origins,unknown_origins=environment_channels(meta,args.channel,package_config)
             row['requested_channels']=channel_urls
             row['package_origins']=origins
             row['excluded_installed_sources']=excluded_origins
@@ -1672,18 +1684,20 @@ def main():
                 say('No usable channel origin for %d package(s); no malformed source added. Fallback/explicit channels apply. Details: %s'%(len(unknown_origins),channel_report))
                 detail('Unknown/non-channel package origins (no source inferred): '+', '.join(unknown_origins))
             for pinfile in (prefix/'conda-meta/pinned',):
-                if pinfile.is_file():
+                if not broad and pinfile.is_file():
                     for pin in pinfile.read_text().splitlines():
                         pin=pin.split('#',1)[0].strip()
                         if '::' in pin and not allowed_pin_origin(pin.split('::',1)[0],channel_names,channel_urls,config):
                             raise RuntimeError('Channel-qualified prefix pin outside requested channels: '+pin)
-            broad = prefix == base
             upgrade_conda = args.upgrade_conda or broad
-            row['package_policy']='base applications retained; dependencies solved together and unused dependencies pruned' if broad else 'targeted maintenance; application packages pinned'
+            row['package_policy']='base applications retained; all package pins ignored; dependencies solved together and unused dependencies pruned' if broad else 'targeted maintenance; application packages pinned'
             say('Package policy: '+row['package_policy'])
             if broad:
                 row['conda_update']=conda_update_status(meta)
-                row['base_intent']=base_package_intent(meta,prefix,config)
+                row['base_intent']=base_package_intent(meta,prefix,config,ignore_pins=True)
+                row['package_pin_policy']='ignore all package pins for this base update; stored settings retained'
+                row['ignored_pins']=row['base_intent']['ignored_pins']
+                say('Base package pins ignored: '+(', '.join(row['ignored_pins']) or 'none configured'))
                 (logdir/'base-package-intent.json').write_text(json.dumps(row['base_intent'],indent=2))
                 say('Base inventory: %d installed; %d retained application/security requests; %d solver-managed dependencies'%(
                     len(meta),len(row['base_intent']['roots']),len(row['base_intent']['dependencies'])))
@@ -1711,7 +1725,7 @@ def main():
             if args.apply:
                 if row['issues']: raise RuntimeError('Package review required; no package/configuration/permission changes attempted for this prefix')
                 row['phase'] = 'save configuration and conda package inventory'
-                for relative in ('.condarc','conda-meta/state','conda-meta/history'):
+                for relative in ('.condarc','conda-meta/state','conda-meta/history','conda-meta/pinned'):
                     p=prefix/relative
                     if p.is_file(): (logdir/('%03d-before-'%i+relative.replace('/','_'))).write_bytes(p.read_bytes())
                 (logdir/('%03d-before-explicit.txt'%i)).write_text(run([conda,'list','-p',prefix,'--explicit']).stdout)
@@ -1724,7 +1738,7 @@ def main():
                     targets,allowed,specs=plan_specs(meta,upgrade_conda,broad=True,conda_minimum=conda_minimum,roots=retained)
                 if targets:
                     row['phase'] = 'solve package update (dry run)'
-                    cmd=[conda,'install','-p',prefix,'--solver','libmamba','--json']+(['--update-all','--prune'] if broad else ['--freeze-installed'])+channel_args+specs
+                    cmd=[conda,'install','-p',prefix,'--solver','libmamba','--json']+(['--update-all','--prune','--no-pin'] if broad else ['--freeze-installed'])+channel_args+specs
                     if args.offline: cmd.append('--offline')
                     plan=runjson(cmd+['--dry-run'])
                     (logdir/('%03d-plan.json'%i)).write_text(json.dumps(plan,indent=2))
@@ -1735,7 +1749,7 @@ def main():
                         say('Validated package removal: %s=%s | %s'%(removal['name'],removal['before'],removal['reason']))
                     detail('Validated package changes: '+(', '.join(changed) or 'none'))
                     # Lock the planned final versions/builds before the execution solve.
-                    final,exact=exact_plan_specs(meta,plan,origins,args.channel,config)
+                    final,exact=exact_plan_specs(meta,plan,origins,args.channel,package_config)
                     if broad:
                         verify_retained(final,retained)
                         retired={r['name'] for r in row['base_intent']['replacements']} & set(final)
@@ -1743,7 +1757,7 @@ def main():
                     if broad:row['conda_update']['plan_conda_version']=final.get('conda',(None,None))[0]
                     verify_minimums(meta,{n:{'version':v} for n,(v,b) in final.items()},upgrade_conda,
                                     row.get('conda_update',{}).get('target',CONDA_MINIMUM))
-                    execution=[conda,'install','-p',prefix,'--solver','libmamba','--json','--yes']+(['--prune'] if broad else ['--freeze-installed'])+channel_args+exact
+                    execution=[conda,'install','-p',prefix,'--solver','libmamba','--json','--yes']+(['--prune','--no-pin'] if broad else ['--freeze-installed'])+channel_args+exact
                     if args.offline: execution.append('--offline')
                     row['phase'] = 'install validated package plan'
                     row['changes_started']=True
