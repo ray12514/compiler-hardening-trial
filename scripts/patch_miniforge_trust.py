@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 17 (2026-10-27).
+"""CSE Miniforge certificate maintenance, revision 18 (2026-10-27).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -18,11 +18,11 @@ Python 3.8+, standard library. Run as a maintenance account, not root.
 No test-site connections, connectivity probes, remote execution or OS writes.
 Preview is local-only: inventory, CA inspection, ownership and permissions.
 Apply reuses non-default channels recorded in each environment's installed conda
-packages, preserving per-package sources where identifiable. conda-forge remains a
+packages. Non-base requests preserve per-package sources; base uses channel priority. conda-forge remains a
 fallback; --channel adds an explicit community channel/mirror when metadata is absent. Anaconda defaults/repo.anaconda.com sources are excluded.
 All solves use --override-channels and strict channel priority.
-There is no PyPI/pip-install fallback. External conda plugins are disabled for
-maintenance subprocesses so conda-pypi cannot introduce a PyPI source.
+There is no PyPI/pip-install fallback. Solver subprocesses discover no external
+plugins and explicitly enable only the installed libmamba solver hook.
 --offline forbids network package retrieval; required packages must be cached or
 available in the configured conda-forge mirror/cache. No installer replacement is required.
 Run once per distinct shared installation on each system; it does not SSH to hosts.
@@ -51,20 +51,20 @@ and stdout/stderr; final summaries include the underlying error rather than a wr
 Default package targets: existing ca-certificates>=2026.10.19 (conda-forge),
 certifi>=2026.10.19, pip>=26.2.2, uv>=0.13.4, and sigstore>=4.5.1 where
 installed through conda. Base also requests conda>=26.9.4 where installed;
---upgrade-conda requests that minimum in non-base prefixes. Related mamba/solver packages are requested together
-when installed. Apply checks the installed Conda's approved source for its newest
-stable release (cached metadata with --offline), keeping the security minimum.
-If base conda is older, apply first solves,
-installs and verifies a targeted conda/CA-package bootstrap with that same conda
-executable. Only then does it solve the full base update. The bootstrap preserves
-the installed Miniforge release/prefix; no installer is downloaded or replaced.
-The base prefix permits all installed conda packages, including Python, conda,
-NumPy, matplotlib and Kerberos dependencies, to update compatibly. Its solve uses
---update-all and security minimum constraints, then executes the validated exact plan.
-Non-base prefixes retain Python/application version+build pins and --freeze-installed.
-All use the classic solver. Blocked dependency/mirror plans are reported.
-Python <3.11 with conda-forge certifi may need a reviewed backport or replacement
-prefix. Existing conda may be retained per the conda maintainers' CA-only guidance.
+--upgrade-conda requests that minimum in non-base prefixes.
+The existing Miniforge distribution/prefix is kept. No installer is downloaded,
+replaced or rerun. Apply uses the installed libmamba solver with entry-point
+plugin discovery disabled and only its solver hook explicitly enabled. PyPI
+integration plugins are not enabled. A missing/broken solver fails before updates.
+Base Conda, Python, solver packages, NumPy, Jupyter, Boost and other installed base
+packages may update compatibly in ONE transaction. The solve uses --update-all,
+security minimums and approved channel priority, without historical per-package
+source locks. Explicit site pins still apply. The exact validated versions/builds
+are installed and verified before configuring trust. There is no manager-only
+bootstrap and no classic conflict-hint graph. Read-only planning is bounded at
+180 seconds; an installation transaction is not killed by that planning limit.
+Non-base prefixes retain Python/application version+build pins, source-qualified
+requests and --freeze-installed. --offline uses cached packages/channel metadata.
 Outdated pip-managed tools are reported for reviewed migration to conda-forge,
 without automatically overwriting pip-owned files. If sigstore is installed,
 an offline `python -I -m sigstore --help` smoke check reports startup failures.
@@ -558,106 +558,80 @@ def exact_plan_specs(meta, plan, origins, extras, config):
     return final,exact
 
 
-def conda_bootstrap_status(meta):
+def conda_update_status(meta):
     current=meta.get('conda',{}).get('version')
     return {'status':'not-installed' if current is None else
             ('would-update' if version(current)<version(CONDA_MINIMUM) else 'would-check-newest'),
             'before':current,'minimum':CONDA_MINIMUM,
-            'policy':'newest stable from approved source; checked during apply'}
+            'policy':'Conda and base packages update together in one transaction'}
 
 
-def bootstrap_dependencies(meta):
-    """Relax installer-history versions for the installed management runtime.
+def select_conda_target(base, meta, origins, config, offline, runjson, logdir, row, say):
+    status=row['conda_update']
+    if status['before'] is None:return CONDA_MINIMUM
+    source=origins.get('conda') or requested_channels([],{k:v for k,v in config.items() if k!='pinned_packages'})[1][0]
+    row['phase']='find newest stable base conda'
+    search=[base/'bin/conda','search','--json','--override-channels','--channel',source,
+            '--repodata-fn','current_repodata.json','conda']
+    if offline:search.append('--offline')
+    available=runjson(search)
+    (logdir/'base-conda-search.json').write_text(json.dumps(available,indent=2))
+    stable=[r['version'] for r in available.get('conda',[])
+            if re.fullmatch(r'\d+(?:\.\d+)*',str(r.get('version','')))]
+    if not stable:raise RuntimeError('No stable Conda release available from '+source)
+    latest=max(stable,key=version)
+    if version(latest)<version(CONDA_MINIMUM):
+        raise RuntimeError('Newest available Conda is %s from %s; required >=%s%s'%(
+            latest,source,CONDA_MINIMUM,' (offline metadata may be stale)' if offline else ''))
+    target=max((latest,status['before']),key=version)
+    status.update(status='planned',latest_available=latest,source=source,target=target)
+    say('Base Conda update: installed=%s; newest stable=%s; target>=%s; same prefix, one base transaction'%(
+        status['before'],latest,target))
+    return target
 
-    Classic's --update-deps relaxes dependencies only AFTER an initial solve;
-    exact installer history can make that first solve impossible. Explicit site
-    pins remain enforced by conda itself.
-    """
-    targets=set(meta)&(MANAGEMENT_DEPS|MANAGERS|{'conda','python','pip'})
-    pending=list(targets)
-    while pending:
-        for dep in meta[pending.pop()].get('depends',[]):
-            name=re.split(r'[ <>=!~\[]',dep,1)[0].rsplit('::',1)[-1]
-            if name in meta and name not in targets:
-                targets.add(name);pending.append(name)
-    return targets
+
+LIBMAMBA_CLI = r'''
+import json, os, sys
+# Prevent all entry-point discovery before Conda constructs its plugin manager.
+from conda.plugins.manager import CondaPluginManager
+CondaPluginManager.load_entrypoints = lambda self, *args, **kwargs: 0
+# The registry contains built-ins plus the one solver hook registered below.
+# no_plugins must be false so CLI initialization retains that explicit hook.
+os.environ['CONDA_NO_PLUGINS'] = 'false'
+from conda import plugins
+from conda.plugins.types import CondaSolver
+from conda.base.context import context
+from conda.cli.main import main
+from conda_libmamba_solver.solver import LibMambaSolver
+class SolverOnly:
+    @plugins.hookimpl
+    def conda_solvers(self):
+        yield CondaSolver(name='libmamba', backend=LibMambaSolver)
+manager = context.plugin_manager
+manager.disable_external_plugins()
+manager.register(SolverOnly(), name='cse-libmamba-solver-only')
+manager.get_cached_solver_backend.cache_clear()
+if sys.argv[1:] == ['__cse_solver_probe__']:
+    from conda import __version__
+    external = [name for name, plugin in manager.list_name_plugin()
+                if plugin is not None and not name.startswith('conda.plugins.')]
+    if external != ['cse-libmamba-solver-only']:
+        raise RuntimeError('Unexpected external plugins: '+repr(external))
+    manager.get_solver_backend('libmamba')
+    print(json.dumps({'success':True,'solver':'libmamba','conda_version':__version__,
+                      'external_plugins':external}))
+else:
+    sys.exit(main(*sys.argv[1:]))
+'''
 
 
-def bootstrap_conda(base, meta, channel_args, origins, extras, config, offline,
-                    runjson, logdir, row, say):
-    """Upgrade the loaded base's manager before asking it to update all packages."""
-    status=row['conda_bootstrap']
-    if status['status']=='not-installed':return meta
-    required={'ca-certificates':MINIMUM['ca-certificates'],
-              'certifi':MINIMUM['certifi']}
-    common=[base/'bin/conda','install','-p',base,'--solver','classic','--json','--update-deps']+channel_args
-    if offline:common.append('--offline')
-    def verify(metadata, stage):
-        status[stage+'_conda_version']=metadata.get('conda',{}).get('version')
-        for name,minimum in dict({'conda':status['target']},**required).items():
-            current=metadata.get(name,{}).get('version')
-            if current is None or version(current)<version(minimum):
-                raise RuntimeError('Conda bootstrap did not meet required minimum in %s: %s=%s; required >=%s. %s'%(
-                    stage,name,current if current is not None else 'missing',minimum,
-                    'No bootstrap install was attempted; inspect base-conda-bootstrap-plan.json.' if stage=='plan' else
-                    'The install command returned, but installed records do not confirm the upgrade; inspect base-conda-bootstrap-install.json.'))
-    try:
-        row['phase']='find newest stable base conda'
-        # Search only the manager's own approved source. Search does not accept
-        # the install-only --strict-channel-priority flag.
-        source=origins.get('conda') or requested_channels([],{k:v for k,v in config.items() if k!='pinned_packages'})[1][0]
-        search=[base/'bin/conda','search','--json','--override-channels','--channel',source,'conda']
-        if offline:search.append('--offline')
-        available=runjson(search)
-        (logdir/'base-conda-bootstrap-search.json').write_text(json.dumps(available,indent=2))
-        stable=[r['version'] for r in available.get('conda',[])
-                if re.fullmatch(r'\d+(?:\.\d+)*',str(r.get('version','')))]
-        if not stable:raise RuntimeError('No stable Conda release available from '+source+(' in offline metadata' if offline else ''))
-        latest=max(stable,key=version)
-        if version(latest)<version(CONDA_MINIMUM):
-            raise RuntimeError('Newest available Conda is %s from %s; required >=%s%s'%(
-                latest,source,CONDA_MINIMUM,' (offline metadata may be stale)' if offline else ''))
-        status.update(latest_available=latest,source=source,target=max((latest,status['before']),key=version))
-        say('Conda bootstrap: installed=%s; newest stable=%s; source=%s'%(status['before'],latest,source))
-        if version(status['before'])>=version(latest):
-            status.update(status='not-needed',after=status['before'])
-            return meta
-        status['status']='would-update'
-        bootstrap_origins=dict(origins,conda=source)
-        # Old mamba/solver packages can pin conda to an older major release.
-        # Request their compatible replacements in this transaction too, rather
-        # than making the old solver try to retain a conflicting manager stack.
-        managers=sorted(set(meta)&MANAGERS)
-        status['manager_targets']=managers
-        dependencies=bootstrap_dependencies(meta)-set(required)-{'conda'}
-        status['dependency_targets']=sorted(dependencies)
-        specs=qualify_specs(['conda=='+status['target']]+[name+'>='+value for name,value in sorted(required.items())]+sorted(dependencies),bootstrap_origins)
-        row['phase']='solve base conda bootstrap (dry run)'
-        plan=runjson(common+specs+['--dry-run'])
-        plan_file=logdir/'base-conda-bootstrap-plan.json'
-        plan_file.write_text(json.dumps(plan,indent=2))
-        check_plan(plan,None)  # Base dependencies may move; source/removal guards still apply.
-        final,exact=exact_plan_specs(meta,plan,bootstrap_origins,extras,config)
-        verify({name:{'version':value} for name,(value,build) in final.items()},'plan')
-        status['plan_file']=str(plan_file)
-        status['package_plan']=[{'name':r['name'],'version':r['version'],
-                                'build':r.get('build_string') or r.get('build')}
-                               for r in plan.get('actions',{}).get('LINK',[])]
-        row['phase']='install validated base conda bootstrap'
-        row['changes_started']=True
-        execution=runjson(common+['--yes']+exact)
-        (logdir/'base-conda-bootstrap-install.json').write_text(json.dumps(execution,indent=2))
-        if execution.get('dry_run'):
-            raise RuntimeError('Conda returned a dry-run result instead of installing the bootstrap; inspect base-conda-bootstrap-install.json')
-        check_plan(execution,None)
-        after=records(base)
-        verify(after,'installed')
-        status.update(status='updated',after=after['conda']['version'])
-        say('Conda bootstrap verified: conda=%s; continuing the base update'%status['after'])
-        return after
-    except Exception as exc:
-        status.update(status='incomplete',reason=str(exc))
-        raise
+def solver_invocation(base, cmd):
+    values=list(map(str,cmd))
+    if values and values[0]==str(base/'bin/conda'):
+        probe=values[1:]==['__cse_solver_probe__']
+        solve=len(values)>1 and values[1]=='install' and '--solver' in values and values[values.index('--solver')+1]=='libmamba'
+        if probe or solve:return [str(base/'bin/python'),'-I','-B','-c',LIBMAMBA_CLI]+values[1:]
+    return values
 
 
 def verify_minimums(before, after, upgrade_conda=False, conda_minimum=CONDA_MINIMUM):
@@ -764,9 +738,9 @@ def final_summary(results, apply, bundle, say):
             say('  Verified package: %s %s -> %s' % (change['name'],change['before'],change['after']))
         if row.get('security_verification'):
             say('  Verified required minimums: '+', '.join('%s=%s (>= %s)'%(n,v['version'],v['minimum']) for n,v in sorted(row['security_verification'].items())))
-        if row.get('conda_bootstrap'):
-            bootstrap=row['conda_bootstrap']
-            say('  Conda bootstrap: %s | before=%s | after=%s | minimum=%s'%(
+        if row.get('conda_update') or row.get('conda_bootstrap'):
+            bootstrap=row.get('conda_update') or row['conda_bootstrap']
+            say('  Conda update: %s | before=%s | after=%s | minimum=%s'%(
                 bootstrap['status'],bootstrap['before'],bootstrap.get('after','not changed/verified'),bootstrap['minimum']))
             if bootstrap.get('latest_available'):
                 say('  Newest stable Conda available: %s | source=%s'%(bootstrap['latest_available'],bootstrap['source']))
@@ -815,7 +789,7 @@ def diagnostic_text(stdout, stderr):
 def failure_category(text):
     value = text.lower()
     if 'unsupported operand type(s) for |' in value and "'set'" in value and "'tuple'" in value:
-        return 'Conda classic conflict-reporting bug', 'Conda crashed while explaining a dependency conflict. Use revision 15 or newer, which disables detailed conflict hints for maintenance subprocesses; inspect any remaining solver failure and explicit pins.'
+        return 'Conda classic conflict-reporting bug', 'Conda classic crashed while explaining a dependency conflict. Use the current libmamba update path; it reports conflicts without classic hint analysis.'
     if 'non-conda' in value or 'conda-forge migration' in value:
         return 'Mixed package ownership', 'Review the named pip/uv-managed tool and its requirements; do not overwrite it with conda in bulk.'
     if any(x in value for x in ('permission denied','permissionerror','not writable','notwritableerror','read-only file system')):
@@ -891,9 +865,9 @@ def report_existing(directory, verbose=False):
         print('\n%s | %s | owner=%s' % (row['prefix'],row['status'],row.get('ownership',{}).get('owner','unknown')))
         print('  Category: '+category)
         print('  Changes started: '+str(row.get('changes_started','not recorded'))+' (not a transaction/rollback guarantee)')
-        if row.get('conda_bootstrap'):
-            bootstrap=row['conda_bootstrap']
-            print('  Conda bootstrap: %s | before=%s | after=%s'%(
+        if row.get('conda_update') or row.get('conda_bootstrap'):
+            bootstrap=row.get('conda_update') or row['conda_bootstrap']
+            print('  Conda update: %s | before=%s | after=%s'%(
                 bootstrap['status'],bootstrap['before'],bootstrap.get('after','not changed/verified')))
             if bootstrap.get('latest_available'):
                 print('  Newest stable Conda available: %s | source=%s'%(bootstrap['latest_available'],bootstrap['source']))
@@ -924,20 +898,6 @@ def report_existing(directory, verbose=False):
     return 0
 
 
-CONFLICT_DIAGNOSTIC = r'''
-import sys
-from conda.resolve import Resolve
-from conda.cli.main import main
-if not sys.argv[1:] or sys.argv[1] != 'install' or '--dry-run' not in sys.argv or '--yes' in sys.argv:
-    raise RuntimeError('Diagnostic process requires an install dry run without --yes')
-original = Resolve.build_conflict_map
-def compatible(self, specs, specs_to_add=None, history_specs=None):
-    return original(self, specs, set(specs_to_add) if specs_to_add is not None else None, history_specs)
-Resolve.build_conflict_map = compatible
-sys.exit(main(*sys.argv[1:]))
-'''
-
-
 def diagnostic_argv(base, prefix, argv, requested):
     """Rebuild only our install command; saved logs are data, never shell code."""
     if len(argv)<2 or Path(argv[0]).resolve()!=(base/'bin/conda').resolve() or argv[1]!='install':
@@ -953,7 +913,7 @@ def diagnostic_argv(base, prefix, argv, requested):
             if i==len(argv):raise RuntimeError('Incomplete saved command option: '+value)
             argument=argv[i];i+=1
             if value=='-p':prefixes.append(Path(argument).resolve())
-            elif value=='--solver' and argument!='classic':raise RuntimeError('Diagnostic supports the classic solver only')
+            elif value=='--solver' and argument not in ('classic','libmamba'):raise RuntimeError('Unsupported saved solver')
             elif value=='--channel':
                 if invalid_channel_reason(argument) or forbidden_channel(argument):raise RuntimeError('Invalid diagnostic channel')
                 channels.add(argument)
@@ -992,9 +952,11 @@ def diagnose_existing(directory, base, offline=False, timeout_seconds=600):
     if any(p==directory or p in directory.parents for p in (base,prefix)):
         raise RuntimeError('Diagnostic logs must be outside the managed prefix trees')
     argv=diagnostic_argv(base,prefix,record['argv'],row.get('requested_channels',[]))
+    if '--solver' not in argv:raise RuntimeError('Saved command has no solver selection')
+    argv[argv.index('--solver')+1]='libmamba'
     if offline and '--offline' not in argv:argv.append('--offline')
     print('DIAGNOSTIC DRY RUN: '+str(prefix),flush=True)
-    print('Detailed hints enabled with a process-local tuple compatibility fix; installed Conda files are not patched.',flush=True)
+    print('Solver: installed libmamba; no classic conflict-hint analysis and no installed Conda file patches.',flush=True)
     print('No package transaction, CA/configuration update, chmod or chgrp will run. Conda may refresh its repodata cache.',flush=True)
     print('Current UID/groups: %s / %s'%(os.geteuid(),sorted(groups())))
     try:print('cse membership confirmed; GID '+str(maintenance_gid()))
@@ -1008,7 +970,7 @@ def diagnose_existing(directory, base, offline=False, timeout_seconds=600):
     for path in dict.fromkeys([base,prefix,prefix/'conda-meta',prefix/'.condarc']+caches):
         print_access(access_snapshot(path),print)
     print('Group write/traverse access can permit package replacement without file ownership; chmod/chgrp of foreign-owned files still needs the owner/admin.',flush=True)
-    env.update(CONDA_UNSATISFIABLE_HINTS='true',CONDA_DRY_RUN='true',PYTHONDONTWRITEBYTECODE='1',
+    env.update(CONDA_UNSATISFIABLE_HINTS='false',CONDA_DRY_RUN='true',PYTHONDONTWRITEBYTECODE='1',
                CONDA_OFFLINE='true' if '--offline' in argv else 'false')
     bundle=base/'etc/cse-trust/ca-bundle.pem';empty=base/'etc/cse-trust/empty-ca-dir'
     if not bundle.is_file() or not empty.is_dir():
@@ -1016,7 +978,7 @@ def diagnose_existing(directory, base, offline=False, timeout_seconds=600):
     for key in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','CURL_CA_BUNDLE','PIP_CERT'):env[key]=str(bundle)
     if any(empty.iterdir()):raise RuntimeError('Expected dedicated empty CA directory')
     env['SSL_CERT_DIR']=str(empty)
-    command=[str(base/'bin/python'),'-I','-B','-c',CONFLICT_DIAGNOSTIC]+argv
+    command=solver_invocation(base,[str(base/'bin/conda')]+argv)
     finished=threading.Event();started=time.monotonic()
     def progress():
         while not finished.wait(30):print('Still diagnosing dependencies (%ds elapsed)'%(time.monotonic()-started),flush=True)
@@ -1353,7 +1315,7 @@ def main():
     ap.add_argument('--inspect-trust',action='store_true',help='Read actual CSE/base CA files and configuration; no updates')
     ap.add_argument('--trust-only',action='store_true',help='Only prepare/write the CSE bundle and shell snippet; no package/environment permission changes')
     scope=ap.add_mutually_exclusive_group()
-    scope.add_argument('--base-only',action='store_true',help='Select only the loaded base; bootstrap older conda before the full update')
+    scope.add_argument('--base-only',action='store_true',help='Select only the loaded base; update Conda and compatible base packages together')
     scope.add_argument('--only',type=Path,action='append',default=[],help='Select only this exact environment; repeatable; still uses the base conda/CSE bundle')
     scope.add_argument('--all-envs',action='store_true',help='Opt into discovery and maintenance of all eligible environments; default is base only')
     ap.add_argument('--channel',action='append',default=[],help='Additional approved community channel or mirror; repeatable; Anaconda defaults excluded')
@@ -1416,7 +1378,7 @@ def main():
         if args.verbose: print(s,flush=True)
         log.write(s+'\n')
     say('Mode: '+('APPLY' if args.apply else 'LOCAL PREVIEW; no network operations'))
-    say('Classic solver: detailed conflict hints disabled to avoid the upstream set/tuple reporting crash; incompatible plans remain rejected.')
+    say('Solver: installed libmamba only; external plugin discovery disabled; base Conda and packages update together.')
     say('Fallback/explicit package channels: '+', '.join(channel_names)+'; Anaconda defaults excluded; external plugins disabled; no PyPI fallback')
     say('Resolved channel URLs: '+', '.join(channel_urls))
     say('Scope: '+('CSE trust files only' if args.trust_only else ', '.join(str(p)+(' [BASE]' if p==base else '') for p in prefixes)))
@@ -1451,7 +1413,12 @@ def main():
         heartbeat=threading.Thread(target=progress,daemon=True)
         heartbeat.start()
         try:
-            r = subprocess.run(list(map(str,cmd)),env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            limit=30 if '__cse_solver_probe__' in cmd else (180 if 'search' in cmd or ('install' in cmd and '--dry-run' in cmd) else None)
+            r = subprocess.run(solver_invocation(base,cmd),env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=limit)
+        except subprocess.TimeoutExpired as exc:
+            decoded=lambda value: value.decode(errors='replace') if isinstance(value,bytes) else (value or '')
+            raise record_failure(cmd,decoded(exc.stdout),decoded(exc.stderr),None,
+                                 'Conda planning did not complete within %s seconds; no package transaction attempted. Inspect the saved command output.'%limit) from exc
         except OSError as exc:
             raise record_failure(cmd,'',str(exc),None, str(exc)+(' | filename: '+repr(exc.filename) if exc.filename else '')) from exc
         finally:
@@ -1557,12 +1524,12 @@ def main():
             row['package_policy']='all base packages may update' if broad else 'targeted maintenance; application packages pinned'
             say('Package policy: '+row['package_policy'])
             if broad:
-                row['conda_bootstrap']=conda_bootstrap_status(meta)
-                say('Conda bootstrap: '+row['conda_bootstrap']['status']+
-                    ' | current='+str(row['conda_bootstrap']['before'])+' | minimum='+CONDA_MINIMUM)
+                row['conda_update']=conda_update_status(meta)
+                say('Conda update: '+row['conda_update']['status']+
+                    ' | current='+str(row['conda_update']['before'])+' | minimum='+CONDA_MINIMUM)
             targets,allowed,specs = plan_specs(meta,upgrade_conda,broad=broad)
-            specs=qualify_specs(specs,origins)
-            row['package_targets'] = [{'name':n,'current':meta[n]['version'],'request':('>='+MINIMUM[n] if n in MINIMUM else ('>='+CONDA_MINIMUM if n == 'conda' else 'compatible build from installed source')),'source':origins.get(n,'fallback/explicit allowed channels')} for n in sorted(targets)]
+            specs=specs if broad else qualify_specs(specs,origins)
+            row['package_targets'] = [{'name':n,'current':meta[n]['version'],'request':('>='+MINIMUM[n] if n in MINIMUM else ('>='+CONDA_MINIMUM if n == 'conda' else 'compatible build from installed source')),'source':('approved channels in priority order' if broad else origins.get(n,'fallback/explicit allowed channels'))} for n in sorted(targets)]
             detail('Package targets: '+(', '.join(sorted(targets)) or 'none'))
             audit = {'packages':{},'bundles':{}}
             py = prefix/'bin/python'
@@ -1583,18 +1550,16 @@ def main():
                     p=prefix/relative
                     if p.is_file(): (logdir/('%03d-before-'%i+relative.replace('/','_'))).write_bytes(p.read_bytes())
                 (logdir/('%03d-before-explicit.txt'%i)).write_text(run([conda,'list','-p',prefix,'--explicit']).stdout)
+                row['phase']='load installed libmamba solver'
+                probe=runjson([conda,'__cse_solver_probe__'])
+                if probe.get('solver')!='libmamba':raise RuntimeError('Installed libmamba solver could not be loaded; no package update attempted')
+                row['solver']='libmamba'
                 if broad:
-                    meta=bootstrap_conda(base,meta,channel_args,origins,args.channel,config,
-                                         args.offline,runjson,logdir,row,say)
-                    # The next solve must use the updated installed records, not
-                    # exact pins for the older manager we just replaced.
-                    _,_,channel_args,origins,_,_=environment_channels(meta,args.channel,config)
-                    conda_minimum=row['conda_bootstrap'].get('target',CONDA_MINIMUM)
+                    conda_minimum=select_conda_target(base,meta,origins,config,args.offline,runjson,logdir,row,say)
                     targets,allowed,specs=plan_specs(meta,upgrade_conda,broad=True,conda_minimum=conda_minimum)
-                    specs=qualify_specs(specs,origins)
                 if targets:
                     row['phase'] = 'solve package update (dry run)'
-                    cmd=[conda,'install','-p',prefix,'--solver','classic','--json']+(['--update-all'] if broad else ['--freeze-installed'])+channel_args+specs
+                    cmd=[conda,'install','-p',prefix,'--solver','libmamba','--json']+(['--update-all'] if broad else ['--freeze-installed'])+channel_args+specs
                     if args.offline: cmd.append('--offline')
                     plan=runjson(cmd+['--dry-run'])
                     (logdir/('%03d-plan.json'%i)).write_text(json.dumps(plan,indent=2))
@@ -1603,23 +1568,27 @@ def main():
                     detail('Validated package changes: '+(', '.join(changed) or 'none'))
                     # Lock the planned final versions/builds before the execution solve.
                     final,exact=exact_plan_specs(meta,plan,origins,args.channel,config)
+                    if broad:row['conda_update']['plan_conda_version']=final.get('conda',(None,None))[0]
                     verify_minimums(meta,{n:{'version':v} for n,(v,b) in final.items()},upgrade_conda,
-                                    row.get('conda_bootstrap',{}).get('target',CONDA_MINIMUM))
-                    execution=[conda,'install','-p',prefix,'--solver','classic','--json','--yes']+([] if broad else ['--freeze-installed'])+channel_args+exact
+                                    row.get('conda_update',{}).get('target',CONDA_MINIMUM))
+                    execution=[conda,'install','-p',prefix,'--solver','libmamba','--json','--yes']+([] if broad else ['--freeze-installed'])+channel_args+exact
                     if args.offline: execution.append('--offline')
                     row['phase'] = 'install validated package plan'
                     row['changes_started']=True
                     runjson(execution)
+                row['phase'] = 'verify installed package versions'
+                after_meta=records(prefix)
+                row['package_changes'] = [{'name':n,'before':initial_meta.get(n,{}).get('version','absent'),'after':r['version']} for n,r in sorted(after_meta.items()) if n not in initial_meta or (r['version'],r['build']) != (initial_meta[n]['version'],initial_meta[n]['build'])]
+                if broad:row['conda_update']['installed_conda_version']=after_meta.get('conda',{}).get('version')
+                row['security_verification']=verify_minimums(meta,after_meta,upgrade_conda,
+                                                           row.get('conda_update',{}).get('target',CONDA_MINIMUM))
+                if broad:row['conda_update'].update(status='updated',after=after_meta.get('conda',{}).get('version'))
                 row['phase'] = 'configure prefix trust'
                 row['changes_started']=True
                 run([conda,'config','--file',prefix/'.condarc','--set','ssl_verify',bundle])
                 run([conda,'env','config','vars','set','-p',prefix]+[k+'='+v for k,v in values.items()])
-                row['phase'] = 'verify updated packages and trust bundles'
-                after_meta=records(prefix)
-                row['package_changes'] = [{'name':n,'before':initial_meta.get(n,{}).get('version','absent'),'after':r['version']} for n,r in sorted(after_meta.items()) if n not in initial_meta or (r['version'],r['build']) != (initial_meta[n]['version'],initial_meta[n]['build'])]
                 row['trust_configuration'] = 'configured to use'
-                row['security_verification']=verify_minimums(meta,after_meta,upgrade_conda,
-                                                           row.get('conda_bootstrap',{}).get('target',CONDA_MINIMUM))
+                row['phase'] = 'verify runtime packages and trust bundles'
                 if 'python' in meta:
                     after=runjson([py,'-I','-c',AUDIT])
                     for n in ('pip','certifi','uv','sigstore'):
@@ -1659,6 +1628,8 @@ def main():
             log.write(traceback.format_exc())
         except Exception as exc:
             row['issues'].append(str(exc));log.write(traceback.format_exc())
+        if args.apply and row['issues'] and row.get('conda_update',{}).get('status')!='updated' and 'conda_update' in row:
+            row['conda_update']['status']='incomplete'
         for issue in row['issues']:say('ATTENTION: '+issue)
         say('Status: '+row['status'])
     (logdir/'summary.json').write_text(json.dumps(results,indent=2))
