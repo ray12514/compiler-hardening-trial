@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 14 (2026-10-27).
+"""CSE Miniforge certificate maintenance, revision 15 (2026-10-27).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -403,6 +403,10 @@ def safe_environment():
     # --apply must not silently inherit a module/user dry_run setting. Planning
     # commands still pass --dry-run explicitly, which overrides this variable.
     env['CONDA_DRY_RUN'] = 'false'
+    # Classic's conflict-hint builder unions a set with a tuple after some
+    # --update-deps solves. Keep the solver's normal conflict rejection while
+    # bypassing that broken explanation path; do not patch installed Conda.
+    env['CONDA_UNSATISFIABLE_HINTS'] = 'false'
     return env
 
 
@@ -809,6 +813,8 @@ def diagnostic_text(stdout, stderr):
 
 def failure_category(text):
     value = text.lower()
+    if 'unsupported operand type(s) for |' in value and "'set'" in value and "'tuple'" in value:
+        return 'Conda classic conflict-reporting bug', 'Conda crashed while explaining a dependency conflict. Use revision 15 or newer, which disables detailed conflict hints for maintenance subprocesses; inspect any remaining solver failure and explicit pins.'
     if 'non-conda' in value or 'conda-forge migration' in value:
         return 'Mixed package ownership', 'Review the named pip/uv-managed tool and its requirements; do not overwrite it with conda in bulk.'
     if any(x in value for x in ('permission denied','permissionerror','not writable','notwritableerror','read-only file system')):
@@ -1258,6 +1264,7 @@ def main():
         if args.verbose: print(s,flush=True)
         log.write(s+'\n')
     say('Mode: '+('APPLY' if args.apply else 'LOCAL PREVIEW; no network operations'))
+    say('Classic solver: detailed conflict hints disabled to avoid the upstream set/tuple reporting crash; incompatible plans remain rejected.')
     say('Fallback/explicit package channels: '+', '.join(channel_names)+'; Anaconda defaults excluded; external plugins disabled; no PyPI fallback')
     say('Resolved channel URLs: '+', '.join(channel_urls))
     say('Scope: '+('CSE trust files only' if args.trust_only else ', '.join(str(p)+(' [BASE]' if p==base else '') for p in prefixes)))
