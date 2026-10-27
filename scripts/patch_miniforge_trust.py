@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 18 (2026-10-27).
+"""CSE Miniforge certificate maintenance, revision 19 (2026-10-27).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -42,7 +42,7 @@ nonfatal warnings (exit 0); real package/check failures remain incomplete (exit 
 summary.json distinguishes updated-with-skips from fully updated; skipped-paths.txt
 and skipped-paths.json list full paths, owners, groups, stages and reasons.
 Default output is concise; --verbose shows path details. Full details are logged.
-Final summaries always repeat package requests, permission counts and failure reasons.
+Final summaries repeat retained package requests, removals, permission counts and failure reasons.
 Per-owner skip reports are private review aids. A skip is not protection.
 --report LOG_DIR (or latest) reads prior summaries/logs without updates or network.
 New command failures save separate JSON records with arguments, exit status, phase
@@ -57,9 +57,14 @@ replaced or rerun. Apply uses the installed libmamba solver with entry-point
 plugin discovery disabled and only its solver hook explicitly enabled. PyPI
 integration plugins are not enabled. A missing/broken solver fails before updates.
 Base Conda, Python, solver packages, NumPy, Jupyter, Boost and other installed base
-packages may update compatibly in ONE transaction. The solve uses --update-all,
-security minimums and approved channel priority, without historical per-package
-source locks. Explicit site pins still apply. The exact validated versions/builds
+applications update compatibly in ONE transaction. Retained requests come from
+explicit history and the installed dependency graph, not a mandatory request for
+every old dependency. The solve uses --update-all --prune, security minimums and
+approved channel priority, without historical per-package source locks. Unused
+dependencies may leave; applications and explicit site pins remain protected.
+Known conda-forge boost/boost-cpp names migrate to libboost-python-devel and
+libboost-devel, preserving development functionality. Unknown conflicts are not
+treated as proof of deprecation. The exact validated versions/builds and removals
 are installed and verified before configuring trust. There is no manager-only
 bootstrap and no classic conflict-hint graph. Read-only planning is bounded at
 180 seconds; an installation transaction is not killed by that planning limit.
@@ -129,6 +134,7 @@ https://docs.conda.io/projects/conda/en/24.11.x/commands/install.html
 https://p11-glue.github.io/p11-glue/p11-kit/manual/trust.html
 """
 import argparse
+import ast
 import datetime
 import fcntl
 import grp
@@ -153,6 +159,8 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
+SCRIPT_REVISION = 19
+BASE_REPLACEMENTS = {'boost':('libboost-python-devel',),'boost-cpp':('libboost-devel',)}
 ROOTS = {
  '7DD78D5F4F13459A83DFF9ABBBA62EDBAF6F2D102BF257FD712F4D9F2746ED8D': 'emSign Root TLS CA - G3',
  'F2EDAAFF3D9B701FB4D14C9F285F8C0BAD90FC3BCC1FA07D47F4718EDABA34A5': 'emSign Root CS CA - G3',
@@ -506,10 +514,98 @@ def discover(base, conda, env, includes, scans, excludes, skipped=None):
     return sorted([p for p in paths if not excluded(p)],key=lambda p:(p != base,str(p)))
 
 
-def plan_specs(meta, upgrade_conda, broad=False, conda_minimum=CONDA_MINIMUM):
+def spec_name(spec):
+    value=str(spec).rsplit('::',1)[-1]
+    match=re.match(r'^([A-Za-z0-9_][A-Za-z0-9_.-]*)',value)
+    if not match:raise RuntimeError('Cannot identify package in metadata/history spec: '+str(spec))
+    return match.group(1)
+
+
+def history_roots(prefix, meta):
+    """Keep explicit user requests, excluding full installer/maintenance snapshots."""
+    path=prefix/'conda-meta/history'
+    if not path.is_file():return set()
+    roots=set();state=set()
+    for block in re.split(r'^==>.*<==\s*$',path.read_text(),flags=re.MULTILINE):
+        for line in block.splitlines():
+            if line.startswith(('+','-')):
+                name=line[1:].rsplit('::',1)[-1].rsplit('-',2)[0]
+                if line[0]=='+':state.add(name)
+                else:state.discard(name)
+        for line in block.splitlines():
+            match=re.match(r'^# (update|install|create|remove) specs: (.*)$',line)
+            if not match:continue
+            try:
+                values=ast.literal_eval(match.group(2))
+                if not isinstance(values,(list,tuple)) or not all(isinstance(v,str) for v in values):raise ValueError('expected a spec list')
+                names={spec_name(v) for v in values}
+            except (ValueError,SyntaxError) as exc:
+                raise RuntimeError('Cannot read package intent from '+str(path)+': '+str(exc)) from exc
+            if match.group(1)=='remove':roots-=names
+            elif names!=state:roots|=names
+    return roots & set(meta)
+
+
+def base_package_intent(meta, prefix=None, config=None):
+    """Preserve explicit requests and every source component of the dependency graph.
+
+    Keeping source components covers every installed package initially, including
+    isolated packages and cycles. New dependencies are then chosen by the solver.
+    Full explicit installer/maintenance snapshots are not application intent.
+    """
+    names=set(meta)
+    graph={n:{spec_name(d) for d in r.get('depends',())} & names for n,r in meta.items()}
+    reverse={n:set() for n in graph}
+    for n,deps in graph.items():
+        for dep in deps:reverse[dep].add(n)
+    visited=set();order=[]
+    for start in sorted(graph):
+        stack=[(start,False)]
+        while stack:
+            n,done=stack.pop()
+            if done:order.append(n);continue
+            if n in visited:continue
+            visited.add(n);stack.append((n,True))
+            stack.extend((dep,False) for dep in sorted(graph[n]) if dep not in visited)
+    components=[];component={}
+    for start in reversed(order):
+        if start in component:continue
+        members=set();stack=[start]
+        while stack:
+            n=stack.pop()
+            if n in component:continue
+            component[n]=len(components);members.add(n);stack.extend(reverse[n])
+        components.append(members)
+    sources=set(range(len(components)))
+    for n,deps in graph.items():
+        sources-={component[d] for d in deps if component[n]!=component[d]}
+    roots=set().union(*(components[i] for i in sources)) if sources else set()
+    explicit=history_roots(prefix,meta) if prefix is not None else set()
+    pins=list((config or {}).get('pinned_packages') or [])
+    pinfile=prefix/'conda-meta/pinned' if prefix is not None else None
+    if pinfile is not None and pinfile.is_file():
+        pins.extend(line.split('#',1)[0].strip() for line in pinfile.read_text().splitlines() if line.split('#',1)[0].strip())
+    pinned={spec_name(pin) for pin in pins} & names
+    roots|=explicit | (set(meta) & (set(MINIMUM)|{'conda','python','mamba','conda-libmamba-solver'}))
+    roots|=pinned
+    # Verified conda-forge naming migration: current recipes prohibit the old
+    # boost/boost-cpp names. Preserve headers/development functionality too.
+    # https://github.com/conda-forge/boost-feedstock/blob/main/recipe/meta.yaml
+    forge=set(requested_channels([],{k:v for k,v in (config or {}).items() if k!='pinned_packages'})[1])
+    forge.update(('conda-forge','https://conda.anaconda.org/conda-forge'))
+    migrations=[]
+    for old,new in sorted(BASE_REPLACEMENTS.items()):
+        if old in meta and old not in pinned and recorded_origin(meta[old]) in forge:
+            roots.discard(old);roots.update(new)
+            migrations.append({'name':old,'replacements':list(new),'reason':'conda-forge Boost package naming migration'})
+    return {'roots':sorted(roots),'explicit_requests':sorted(explicit),'pinned_packages':sorted(pinned),
+            'dependencies':sorted(set(meta)-roots-{r['name'] for r in migrations}),
+            'replacements':migrations}
+
+
+def plan_specs(meta, upgrade_conda, broad=False, conda_minimum=CONDA_MINIMUM, roots=None):
     if broad:
-        # Base is explicitly authorized for a full compatible conda update.
-        targets=set(meta)
+        targets=set(base_package_intent(meta)['roots'] if roots is None else roots)
         specs=[n+'>='+MINIMUM[n] if n in MINIMUM else ('conda>='+conda_minimum if n=='conda' else n) for n in sorted(targets)]
         return targets,None,specs
     targets = set(meta) & (set(MINIMUM) | MANAGERS)
@@ -526,7 +622,7 @@ def plan_specs(meta, upgrade_conda, broad=False, conda_minimum=CONDA_MINIMUM):
     return targets, allowed, specs
 
 
-def check_plan(plan, allowed):
+def check_plan(plan, allowed, retained=None):
     if plan.get('success') is False: raise RuntimeError('Conda solver reported failure')
     actions = plan.get('actions',{})
     for action in ('LINK','FETCH'):
@@ -538,8 +634,9 @@ def check_plan(plan, allowed):
     unlinked = {r['name'] for r in actions.get('UNLINK',[])}
     if allowed is not None and (linked | unlinked) - allowed:
         raise RuntimeError('Rejected unrelated package changes: ' + ', '.join(sorted((linked|unlinked)-allowed)))
-    if unlinked - linked:
-        raise RuntimeError('Rejected package removal without replacement: ' + ', '.join(sorted(unlinked-linked)))
+    removed=unlinked-linked
+    if removed and (retained is None or removed & set(retained)):
+        raise RuntimeError('Rejected package removal without replacement: ' + ', '.join(sorted(removed if retained is None else removed & set(retained))))
     return sorted(linked | unlinked)
 
 
@@ -547,6 +644,9 @@ def exact_plan_specs(meta, plan, origins, extras, config):
     """Bind the validated final package versions/builds and allowed sources."""
     final={n:(r['version'],r['build']) for n,r in meta.items()}
     final_origins=dict(origins)
+    for record in plan.get('actions',{}).get('UNLINK',[]):
+        final.pop(record['name'],None)
+        final_origins.pop(record['name'],None)
     for record in plan.get('actions',{}).get('LINK',[]):
         name=record['name']
         final[name]=(record['version'],record.get('build_string') or record.get('build'))
@@ -556,6 +656,26 @@ def exact_plan_specs(meta, plan, origins, extras, config):
         raise RuntimeError('Plan omitted build identifiers')
     exact=qualify_specs([name+'='+value+'='+build for name,(value,build) in sorted(final.items())],final_origins)
     return final,exact
+
+
+def verify_retained(final, retained):
+    missing=set(retained)-set(final)
+    if missing:raise RuntimeError('Required base applications missing from plan: '+', '.join(sorted(missing)))
+
+
+def verify_installed_plan(final, installed):
+    actual={n:(r['version'],r['build']) for n,r in installed.items()}
+    differences={n for n in set(final)|set(actual) if final.get(n)!=actual.get(n)}
+    if differences:raise RuntimeError('Installed packages differ from validated plan: '+', '.join(sorted(differences)))
+
+
+def planned_removals(plan, migrations):
+    linked={r['name'] for r in plan.get('actions',{}).get('LINK',[])}
+    replacements={r['name']:r['replacements'] for r in migrations}
+    return [{'name':r['name'],'before':r['version'],'status':'planned',
+             'reason':'superseded by '+', '.join(replacements[r['name']]) if r['name'] in replacements else
+                      'not needed by the updated retained package set'}
+            for r in plan.get('actions',{}).get('UNLINK',[]) if r['name'] not in linked]
 
 
 def conda_update_status(meta):
@@ -603,10 +723,45 @@ from conda.plugins.types import CondaSolver
 from conda.base.context import context
 from conda.cli.main import main
 from conda_libmamba_solver.solver import LibMambaSolver
+import conda_libmamba_solver.solver as solver_module
+def retired_names(state):
+    replacements=__CSE_BASE_REPLACEMENTS__
+    return {old for old,new in replacements.items() if state.prune and old in state.installed and
+            old not in state.requested and all(n in state.requested for n in new)}
+# Conda 24.11's install CLI parses --prune but omits it from the solver call.
+# Honor the explicit flag through the public transaction API in this process.
+class RetainedBaseSolver(LibMambaSolver):
+    def solve_for_transaction(self, *args, **kwargs):
+        if '--prune' in sys.argv:
+            if len(args)>2:args=(*args[:2],True,*args[3:])
+            else:kwargs['prune']=True
+        return super().solve_for_transaction(*args, **kwargs)
+    # Explicitly retire the old names during the solve, so they cannot bias it
+    # toward older replacement versions before post-solve dependency pruning.
+    def _specs_to_tasks_add(self, in_state, out_state):
+        tasks=super()._specs_to_tasks_add(in_state, out_state)
+        import libmambapy as api
+        tasks.setdefault(('ERASE',api.SOLVER_ERASE),[]).extend(sorted(retired_names(in_state)))
+        return tasks
+    def _specs_to_request_jobs_add(self, in_state, out_state):
+        tasks=super()._specs_to_request_jobs_add(in_state, out_state)
+        from libmambapy.solver import Request
+        tasks.setdefault(Request.Remove,[]).extend(sorted(retired_names(in_state)))
+        return tasks
+# --update-all otherwise creates update jobs for retired names before pruning.
+# They are neither requests nor dependencies of the new replacement packages.
+class RetainedBaseInputState(solver_module.SolverInputState):
+    @property
+    def always_update(self):
+        updates=super().always_update
+        if not self.prune:return updates
+        retired=retired_names(self)
+        return {n:spec for n,spec in updates.items() if n not in retired}
+solver_module.SolverInputState=RetainedBaseInputState
 class SolverOnly:
     @plugins.hookimpl
     def conda_solvers(self):
-        yield CondaSolver(name='libmamba', backend=LibMambaSolver)
+        yield CondaSolver(name='libmamba', backend=RetainedBaseSolver)
 manager = context.plugin_manager
 manager.disable_external_plugins()
 manager.register(SolverOnly(), name='cse-libmamba-solver-only')
@@ -622,7 +777,7 @@ if sys.argv[1:] == ['__cse_solver_probe__']:
                       'external_plugins':external}))
 else:
     sys.exit(main(*sys.argv[1:]))
-'''
+'''.replace('__CSE_BASE_REPLACEMENTS__',repr(BASE_REPLACEMENTS))
 
 
 def solver_invocation(base, cmd):
@@ -736,6 +891,8 @@ def final_summary(results, apply, bundle, say):
             say('  Solver plan: %s %s -> %s (build %s)' % (change['name'],change['before'],change['after'],change['build']))
         for change in row.get('package_changes',[]):
             say('  Verified package: %s %s -> %s' % (change['name'],change['before'],change['after']))
+        for removal in row.get('package_removals',[]):
+            say('  %s removal: %s=%s | %s'%(removal.get('status','planned').capitalize(),removal['name'],removal['before'],removal['reason']))
         if row.get('security_verification'):
             say('  Verified required minimums: '+', '.join('%s=%s (>= %s)'%(n,v['version'],v['minimum']) for n,v in sorted(row['security_verification'].items())))
         if row.get('conda_update') or row.get('conda_bootstrap'):
@@ -873,6 +1030,8 @@ def report_existing(directory, verbose=False):
                 print('  Newest stable Conda available: %s | source=%s'%(bootstrap['latest_available'],bootstrap['source']))
         for issue in issues:
             if 'Command failed; see private run.log' not in issue: print('  Reason: '+issue)
+        for removal in row.get('package_removals',[]):
+            print('  %s removal: %s=%s | %s'%(removal.get('status','planned').capitalize(),removal['name'],removal['before'],removal['reason']))
         for event in evidence:
             print('  Phase: '+event.get('phase','not recorded'))
             print('  Command: '+event['command'])
@@ -903,7 +1062,7 @@ def diagnostic_argv(base, prefix, argv, requested):
     if len(argv)<2 or Path(argv[0]).resolve()!=(base/'bin/conda').resolve() or argv[1]!='install':
         raise RuntimeError('Saved failure is not an install from the currently selected base')
     switches={'--json','--offline','--override-channels','--strict-channel-priority',
-              '--update-deps','--update-all','--freeze-installed','--dry-run'}
+              '--update-deps','--update-all','--freeze-installed','--prune','--dry-run'}
     output=['install'];channels=set(requested);specs=[];prefixes=[];i=2
     while i<len(argv):
         value=argv[i];i+=1
@@ -1011,10 +1170,7 @@ def diagnose_existing(directory, base, offline=False, timeout_seconds=600):
     if timed_out:
         print('DIAGNOSTIC TIMED OUT after %d seconds; conflict analysis did not complete.'%timeout_seconds,flush=True)
         print('A deprecated version-spec warning is not a conflicting-package finding. No package transaction was attempted.',flush=True)
-        retry=['python3','patch_miniforge_trust.py',str(base),'--diagnose',str(directory),
-               '--diagnostic-timeout',str(max(1800,timeout_seconds*2))]
-        if offline:retry.append('--offline')
-        print('Retry with more time: '+shlex.join(retry),flush=True)
+        print('Review the saved native solver output and explicit pins. Use the current script\'s retained base package inventory to revise the request.',flush=True)
         print('Partial Conda output:',flush=True)
     print(str(message)[:16000],flush=True)
     print('Full diagnostic: '+str(report),flush=True)
@@ -1310,6 +1466,7 @@ def inspect_trust(base, prefixes=()):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--version',action='version',version='patch_miniforge_trust.py revision %d'%SCRIPT_REVISION)
     ap.add_argument('miniforge', nargs='?', type=Path)
     ap.add_argument('--apply', action='store_true')
     ap.add_argument('--inspect-trust',action='store_true',help='Read actual CSE/base CA files and configuration; no updates')
@@ -1378,6 +1535,7 @@ def main():
         if args.verbose: print(s,flush=True)
         log.write(s+'\n')
     say('Mode: '+('APPLY' if args.apply else 'LOCAL PREVIEW; no network operations'))
+    say('Script revision: %d'%SCRIPT_REVISION)
     say('Solver: installed libmamba only; external plugin discovery disabled; base Conda and packages update together.')
     say('Fallback/explicit package channels: '+', '.join(channel_names)+'; Anaconda defaults excluded; external plugins disabled; no PyPI fallback')
     say('Resolved channel URLs: '+', '.join(channel_urls))
@@ -1521,15 +1679,22 @@ def main():
                             raise RuntimeError('Channel-qualified prefix pin outside requested channels: '+pin)
             broad = prefix == base
             upgrade_conda = args.upgrade_conda or broad
-            row['package_policy']='all base packages may update' if broad else 'targeted maintenance; application packages pinned'
+            row['package_policy']='base applications retained; dependencies solved together and unused dependencies pruned' if broad else 'targeted maintenance; application packages pinned'
             say('Package policy: '+row['package_policy'])
             if broad:
                 row['conda_update']=conda_update_status(meta)
+                row['base_intent']=base_package_intent(meta,prefix,config)
+                (logdir/'base-package-intent.json').write_text(json.dumps(row['base_intent'],indent=2))
+                say('Base inventory: %d installed; %d retained application/security requests; %d solver-managed dependencies'%(
+                    len(meta),len(row['base_intent']['roots']),len(row['base_intent']['dependencies'])))
+                for migration in row['base_intent']['replacements']:
+                    say('Base package replacement: '+migration['name']+' -> '+', '.join(migration['replacements']))
                 say('Conda update: '+row['conda_update']['status']+
                     ' | current='+str(row['conda_update']['before'])+' | minimum='+CONDA_MINIMUM)
-            targets,allowed,specs = plan_specs(meta,upgrade_conda,broad=broad)
+            retained=set(row['base_intent']['roots']) if broad else None
+            targets,allowed,specs = plan_specs(meta,upgrade_conda,broad=broad,roots=retained)
             specs=specs if broad else qualify_specs(specs,origins)
-            row['package_targets'] = [{'name':n,'current':meta[n]['version'],'request':('>='+MINIMUM[n] if n in MINIMUM else ('>='+CONDA_MINIMUM if n == 'conda' else 'compatible build from installed source')),'source':('approved channels in priority order' if broad else origins.get(n,'fallback/explicit allowed channels'))} for n in sorted(targets)]
+            row['package_targets'] = [{'name':n,'current':meta.get(n,{}).get('version','absent'),'request':('>='+MINIMUM[n] if n in MINIMUM else ('>='+CONDA_MINIMUM if n == 'conda' else 'compatible build')),'source':('approved channels in priority order' if broad else origins.get(n,'fallback/explicit allowed channels'))} for n in sorted(targets)]
             detail('Package targets: '+(', '.join(sorted(targets)) or 'none'))
             audit = {'packages':{},'bundles':{}}
             py = prefix/'bin/python'
@@ -1556,22 +1721,29 @@ def main():
                 row['solver']='libmamba'
                 if broad:
                     conda_minimum=select_conda_target(base,meta,origins,config,args.offline,runjson,logdir,row,say)
-                    targets,allowed,specs=plan_specs(meta,upgrade_conda,broad=True,conda_minimum=conda_minimum)
+                    targets,allowed,specs=plan_specs(meta,upgrade_conda,broad=True,conda_minimum=conda_minimum,roots=retained)
                 if targets:
                     row['phase'] = 'solve package update (dry run)'
-                    cmd=[conda,'install','-p',prefix,'--solver','libmamba','--json']+(['--update-all'] if broad else ['--freeze-installed'])+channel_args+specs
+                    cmd=[conda,'install','-p',prefix,'--solver','libmamba','--json']+(['--update-all','--prune'] if broad else ['--freeze-installed'])+channel_args+specs
                     if args.offline: cmd.append('--offline')
                     plan=runjson(cmd+['--dry-run'])
                     (logdir/('%03d-plan.json'%i)).write_text(json.dumps(plan,indent=2))
-                    changed=check_plan(plan,allowed)
+                    changed=check_plan(plan,allowed,retained)
                     row['package_plan'] = [{'name':r['name'],'before':meta.get(r['name'],{}).get('version','absent'),'after':r['version'],'build':r.get('build_string') or r.get('build')} for r in plan.get('actions',{}).get('LINK',[])]
+                    row['package_removals']=planned_removals(plan,row.get('base_intent',{}).get('replacements',[]))
+                    for removal in row['package_removals']:
+                        say('Validated package removal: %s=%s | %s'%(removal['name'],removal['before'],removal['reason']))
                     detail('Validated package changes: '+(', '.join(changed) or 'none'))
                     # Lock the planned final versions/builds before the execution solve.
                     final,exact=exact_plan_specs(meta,plan,origins,args.channel,config)
+                    if broad:
+                        verify_retained(final,retained)
+                        retired={r['name'] for r in row['base_intent']['replacements']} & set(final)
+                        if retired:raise RuntimeError('Solver retained superseded package names: '+', '.join(sorted(retired)))
                     if broad:row['conda_update']['plan_conda_version']=final.get('conda',(None,None))[0]
                     verify_minimums(meta,{n:{'version':v} for n,(v,b) in final.items()},upgrade_conda,
                                     row.get('conda_update',{}).get('target',CONDA_MINIMUM))
-                    execution=[conda,'install','-p',prefix,'--solver','libmamba','--json','--yes']+([] if broad else ['--freeze-installed'])+channel_args+exact
+                    execution=[conda,'install','-p',prefix,'--solver','libmamba','--json','--yes']+(['--prune'] if broad else ['--freeze-installed'])+channel_args+exact
                     if args.offline: execution.append('--offline')
                     row['phase'] = 'install validated package plan'
                     row['changes_started']=True
@@ -1582,6 +1754,8 @@ def main():
                 if broad:row['conda_update']['installed_conda_version']=after_meta.get('conda',{}).get('version')
                 row['security_verification']=verify_minimums(meta,after_meta,upgrade_conda,
                                                            row.get('conda_update',{}).get('target',CONDA_MINIMUM))
+                if targets:verify_installed_plan(final,after_meta)
+                for removal in row.get('package_removals',[]):removal['status']='verified'
                 if broad:row['conda_update'].update(status='updated',after=after_meta.get('conda',{}).get('version'))
                 row['phase'] = 'configure prefix trust'
                 row['changes_started']=True

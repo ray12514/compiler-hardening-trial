@@ -7,7 +7,7 @@ No external incident test endpoint is contacted.
 
 ## Update Conda and base packages in the existing installation
 
-Revision 18 keeps the installed Miniforge distribution, prefix, module selection
+Revision 19 keeps the installed Miniforge distribution, prefix, module selection
 and Spack version pin. Miniforge `24.11.2-1` does not itself require a reinstall
 for an in-place Conda/base package update. No installer is downloaded or rerun.
 The default scope is **the loaded base only**. Other environments require an
@@ -20,6 +20,9 @@ python3 patch_miniforge_trust.py --base-only
 python3 patch_miniforge_trust.py --base-only --apply
 ```
 
+`python3 patch_miniforge_trust.py --version` should print revision 19. Each run
+also records its revision so an older copied script can be identified directly.
+
 Use `--ca-bundle /path/to/CSE-existing-bundle.pem` when a particular existing site
 bundle is required. The source is read to prepare the managed CSE copy before
 package retrieval. The update then:
@@ -29,15 +32,28 @@ package retrieval. The update then:
    `conda-pypi` and other external hooks are not enabled.
 2. Checks the approved source's current repodata for the newest stable Conda,
    retaining the security floor `26.9.4` and any newer installed version.
-3. Solves **one full base update** with `--update-all`, minimum security versions
-   and every installed base package requested without an old version/build lock.
-   Python, Mamba/solver packages, NumPy, Jupyter, Boost and their dependencies can
-   move together. Base requests use approved channel priority rather than
-   historical per-package channel locks. Explicit site pins remain enforced.
-4. Rejects excluded Anaconda defaults sources, unintended removals and unmet
-   security minimums, then installs the validated final versions/builds.
-5. Verifies the installed records before configuring prefix trust and inspecting
+3. Identifies the retained base requests from explicit installation history and
+   the installed dependency graph. Installer/full-package maintenance snapshots
+   do not turn every old dependency into a permanent application requirement.
+   Standalone packages and dependency cycles are retained conservatively.
+   Python, Conda, the solver, installed security targets and explicit pins are
+   protected. Historical version/build requests may update; site pins stay enforced.
+4. Solves **one full base update** with `--update-all --prune`. Python, Mamba,
+   NumPy, Jupyter, Boost and their dependencies can move together. Base requests
+   use approved channel priority rather than historical per-package channel locks.
+   Dependencies can be replaced or removed when the updated retained packages no
+   longer need them. Retained applications cannot silently disappear.
+5. Rejects excluded Anaconda defaults sources, missing retained applications and
+   unmet security minimums, then installs the validated final versions/builds and
+   removals. Installed records must match that complete plan.
+6. Verifies the installed records before configuring prefix trust and inspecting
    runtime bundles and shared permissions.
+
+The process-local solver wrapper explicitly forwards pruning through Conda's
+transaction API: Conda 24.11 accepts the install CLI flag but does not forward it.
+Retired names do not get update jobs; the solver explicitly removes those names
+in the same transaction, so they cannot hold their replacements to older versions.
+Both libmamba 1.x and 2.x request APIs are supported. No installed solver files are patched.
 
 There is no preliminary manager-only bootstrap and no classic conflict-hint graph
 in this path. A missing/broken installed solver fails before package updates with
@@ -55,11 +71,31 @@ Preview remains local-only and does not load a solver, contact channels or insta
 packages. `--trust-only` still prepares only the managed trust files. Successful
 prefixes print the shell snippet to source after loading the module.
 
-Private logs include `base-conda-search.json`, `NNN-plan.json`, command output and
+Private logs include `base-package-intent.json` (retained requests, dependencies,
+pins and known replacements), `base-conda-search.json`, `NNN-plan.json`, command output and
 `conda_update` in `summary.json`, including the original, planned and installed
-Conda versions. Reports still read legacy `conda_bootstrap` records from older runs.
+Conda versions. Removals and their reasons are printed and saved in
+`package_removals`. Reports still read legacy `conda_bootstrap` records from older runs.
 An install that returns a dry-run result or leaves old installed versions is
 reported as incomplete. Apply overrides inherited dry-run settings.
+
+### Obsolete names and unused dependencies
+
+Current [conda-forge Boost recipes](https://github.com/conda-forge/boost-feedstock/blob/main/recipe/meta.yaml)
+explicitly prohibit co-installing the old `boost`/`boost-cpp` names with their new
+`libboost*` counterparts. For installed conda-forge packages, maintenance maps
+`boost` to `libboost-python-devel` and `boost-cpp` to `libboost-devel`, preserving
+headers, libraries and development metadata. A site pin on an old name is retained
+for review instead of bypassed. Other package sources are not assumed to share
+this migration.
+
+An unsatisfiable request or an old version number does not establish that a
+package is deprecated. Unknown application conflicts still fail with the solver's
+explanation. Ordinary dependencies may disappear only as part of the compatible
+retained-package solve, and their removals are recorded as no longer needed,
+not as a claim that upstream deprecated them. Availability and ABI compatibility
+come from channel metadata for the actual host; the script does not guess that
+every package can move to its individually newest release.
 
 ### An update is rejected
 
@@ -152,7 +188,7 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
 
 The script was updated at commit `3cfb223ceb8ca59a128523627df0d187a75bc9a0`.
 That historical revision uses classic solving rather than the current single
-libmamba base transaction. Use the current `main` retrieval for revision 18.
+libmamba base transaction. Use the current `main` retrieval for revision 19.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
