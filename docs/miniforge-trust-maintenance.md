@@ -7,10 +7,12 @@ No external incident test endpoint is contacted.
 
 ## Update Conda in the loaded installation first
 
-Revision 13 keeps the existing Miniforge installation and discovers it from the
+Revision 14 keeps the existing Miniforge installation and discovers it from the
 loaded module's `CONDA_EXE` or `conda` on `PATH`. No system name or explicit base
-path is needed. After retrieving the current script, load your normal Miniforge
-module and preview only its base environment:
+path is needed. The default scope is now **the loaded base only**. Discovery and
+updates of other environments require `--all-envs`; `--only PATH` selects exact
+prefixes. After retrieving the current script, load your normal Miniforge module
+and preview only its base environment:
 
 ```bash
 python3 patch_miniforge_trust.py --base-only
@@ -29,22 +31,55 @@ site bundle is required. It reads that source and writes the filtered copy to
 The CSE bundle and verified-TLS environment are prepared before either package
 transaction. Afterward, source the printed `use-ca.sh` path in the current shell.
 
-If installed base Conda is below `26.9.4`, apply first requests `conda>=26.9.4`,
+Apply first searches the installed Conda package's recorded approved source (or
+the configured conda-forge source when the origin is unknown) for the newest stable
+dotted-numeric release for the current platform. It checks even when installed
+Conda already meets `26.9.4`. The newest available release must meet that security
+minimum; missing/stale metadata fails with its own phase and diagnostic.
+If installed base Conda is older than that release, apply requests that exact version,
 `ca-certificates>=2026.10.19`, and `certifi>=2026.10.19`. This is a separate
 targeted bootstrap solve/install, without `--update-all`; compatible dependencies
-can change as part of that transaction. The bootstrap uses the same allowed
+can change as part of that transaction. It explicitly requests installed
+Mamba/libmamba/solver packages together and uses `--update-deps`. For example,
+Mamba 1.5.12 requires `conda >=24,<25`; keeping that manager while requesting
+Conda 26 is incompatible. It also explicitly requests Python so classic Conda
+can move to a supported interpreter/ABI instead of implicitly pinning the old
+Python minor release. Explicit site pins still apply. The bootstrap targets the
+installed management/runtime dependency closure explicitly.
+This relaxes the exact versions recorded by the Miniforge installer before the first
+classic solve; `--update-deps` alone relaxes them only after that initial solve succeeds.
+Unrelated applications are left for the subsequent full base update. The bootstrap uses the same allowed
 channels, source selection, classic solver, exact-plan checks, and `--offline`
 policy as the remaining work. It does not run a Miniforge installer, change its
 Spack version pin, remove the prefix, or replace the distribution.
 
-Only after the installed Conda and CA-package minimums are verified does the
+Only after the installed Conda and CA-package bootstrap targets are verified does the
 script run the existing full base update. A failed or unverified bootstrap stops
-that prefix before the full update. A sufficiently new Conda skips the bootstrap.
-Preview stays local-only and reports `would-update` or `not-needed`; it does not
+that prefix before the full update. Conda at or above the newest available stable
+release skips the bootstrap and is never intentionally downgraded. The full update
+retains the verified Conda version as its minimum. Site pins and dependency conflicts
+are reported; they are not bypassed to force the latest release.
+Preview stays local-only and reports the installed security-minimum state plus the
+policy that newest-version availability is checked during apply; it does not
 solve, install, or contact package channels. `--trust-only` continues to perform
 certificate-only work without invoking Conda or updating packages.
 
-Private logs retain `base-conda-bootstrap-plan.json`,
+`--offline` uses cached channel metadata and packages; "newest" then means newest
+visible in that cache. Subprocess phase messages are printed before running each
+command, with an elapsed-time message every 30 seconds while it is still running;
+full command output remains in the private logs.
+
+An error saying Conda "did not meet required minimum" is a verification failure,
+not the solver's explanation. The message now includes the package, observed
+version, required version, and whether the observation was in the **plan** (no
+bootstrap install attempted) or **installed** records (the command returned but
+the expected version was not found). Both Conda versions are saved in
+`conda_bootstrap` in `summary.json`. Apply overrides inherited `CONDA_DRY_RUN`
+or `.condarc` dry-run settings, while planning commands explicitly use `--dry-run`.
+If an install nevertheless returns a dry-run result, it is reported directly
+instead of proceeding to a misleading minimum-version failure.
+
+Private logs retain `base-conda-bootstrap-search.json`, `base-conda-bootstrap-plan.json`,
 `base-conda-bootstrap-install.json`, and a separate `conda_bootstrap` result in
 `summary.json`. If the later full update fails, the report distinguishes a
 completed Conda bootstrap from incomplete base-package work. The package-change
@@ -97,7 +132,7 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
 
 The script was updated at commit `3cfb223ceb8ca59a128523627df0d187a75bc9a0`.
 That historical revision performs the full base update but does not have the
-separate Conda bootstrap above. Use the current `main` retrieval for revision 13.
+separate Conda bootstrap above. Use the current `main` retrieval for revision 14.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
@@ -259,7 +294,7 @@ hosting domain or add Anaconda `defaults` in response to the generic conda messa
 
 ## Full updates are permitted in the base environment
 
-Revision 13 first bootstraps an older Conda as described above, then retains
+Revision 14 first checks/bootstraps Conda as described above, then retains
 revision 12's full conda package-update scope for the Miniforge base. It no
 longer rejects changes to `krb5`, NumPy, matplotlib, matplotlib-base, Python or other
 base packages as unrelated. The base solve uses `--update-all` with no script-generated
@@ -297,9 +332,8 @@ apply performs the solve and records exact changes.
 
 ## Work on the base, then one environment
 
-The base is selected first in normal discovery unless explicitly excluded. It is now
-labeled `[BASE]` in scope/progress output. To isolate it and avoid discovering other
-users' environments:
+The base is the default scope and is labeled `[BASE]` in progress output.
+You can make that scope explicit with `--base-only`:
 
 ```bash
 python3 patch_miniforge_trust.py /actual/path/to/miniforge \
@@ -501,12 +535,14 @@ Blocked dependency plans and unmet security minimums remain incomplete.
 
 ## Environment scope
 
-Base and registered environments are discovered automatically, as are direct children
+Only base is selected by default. `--only PATH` selects exactly the named prefixes.
+With `--all-envs`, base and registered environments are discovered, as are direct children
 of the installation's `envs` directory. Eligibility requires actual maintenance access
 through your UID or current groups. Registration alone is not ownership.
 
-Add an unregistered environment with `--include /path/to/environment`. Find environments
-under a known software directory with `--scan-root /path/to/shared/environments`.
+With `--all-envs`, add an unregistered environment with `--include /path/to/environment`.
+Find environments under a known software directory with `--scan-root /path/to/shared/environments`.
+`--include` and `--scan-root` require `--all-envs` to avoid silently expanding a narrow scope.
 Keep private environments out with `--exclude /path/to/private/environment`;
 its descendants are also excluded. These options are repeatable.
 
@@ -525,6 +561,7 @@ You can intentionally leave a colleague's test tree alone, even when it is acces
 
 ```bash
 python3 patch_miniforge_trust.py /actual/path/to/miniforge \
+  --all-envs \
   --ca-bundle /actual/path/to/CSE-existing-bundle.pem \
   --exclude /actual/path/to/miniforge/.colleague-test
 ```
@@ -596,10 +633,22 @@ use the same `cse` group target; the user owner UID stays unchanged.
 
 ## Certificate behavior and activation
 
-The source PEM is read, not overwritten. The script writes:
+Certificate preparation reads the source PEM and writes a separate managed copy:
 
 - `MINIFORGE/etc/cse-trust/ca-bundle.pem`
 - `MINIFORGE/etc/cse-trust/use-ca.sh`
+
+Writing this shared managed copy is the preparation stage. It happens before the
+bootstrap and can remain after a package failure. Packages may replace their own
+vendor PEM files inside selected prefixes, and successful selected prefixes receive
+persistent `.condarc` and activation-variable changes; those are final changes,
+not temporary staging. A package-owned source PEM inside a selected prefix can also
+be replaced by its package update; external site/OS source files are only read.
+With the default scope, those package/configuration changes
+are confined to base. No bundle is copied over every discovered PEM path.
+Environments already configured to use the shared managed bundle see its new contents
+too, even when their own files are outside this run's scope. Use `--trust-only` for
+managed-bundle preparation without package/configuration/permission updates.
 
 The new bundle preserves certificates other than four exact incident-root fingerprints.
 This is interim root-removal mitigation, not a complete refresh of your custom public
@@ -654,7 +703,9 @@ operations, actual-bundle inspection, exact-prefix scope, channel-source guards,
 source-qualified update specs, malformed/host-only metadata recovery, structured alias/custom-channel config, full-base update policy, mandatory minimum
 verification, module-based bootstrap ordering, failed/stale bootstrap guards,
 offline bootstrap policy, preservation of original before/after inventories, and
-simulated preview/offline apply. Actual SUSE/RHEL deployment remains
+simulated preview/offline apply. Tests also cover newest-version selection when
+the minimum is already installed, downgrade guards, stale metadata, and default
+base-only scope with unchanged sibling PEM/configuration files. Actual SUSE/RHEL deployment remains
 a target-system validation task.
 
 ## References
