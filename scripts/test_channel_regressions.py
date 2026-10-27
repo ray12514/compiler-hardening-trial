@@ -7,6 +7,68 @@ from unittest.mock import patch
 spec=importlib.util.spec_from_file_location('maintenance',pathlib.Path(__file__).with_name('patch_miniforge_trust.py'))
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 
+class DiagnosticTests(unittest.TestCase):
+ def command(self,base,prefix):
+  return [str(base/'bin/conda'),'install','-p',str(prefix),'--solver','classic','--json',
+          '--override-channels','--channel','conda-forge','--strict-channel-priority',
+          'conda-forge::python>=3.11','--yes']
+ def test_saved_install_is_converted_to_dry_run(self):
+  base=pathlib.Path('/test/base');prefix=base/'envs/example'
+  argv=self.command(base,prefix)
+  result=m.diagnostic_argv(base,prefix,argv,[])
+  self.assertIn('--dry-run',result);self.assertNotIn('--yes',result)
+  self.assertIn('--strict-channel-priority',result);self.assertIn('conda-forge::python>=3.11',result)
+  self.assertIn('--yes',argv)
+ def test_saved_commands_cannot_change_executable_prefix_or_channel_policy(self):
+  base=pathlib.Path('/test/base');prefix=base/'envs/example'
+  original=self.command(base,prefix)
+  invalid=[['/different/conda']+original[1:],original+['--no-pin'],
+           original+['--no-channel-priority'],original+['-p','/different/prefix'],
+           [v for v in original if v!='--strict-channel-priority'],
+           original+['defaults::openssl'],original+['--channel','defaults']]
+  for argv in invalid:
+   with self.subTest(argv=argv),self.assertRaises(RuntimeError):m.diagnostic_argv(base,prefix,argv,[])
+ def test_diagnose_rejects_apply_before_any_environment_access(self):
+  with patch.object(m.sys,'argv',['script','--diagnose','latest','--apply']),patch('sys.stderr',io.StringIO()),patch.object(m,'find_base') as find:
+   with self.assertRaises(SystemExit):m.main()
+   find.assert_not_called()
+ def test_group_write_access_does_not_require_uid_ownership(self):
+  prefix=unittest.mock.Mock()
+  prefix.stat.return_value=unittest.mock.Mock(st_uid=2001,st_gid=2002,st_mode=0o40775)
+  with patch.object(m.os,'geteuid',return_value=1000),patch.object(m,'groups',return_value={1000,2002}),patch.object(m.os,'access',return_value=True):
+   self.assertTrue(m.maintainable(prefix))
+ def test_diagnosis_runs_only_a_dry_run_and_writes_private_report(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=pathlib.Path(directory);base=root/'base';(base/'bin').mkdir(parents=True)
+   (base/'bin/conda').touch();(base/'bin/python').touch();(base/'conda-meta').mkdir()
+   (base/'etc/cse-trust/empty-ca-dir').mkdir(parents=True);(base/'etc/cse-trust/ca-bundle.pem').touch()
+   marker=base/'conda-meta/history';marker.write_text('unchanged')
+   logs=root/'logs';logs.mkdir();argv=self.command(base,base)
+   (logs/'failed-command-001.json').write_text(json.dumps({'argv':argv,'phase':'install validated package plan'}))
+   (logs/'summary.json').write_text(json.dumps([{'prefix':str(base),'command_failures':[{'file':'failed-command-001.json'}]}]))
+   response={'success':False,'exception_name':'UnsatisfiableError','message':'Package python conflicts for: python_abi=3.14'}
+   with patch.object(m,'capture',return_value=json.dumps({'pkgs_dirs':[str(root/'cache')]})),patch.object(m.subprocess,'run',return_value=subprocess.CompletedProcess([],1,json.dumps(response),'')) as run,patch.object(m,'atomic_write') as write,patch.object(m,'public_permissions') as permissions,patch('sys.stdout',io.StringIO()) as out:
+    self.assertEqual(m.diagnose_existing(logs,base,True),2)
+   command=run.call_args.args[0];env=run.call_args.kwargs['env']
+   self.assertIn('--dry-run',command);self.assertNotIn('--yes',command);self.assertIn('-B',command)
+   self.assertEqual(env['CONDA_DRY_RUN'],'true');self.assertEqual(env['CONDA_UNSATISFIABLE_HINTS'],'true')
+   self.assertEqual(env['CONDA_SSL_VERIFY'],str(base/'etc/cse-trust/ca-bundle.pem'))
+   self.assertEqual(marker.read_text(),'unchanged');write.assert_not_called();permissions.assert_not_called()
+   reports=list(logs.glob('solver-diagnostic-*.json'));self.assertEqual(len(reports),1)
+   self.assertEqual(reports[0].stat().st_mode&0o777,0o600)
+   self.assertIn('Package python conflicts',out.getvalue())
+ def test_foreign_owned_directory_permissions_are_left_to_owner(self):
+  with tempfile.TemporaryDirectory() as directory:
+   prefix=pathlib.Path(directory);original=pathlib.Path.lstat
+   def foreign(path):
+    value=original(path)
+    if path==prefix:
+     fields=list(value);fields[4]=m.os.geteuid()+1;return m.os.stat_result(fields)
+    return value
+   with patch.object(pathlib.Path,'lstat',foreign),patch.object(m,'maintenance_gid',return_value=m.os.getegid()),patch.object(m.os,'chmod') as chmod,patch.object(m.os,'chown') as chown:
+    issues=m.public_permissions(prefix,prefix,True,lambda message:None)
+    self.assertTrue(any('Owner must set group' in issue for issue in issues));chmod.assert_not_called();chown.assert_not_called()
+
 class ClassicConflictTests(unittest.TestCase):
  def test_maintenance_disables_broken_hints_even_if_inherited_enabled(self):
   with patch.dict(os.environ,{'CONDA_UNSATISFIABLE_HINTS':'true'}):
