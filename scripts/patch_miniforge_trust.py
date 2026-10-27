@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 20 (2026-10-27).
+"""CSE Miniforge certificate maintenance, revision 21 (2026-10-27).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -73,6 +73,12 @@ bootstrap and no classic conflict-hint graph. Read-only planning is bounded at
 180 seconds; an installation transaction is not killed by that planning limit.
 Non-base prefixes retain Python/application version+build pins, source-qualified
 requests and --freeze-installed. --offline uses cached packages/channel metadata.
+The known XKB directory-to-symlink migration is checked against cached package
+metadata. An old package-owned directory is preserved by rename in private
+share/X11/.cse-trust-path-backups before installation. Untracked/shared files stop
+the migration. Failed installations restore that tree when package records roll
+back; partial rollback retains the backup and reports recovery paths. These
+backups are excluded from permission normalization. This is not a full snapshot.
 Outdated pip-managed tools are reported for reviewed migration to conda-forge,
 without automatically overwriting pip-owned files. If sigstore is installed,
 an offline `python -I -m sigstore --help` smoke check reports startup failures.
@@ -162,7 +168,7 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 20
+SCRIPT_REVISION = 21
 BASE_REPLACEMENTS = {'boost':('libboost-python-devel',),'boost-cpp':('libboost-devel',)}
 ROOTS = {
  '7DD78D5F4F13459A83DFF9ABBBA62EDBAF6F2D102BF257FD712F4D9F2746ED8D': 'emSign Root TLS CA - G3',
@@ -682,6 +688,131 @@ def planned_removals(plan, migrations):
             for r in plan.get('actions',{}).get('UNLINK',[]) if r['name'] not in linked]
 
 
+XKB_PATH = 'share/X11/xkb'
+XKB_LINK = '../xkeyboard-config-2'
+# Keep the backup beside xkb so Conda's empty-parent cleanup cannot remove X11
+# during rollback; the move also stays on the source filesystem.
+PATH_BACKUPS = 'share/X11/.cse-trust-path-backups'
+XKB_CACHE_PROBE = r'''
+import json, os, sys
+from pathlib import Path
+from conda.plugins.manager import CondaPluginManager
+CondaPluginManager.load_entrypoints = lambda self, *args, **kwargs: 0
+from conda.base.context import context
+record=json.loads(sys.argv[1])
+build=record.get('build_string') or record.get('build')
+parts=[record['name'],record['version'],build]
+if any(not v or '/' in v or '\\' in v or v in ('.','..') for v in parts):
+    raise RuntimeError('Invalid planned package identifier')
+for cache in context.pkgs_dirs:
+    root=Path(cache)/'-'.join(parts)
+    info=root/'info/paths.json'
+    if not info.is_file():continue
+    index=json.loads((root/'info/index.json').read_text())
+    if any(str(index.get(k))!=str(v) for k,v in zip(('name','version','build'),parts)):continue
+    paths=json.loads(info.read_text())['paths']
+    entry=next((r for r in paths if r['_path']=='share/X11/xkb'),None)
+    if entry and entry['path_type']=='softlink':
+        link=root/'share/X11/xkb'
+        if not link.is_symlink():raise RuntimeError('Cached XKB symlink is not a symlink: '+str(link))
+        print(json.dumps({'available':True,'target':os.readlink(link),'package_dir':str(root)}))
+    else:print(json.dumps({'available':True,'target':None,'package_dir':str(root)}))
+    break
+else:print(json.dumps({'available':False}))
+'''
+
+
+def no_link_parents(prefix, path):
+    for parent in reversed(path.parent.parents):
+        if parent==prefix or prefix in parent.parents:
+            if parent.is_symlink():raise RuntimeError('Refusing XKB migration through symlink parent: '+str(parent))
+    if path.parent.is_symlink():raise RuntimeError('Refusing XKB migration through symlink parent: '+str(path.parent))
+
+
+def inspect_xkb_tree(prefix, meta):
+    source=prefix/XKB_PATH
+    no_link_parents(prefix,source)
+    target=prefix/'share/xkeyboard-config-2'
+    if target.is_symlink() or (target.exists() and not target.is_dir()):
+        raise RuntimeError('XKB replacement data path must be a real directory or absent: '+str(target))
+    st=source.lstat()
+    if not stat.S_ISDIR(st.st_mode):raise RuntimeError('XKB migration requires a real directory: '+str(source))
+    declared=lambda r:set(r.get('files',[]))|{p['_path'] for p in r.get('paths_data',{}).get('paths',[])}
+    owned=declared(meta.get('xkeyboard-config',{}))
+    other={p for name,r in meta.items() if name!='xkeyboard-config' for p in declared(r) if p.startswith(XKB_PATH+'/')}
+    seen=[];untracked=[];stack=[source]
+    while stack:
+        with os.scandir(stack.pop()) as entries:
+            for entry in entries:
+                mode=entry.stat(follow_symlinks=False).st_mode
+                path=Path(entry.path);relative=path.relative_to(prefix).as_posix()
+                if stat.S_ISDIR(mode):stack.append(path)
+                elif stat.S_ISREG(mode) or stat.S_ISLNK(mode):
+                    seen.append(relative)
+                    if relative not in owned or relative in other:untracked.append(relative)
+                else:raise RuntimeError('Special file blocks XKB migration: '+str(path))
+    if untracked:raise RuntimeError('XKB directory contains untracked or other-package files; left untouched: '+', '.join(sorted(untracked)[:20]))
+    return {'source':str(source),'files':sorted(seen),'device':st.st_dev,'inode':st.st_ino,
+            'uid':st.st_uid,'gid':st.st_gid,'mode':stat.S_IMODE(st.st_mode)}
+
+
+def save_xkb_manifest(migration):
+    path=Path(migration['manifest'])
+    fd,tmp=tempfile.mkstemp(prefix='.manifest-',dir=str(path.parent))
+    try:
+        with os.fdopen(fd,'w') as stream:
+            json.dump(migration,stream,indent=2);stream.flush();os.fsync(stream.fileno())
+        os.replace(tmp,str(path))
+    finally:
+        if os.path.exists(tmp):os.unlink(tmp)
+
+
+def preserve_xkb_tree(prefix, meta, migration):
+    inspection=inspect_xkb_tree(prefix,meta)
+    if not os.access(str((prefix/XKB_PATH).parent),os.W_OK|os.X_OK):
+        raise RuntimeError('XKB parent directory is not writable/traversable: '+str((prefix/XKB_PATH).parent))
+    root=prefix/PATH_BACKUPS
+    no_link_parents(prefix,root/'run')
+    marker=root/'managed-by-patch-miniforge-trust'
+    if root.exists() and not marker.is_file():raise RuntimeError('Refusing an unmanaged XKB backup directory: '+str(root))
+    root.mkdir(mode=0o2775,exist_ok=True)
+    if root.is_symlink():raise RuntimeError('XKB backup directory is a symlink: '+str(root))
+    if root.stat().st_uid==os.geteuid():
+        os.chown(str(root),-1,maintenance_gid());os.chmod(str(root),0o2775)
+    if not marker.exists():marker.write_text('CSE XKB path migration backups v1\n')
+    directory=Path(tempfile.mkdtemp(prefix='xkb-',dir=str(root)))
+    migration.update(inspection,status='prepared',backup=str(directory/'xkb'),manifest=str(directory/'manifest.json'))
+    save_xkb_manifest(migration)  # Record the recovery paths before moving data.
+    source=Path(inspection['source']);st=source.lstat()
+    if (st.st_dev,st.st_ino)!=(inspection['device'],inspection['inode']):
+        raise RuntimeError('XKB directory changed during migration preflight')
+    os.rename(str(source),migration['backup'])  # Same-prefix move; no copy/delete fallback.
+    migration['status']='preserved';save_xkb_manifest(migration)
+
+
+def restore_xkb_tree(prefix, before, migration):
+    if migration.get('status')!='preserved':return
+    identity=lambda meta:{n:(r['version'],r['build']) for n,r in meta.items()}
+    if identity(records(prefix))!=identity(before):
+        migration.update(status='recovery-needed',reason='Conda package records did not roll back; original tree retained in backup')
+        save_xkb_manifest(migration);return
+    backup=Path(migration['backup']);no_link_parents(prefix,backup);st=backup.lstat()
+    if not stat.S_ISDIR(st.st_mode) or (st.st_dev,st.st_ino)!=(migration['device'],migration['inode']):
+        raise RuntimeError('Original XKB backup identity changed; manual recovery required')
+    source=Path(migration['source']);no_link_parents(prefix,source)
+    if source.is_symlink() and os.readlink(str(source))==XKB_LINK:source.unlink()
+    elif source.exists():source.rmdir()  # Only an empty real directory may be replaced.
+    os.rename(migration['backup'],str(source))
+    migration['status']='restored-after-failure';save_xkb_manifest(migration)
+
+
+def verify_xkb_tree(prefix, migration):
+    source=prefix/XKB_PATH;no_link_parents(prefix,source)
+    if (prefix/'share/xkeyboard-config-2').is_symlink() or not source.is_symlink() or os.readlink(str(source))!=XKB_LINK or not (source/'geometry/hp').is_file():
+        raise RuntimeError('Installed XKB directory-to-symlink migration is incomplete: '+str(source))
+    migration['status']='installed-original-preserved';save_xkb_manifest(migration)
+
+
 def conda_update_status(meta):
     current=meta.get('conda',{}).get('version')
     return {'status':'not-installed' if current is None else
@@ -891,6 +1022,10 @@ def final_summary(results, apply, bundle, say):
         if row.get('package_policy'):say('  Package policy: '+row['package_policy'])
         if row.get('package_pin_policy'):say('  Package pins: '+row['package_pin_policy'])
         if row.get('ignored_pins'):say('  Ignored base pin specs: '+', '.join(row['ignored_pins']))
+        if row.get('xkb_migration'):
+            migration=row['xkb_migration']
+            say('  XKB path migration: '+migration.get('status','not moved')+' | original tree: '+migration.get('backup','not moved')+' | manifest: '+migration.get('manifest','not created'))
+            if migration.get('reason'):say('  XKB recovery note: '+migration['reason'])
         for target in row.get('package_targets',[]):
             say('  Package target: %s %s -> %s | source=%s' % (target['name'],target['current'],target['request'],target.get('source','not recorded')))
         for change in row.get('package_plan',[]):
@@ -957,6 +1092,8 @@ def failure_category(text):
         return 'Mixed package ownership', 'Review the named pip/uv-managed tool and its requirements; do not overwrite it with conda in bulk.'
     if any(x in value for x in ('permission denied','permissionerror','not writable','notwritableerror','read-only file system')):
         return 'Filesystem access', 'Check the exact denied path, its parent traversal, ACLs, mount policy and cache location; environment ownership alone is insufficient.'
+    if any(x in value for x in ('fileexistserror','clobbererror','file exists','directory-to-symlink','xkb migration')):
+        return 'Package file collision', 'Check the named filesystem path and any saved XKB migration manifest. A longer dependency solve will not repair an existing-path collision. Existing package-owned XKB directories are preserved before the known symlink migration; custom/other-package contents require review.'
     if any(x in value for x in ('certificate_verify_failed','sslerror','ssl verification','certificate verify failed','proxyerror')):
         return 'TLS/proxy access', 'Review CA/proxy configuration and the specific endpoint; do not disable TLS verification.'
     if any(x in value for x in ('unavailableinvalidchannel','channelnotfound','channel is not accessible','invalid requested channel','invalid resolved channel','invalid channel alias/custom')):
@@ -1038,6 +1175,10 @@ def report_existing(directory, verbose=False):
             if 'Command failed; see private run.log' not in issue: print('  Reason: '+issue)
         if row.get('package_pin_policy'):print('  Package pins: '+row['package_pin_policy'])
         if row.get('ignored_pins'):print('  Ignored base pin specs: '+', '.join(row['ignored_pins']))
+        if row.get('xkb_migration'):
+            migration=row['xkb_migration']
+            print('  XKB path migration: '+migration.get('status','not moved')+' | original tree: '+migration.get('backup','not moved')+' | manifest: '+migration.get('manifest','not created'))
+            if migration.get('reason'):print('  XKB recovery note: '+migration['reason'])
         for removal in row.get('package_removals',[]):
             print('  %s removal: %s=%s | %s'%(removal.get('status','planned').capitalize(),removal['name'],removal['before'],removal['reason']))
         for event in evidence:
@@ -1074,7 +1215,7 @@ def diagnostic_argv(base, prefix, argv, requested):
     output=['install'];channels=set(requested);specs=[];prefixes=[];i=2
     while i<len(argv):
         value=argv[i];i+=1
-        if value=='--yes':continue
+        if value in ('--yes','--download-only'):continue
         if value in switches:output.append(value);continue
         if value in ('-p','--solver','--channel'):
             if i==len(argv):raise RuntimeError('Incomplete saved command option: '+value)
@@ -1581,7 +1722,7 @@ def main():
         heartbeat=threading.Thread(target=progress,daemon=True)
         heartbeat.start()
         try:
-            limit=30 if '__cse_solver_probe__' in cmd else (180 if 'search' in cmd or ('install' in cmd and '--dry-run' in cmd) else None)
+            limit=30 if '__cse_solver_probe__' in cmd or XKB_CACHE_PROBE in cmd else (180 if 'search' in cmd or ('install' in cmd and '--dry-run' in cmd) else None)
             r = subprocess.run(solver_invocation(base,cmd),env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=limit)
         except subprocess.TimeoutExpired as exc:
             decoded=lambda value: value.decode(errors='replace') if isinstance(value,bytes) else (value or '')
@@ -1759,9 +1900,44 @@ def main():
                                     row.get('conda_update',{}).get('target',CONDA_MINIMUM))
                     execution=[conda,'install','-p',prefix,'--solver','libmamba','--json','--yes']+(['--prune','--no-pin'] if broad else ['--freeze-installed'])+channel_args+exact
                     if args.offline: execution.append('--offline')
-                    row['phase'] = 'install validated package plan'
+                    migration=None
+                    xkb=next((r for r in plan.get('actions',{}).get('LINK',[]) if r['name']=='xkeyboard-config'),None)
+                    xkb_path=prefix/XKB_PATH
+                    if broad and xkb and xkb_path.is_dir() and not xkb_path.is_symlink():
+                        row['phase']='inspect planned XKB layout'
+                        probe_cmd=[base/'bin/python','-I','-B','-c',XKB_CACHE_PROBE,json.dumps(xkb)]
+                        payload=runjson(probe_cmd)
+                        if not payload.get('available'):
+                            row['phase']='download validated packages for XKB layout preflight (no transaction)'
+                            # Older Conda reports successful cache preparation as
+                            # CondaExitZero JSON on stderr, with no stdout JSON.
+                            run(execution+['--download-only'])
+                            payload=runjson(probe_cmd)
+                        if not payload.get('available'):raise RuntimeError('Planned XKB package payload is unavailable for layout preflight')
+                        if payload.get('target') is not None:
+                            if payload['target']!=XKB_LINK:raise RuntimeError('Unsupported XKB symlink target: '+str(payload['target']))
+                            inspect_xkb_tree(prefix,meta)  # Refuse custom/shared data before changing anything.
+                            migration={'planned_package':{'name':'xkeyboard-config','version':xkb['version'],'build':xkb.get('build_string') or xkb.get('build')}}
+                            row['xkb_migration']=migration
                     row['changes_started']=True
-                    runjson(execution)
+                    try:
+                        if migration is not None:
+                            row['phase']='preserve old XKB directory before symlink migration'
+                            preserve_xkb_tree(prefix,meta,migration)
+                            say('Original XKB directory preserved: '+migration['backup'])
+                            say('XKB recovery manifest: '+migration['manifest'])
+                        row['phase'] = 'install validated package plan'
+                        runjson(execution)
+                    except Exception:
+                        if migration is not None:
+                            try:restore_xkb_tree(prefix,meta,migration)
+                            except Exception as recovery_error:
+                                migration.update(status='recovery-needed',reason=str(recovery_error))
+                                row['issues'].append('XKB recovery required: '+str(recovery_error))
+                                try:save_xkb_manifest(migration)
+                                except (OSError,KeyError):pass
+                            say('XKB migration after failure: '+migration.get('status','not moved')+' | '+migration.get('manifest','no backup created'))
+                        raise
                 row['phase'] = 'verify installed package versions'
                 after_meta=records(prefix)
                 row['package_changes'] = [{'name':n,'before':initial_meta.get(n,{}).get('version','absent'),'after':r['version']} for n,r in sorted(after_meta.items()) if n not in initial_meta or (r['version'],r['build']) != (initial_meta[n]['version'],initial_meta[n]['build'])]
@@ -1769,6 +1945,7 @@ def main():
                 row['security_verification']=verify_minimums(meta,after_meta,upgrade_conda,
                                                            row.get('conda_update',{}).get('target',CONDA_MINIMUM))
                 if targets:verify_installed_plan(final,after_meta)
+                if row.get('xkb_migration'):verify_xkb_tree(prefix,row['xkb_migration'])
                 for removal in row.get('package_removals',[]):removal['status']='verified'
                 if broad:row['conda_update'].update(status='updated',after=after_meta.get('conda',{}).get('version'))
                 row['phase'] = 'configure prefix trust'
@@ -1804,7 +1981,7 @@ def main():
                 if n in meta or n in audit['packages']:row['issues'].append(n+' needs separate embedded-tool/dependency review')
             row['phase'] = 'normalize shared permissions'
             row['permissions'] = {}
-            permissions = public_permissions(prefix,base,args.apply,detail,row['skipped_paths'],args.exclude,row['permissions'])
+            permissions = public_permissions(prefix,base,args.apply,detail,row['skipped_paths'],args.exclude+[base/PATH_BACKUPS],row['permissions'])
             skipped_paths.extend(row['skipped_paths'])
             row['permission_warnings'] = permissions
             row['status']='incomplete' if row['issues'] else (('updated' if args.apply else 'previewed') + ('-with-skips' if permissions else ''))
