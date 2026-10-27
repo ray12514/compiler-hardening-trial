@@ -32,6 +32,16 @@ class DiagnosticTests(unittest.TestCase):
   with patch.object(m.sys,'argv',['script','--diagnose','latest','--apply']),patch('sys.stderr',io.StringIO()),patch.object(m,'find_base') as find:
    with self.assertRaises(SystemExit):m.main()
    find.assert_not_called()
+ def test_diagnostic_timeout_cli_defaults_and_custom_value(self):
+  for extra,expected in (([],600),(['--diagnostic-timeout','1800'],1800)):
+   with self.subTest(expected=expected),patch.object(m.sys,'argv',['script','--diagnose','latest']+extra),patch.object(m,'find_base',return_value=pathlib.Path('/base')),patch.object(m,'diagnose_existing',return_value=2) as diagnose:
+    self.assertEqual(m.main(),2)
+    diagnose.assert_called_once_with(pathlib.Path('latest'),pathlib.Path('/base'),False,expected)
+ def test_diagnostic_timeout_rejects_invalid_values_or_wrong_mode(self):
+  for argv in (['--diagnose','latest','--diagnostic-timeout','0'],['--diagnose','latest','--diagnostic-timeout','-1'],['--diagnostic-timeout','1800']):
+   with self.subTest(argv=argv),patch.object(m.sys,'argv',['script']+argv),patch('sys.stderr',io.StringIO()),patch.object(m,'find_base') as find:
+    with self.assertRaises(SystemExit):m.main()
+    find.assert_not_called()
  def test_group_write_access_does_not_require_uid_ownership(self):
   prefix=unittest.mock.Mock()
   prefix.stat.return_value=unittest.mock.Mock(st_uid=2001,st_gid=2002,st_mode=0o40775)
@@ -68,6 +78,26 @@ class DiagnosticTests(unittest.TestCase):
    with patch.object(pathlib.Path,'lstat',foreign),patch.object(m,'maintenance_gid',return_value=m.os.getegid()),patch.object(m.os,'chmod') as chmod,patch.object(m.os,'chown') as chown:
     issues=m.public_permissions(prefix,prefix,True,lambda message:None)
     self.assertTrue(any('Owner must set group' in issue for issue in issues));chmod.assert_not_called();chown.assert_not_called()
+ def test_timeout_keeps_partial_warning_and_reports_incomplete_analysis(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=pathlib.Path(directory);base=root/'base';(base/'bin').mkdir(parents=True)
+   (base/'bin/conda').touch();(base/'conda-meta').mkdir()
+   marker=base/'conda-meta/history';marker.write_text('unchanged')
+   (base/'etc/cse-trust/empty-ca-dir').mkdir(parents=True);(base/'etc/cse-trust/ca-bundle.pem').touch()
+   logs=root/'logs';logs.mkdir()
+   (logs/'failed-command-001.json').write_text(json.dumps({'argv':self.command(base,base)}))
+   (logs/'summary.json').write_text(json.dumps([{'prefix':str(base),'command_failures':[{'file':'failed-command-001.json'}]}]))
+   warning=b'WARNING: Using .* with relational operator is superfluous and deprecated'
+   expired=subprocess.TimeoutExpired('conda',7,output=b'',stderr=warning)
+   with patch.object(m,'capture',return_value='{}'),patch.object(m.subprocess,'run',side_effect=expired) as run,patch('sys.stdout',io.StringIO()) as out:
+    self.assertEqual(m.diagnose_existing(logs,base,True,timeout_seconds=7),2)
+   self.assertEqual(run.call_args.kwargs['timeout'],7)
+   report=json.loads(next(logs.glob('solver-diagnostic-*.json')).read_text())
+   self.assertEqual(report['diagnostic_status'],'timed_out');self.assertEqual(report['timeout_seconds'],7)
+   self.assertIsNone(report['returncode']);self.assertIn(warning.decode(),report['stderr'])
+   self.assertEqual(marker.read_text(),'unchanged')
+   self.assertLess(out.getvalue().index('DIAGNOSTIC TIMED OUT after 7 seconds'),out.getvalue().index(warning.decode()))
+   self.assertIn('--diagnostic-timeout 1800',out.getvalue());self.assertIn('no conflict conclusion',out.getvalue())
 
 class ClassicConflictTests(unittest.TestCase):
  def test_maintenance_disables_broken_hints_even_if_inherited_enabled(self):
