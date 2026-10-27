@@ -32,6 +32,10 @@ class DiagnosticTests(unittest.TestCase):
   base=pathlib.Path('/test/base');argv=self.command(base,base)+['--no-pin']
   converted=m.diagnostic_argv(base,base,argv,[])
   self.assertIn('--no-pin',converted);self.assertIn('--dry-run',converted);self.assertNotIn('--yes',converted)
+ def test_saved_download_only_is_replayed_as_dry_run(self):
+  base=pathlib.Path('/test/base');argv=self.command(base,base)+['--download-only']
+  result=m.diagnostic_argv(base,base,argv,[])
+  self.assertIn('--dry-run',result);self.assertNotIn('--download-only',result)
  def test_diagnose_rejects_apply_before_any_environment_access(self):
   with patch.object(m.sys,'argv',['script','--diagnose','latest','--apply']),patch('sys.stderr',io.StringIO()),patch.object(m,'find_base') as find:
    with self.assertRaises(SystemExit):m.main()
@@ -323,6 +327,67 @@ class ChannelFlowTests(unittest.TestCase):
      sources=[cmd[i+1] for i,value in enumerate(cmd) if value=='--channel']
      self.assertTrue(all(value in ('conda-forge','https://conda.anaconda.org/conda-forge') for value in sources))
 
+class XkbMigrationTests(unittest.TestCase):
+ def fixture(self,directory):
+  prefix=pathlib.Path(directory)/'base';(prefix/'etc/cse-trust').mkdir(parents=True)
+  source=prefix/m.XKB_PATH;(source/'geometry').mkdir(parents=True)
+  (source/'geometry/hp').write_text('original keyboard map');(source/'geometry/hp').chmod(0o640)
+  meta={'xkeyboard-config':{'name':'xkeyboard-config','version':'2.42','build':'old','files':[m.XKB_PATH+'/geometry/hp']}}
+  (prefix/'conda-meta').mkdir();(prefix/'conda-meta/xkeyboard-config.json').write_text(json.dumps(meta['xkeyboard-config']))
+  return prefix,source,meta
+ def preserve(self,prefix,meta,migration):
+  with patch.object(m,'maintenance_gid',return_value=os.getegid()):m.preserve_xkb_tree(prefix,meta,migration)
+ def test_success_preserves_original_data_and_private_backup_permissions(self):
+  with tempfile.TemporaryDirectory() as directory:
+   prefix,source,meta=self.fixture(directory);original=(source/'geometry/hp').stat();migration={}
+   self.preserve(prefix,meta,migration);backup=pathlib.Path(migration['backup'])
+   self.assertFalse(source.exists());self.assertEqual((backup/'geometry/hp').read_text(),'original keyboard map')
+   actual=(backup/'geometry/hp').stat();self.assertEqual((actual.st_ino,actual.st_uid,actual.st_gid,actual.st_mode),(original.st_ino,original.st_uid,original.st_gid,original.st_mode))
+   self.assertEqual(backup.parent.stat().st_mode&0o777,0o700)
+   self.assertEqual(pathlib.Path(migration['manifest']).stat().st_mode&0o777,0o600)
+   target=prefix/'share/xkeyboard-config-2';(target/'geometry').mkdir(parents=True);(target/'geometry/hp').write_text('new keyboard map')
+   source.symlink_to(m.XKB_LINK);m.verify_xkb_tree(prefix,migration)
+   self.assertEqual(migration['status'],'installed-original-preserved')
+   with patch.object(m,'maintenance_gid',return_value=os.getegid()):m.public_permissions(prefix,prefix,True,lambda line:None,excludes=[prefix/m.PATH_BACKUPS])
+   self.assertEqual((backup/'geometry/hp').stat().st_mode,original.st_mode)
+   self.assertEqual(backup.parent.stat().st_mode&0o777,0o700)
+ def test_rollback_restores_original_directory_after_failed_install(self):
+  with tempfile.TemporaryDirectory() as directory:
+   prefix,source,meta=self.fixture(directory);migration={};self.preserve(prefix,meta,migration)
+   target=prefix/'share/xkeyboard-config-2';target.mkdir();source.symlink_to(m.XKB_LINK)
+   m.restore_xkb_tree(prefix,meta,migration)
+   self.assertEqual(migration['status'],'restored-after-failure');self.assertFalse(source.is_symlink())
+   self.assertEqual((source/'geometry/hp').read_text(),'original keyboard map');self.assertFalse(pathlib.Path(migration['backup']).exists())
+ def test_partial_package_rollback_keeps_backup_and_active_path_for_recovery(self):
+  with tempfile.TemporaryDirectory() as directory:
+   prefix,source,meta=self.fixture(directory);migration={};self.preserve(prefix,meta,migration)
+   current=dict(meta['xkeyboard-config'],version='2.48');(prefix/'conda-meta/xkeyboard-config.json').write_text(json.dumps(current))
+   source.symlink_to(m.XKB_LINK);m.restore_xkb_tree(prefix,meta,migration)
+   self.assertEqual(migration['status'],'recovery-needed');self.assertTrue(source.is_symlink());self.assertTrue(pathlib.Path(migration['backup']).is_dir())
+ def test_custom_and_other_package_files_are_left_untouched(self):
+  for mode in ('custom','shared'):
+   with self.subTest(mode=mode),tempfile.TemporaryDirectory() as directory:
+    prefix,source,meta=self.fixture(directory)
+    if mode=='custom':(source/'custom-map').write_text('custom data')
+    else:meta['other']={'files':[m.XKB_PATH+'/geometry/hp']}
+    with self.assertRaisesRegex(RuntimeError,'untracked or other-package'):self.preserve(prefix,meta,{})
+    self.assertTrue(source.is_dir());self.assertFalse((prefix/m.PATH_BACKUPS).exists())
+ def test_symlink_parent_cannot_redirect_migration_outside_prefix(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=pathlib.Path(directory);prefix=root/'base';prefix.mkdir();outside=root/'outside';(outside/'X11/xkb').mkdir(parents=True)
+   (outside/'X11/xkb/map').write_text('outside data');(prefix/'share').symlink_to(outside)
+   with self.assertRaisesRegex(RuntimeError,'symlink parent'):m.inspect_xkb_tree(prefix,{})
+   self.assertEqual((outside/'X11/xkb/map').read_text(),'outside data')
+ def test_replacement_data_symlink_cannot_redirect_installation(self):
+  with tempfile.TemporaryDirectory() as directory:
+   prefix,source,meta=self.fixture(directory);outside=pathlib.Path(directory)/'outside';outside.mkdir()
+   (prefix/'share/xkeyboard-config-2').symlink_to(outside)
+   with self.assertRaisesRegex(RuntimeError,'replacement data path'):self.preserve(prefix,meta,{})
+   self.assertEqual((source/'geometry/hp').read_text(),'original keyboard map');self.assertEqual(list(outside.iterdir()),[])
+ def test_collision_has_filesystem_category(self):
+  category,advice=m.failure_category("CondaMultiError: FileExistsError(17, 'File exists', '../xkeyboard-config-2', '/base/share/X11/xkb')")
+  self.assertEqual(category,'Package file collision');self.assertIn('manifest',advice)
+
 class BaseUpdatePolicyTests(unittest.TestCase):
  def test_base_can_ignore_all_pins_without_retaining_old_dependency_or_boost_names(self):
   meta={'app':{'depends':['dependency']},'dependency':{},'boost':{'channel':'conda-forge'}}
@@ -437,7 +502,7 @@ class BaseUpdatePolicyTests(unittest.TestCase):
 class BaseTransactionTests(unittest.TestCase):
  def run_loaded_base(self,apply=True,current=False,fail_install=False,offline=False,stale_install=False,
                      available=None,default_scope=False,all_envs=False,only=False,stale_plan=False,
-                     manager_stack=False,dry_run_install=False,missing_solver=False,prune_dependency=False,stale_removal=False,configured_pins=()):
+                     manager_stack=False,dry_run_install=False,missing_solver=False,prune_dependency=False,stale_removal=False,configured_pins=(),xkb_layout=False,xkb_uncached=False):
   with tempfile.TemporaryDirectory() as directory:
    root=pathlib.Path(directory);base=root/'loaded-miniforge'
    (base/'bin').mkdir(parents=True);(base/'bin/conda').touch()
@@ -461,19 +526,29 @@ class BaseTransactionTests(unittest.TestCase):
    if prune_dependency:
     installed['legacy-runtime']={'name':'legacy-runtime','version':'1','build':'0','channel':'conda-forge'}
     installed['numpy']['depends']=['legacy-runtime']
+   if xkb_layout:
+    installed['xkeyboard-config']={'name':'xkeyboard-config','version':'2.42','build':'0','channel':'conda-forge','files':[m.XKB_PATH+'/geometry/hp']};updates['xkeyboard-config']='2.48'
+    source=base/m.XKB_PATH;(source/'geometry').mkdir(parents=True);(source/'geometry/hp').write_text('original map')
+    if xkb_layout=='custom':(source/'custom-map').write_text('custom map')
    def save():
     for path in (base/'conda-meta').glob('*.json'):path.unlink()
     for name,record in installed.items():(base/'conda-meta'/(name+'.json')).write_text(json.dumps(record))
-   save();calls=[]
+   save();calls=[];cache_ready=not xkb_uncached
    def fake(cmd,**kwargs):
+    nonlocal cache_ready
     cmd=list(map(str,cmd));calls.append((cmd,dict(kwargs.get('env',{}))))
     if cmd[1:]==['info','--base']:return subprocess.CompletedProcess(cmd,0,str(base)+'\n','')
     if '__cse_solver_probe__' in cmd:output={'success':True,'solver':'classic' if missing_solver else 'libmamba'}
     elif '--show' in cmd:output={'pinned_packages':list(configured_pins)}
     elif 'search' in cmd:output={'conda':[{'name':'conda','version':v,'channel':'conda-forge','build':'0'} for v in available]}
     elif '--explicit' in cmd:return subprocess.CompletedProcess(cmd,0,'@EXPLICIT\n','')
+    elif m.XKB_CACHE_PROBE in cmd:output={'available':cache_ready,'target':m.XKB_LINK}
     elif 'install' in cmd:
-     if '--dry-run' in cmd:
+     if '--download-only' in cmd:
+      self.assertEqual(installed['xkeyboard-config']['version'],'2.42');self.assertEqual((base/m.XKB_PATH/'geometry/hp').read_text(),'original map')
+      cache_ready=True
+      return subprocess.CompletedProcess(cmd,0,'',json.dumps({'exception_name':'CondaExitZero','message':'Package caches prepared; transaction cancelled'}))
+     elif '--dry-run' in cmd:
       links=[dict(installed[n],version=v) for n,v in updates.items()]
       if stale_plan:links[0]['version']=installed['conda']['version']
       output={'success':True,'actions':{'LINK':links}}
@@ -484,6 +559,8 @@ class BaseTransactionTests(unittest.TestCase):
       if not stale_install:
        for name,value in updates.items():installed[name]['version']=value
       if prune_dependency and not stale_removal:installed.pop('legacy-runtime')
+      if xkb_layout:
+       new=base/'share/xkeyboard-config-2/geometry';new.mkdir(parents=True);(new/'hp').write_text('new map');(base/m.XKB_PATH).symlink_to(m.XKB_LINK)
       save();output={'success':True}
     elif '-c' in cmd:output={'python':[3,14,0],'packages':{},'bundles':{}}
     else:output={'success':True}
@@ -492,6 +569,12 @@ class BaseTransactionTests(unittest.TestCase):
    argv=['patch_miniforge_trust.py']+scope+['--log-dir',str(root/'logs')]+(['--apply'] if apply else [])+(['--offline'] if offline else [])
    with patch.object(m.sys,'argv',argv),patch.dict(m.os.environ,{'CONDA_EXE':str(base/'bin/conda')}),patch.object(m.os,'geteuid',return_value=123),patch.object(m,'maintenance_gid',return_value=0),patch.object(m,'maintainable',return_value=True),patch.object(m,'choose_source',return_value=root/'source.pem'),patch.object(m,'filtered_bundle',return_value=('PEM',[])),patch.object(m,'atomic_write',side_effect=lambda path,data:pathlib.Path(path).write_text(data)),patch.object(m.subprocess,'run',side_effect=fake),patch.object(m,'public_permissions',return_value=[]),patch('sys.stdout',io.StringIO()):result=m.main()
    rows=json.loads((root/'logs/summary.json').read_text())
+   if xkb_layout and apply:
+    migration=rows[0].get('xkb_migration')
+    if result==0:
+     self.assertEqual((pathlib.Path(migration['backup'])/'geometry/hp').read_text(),'original map')
+     self.assertEqual((base/m.XKB_PATH/'geometry/hp').read_text(),'new map')
+    else:self.assertEqual((base/m.XKB_PATH/'geometry/hp').read_text(),'original map')
    self.assertEqual([r['prefix'] for r in rows],[str(other)] if only else [str(base),str(other)] if all_envs else [str(base)])
    if not all_envs and not only:
     self.assertFalse(any(str(other) in cmd for cmd,env in calls))
@@ -512,6 +595,18 @@ class BaseTransactionTests(unittest.TestCase):
   result,row,calls,installed=self.run_loaded_base(configured_pins=['defaults::certifi==2024.12.14'])
   self.assertEqual(result,0,row['issues']);self.assertEqual(row['ignored_pins'],['defaults::certifi==2024.12.14'])
   self.assertTrue(all('--no-pin' in c for c,e in calls if 'install' in c))
+ def test_xkb_payload_is_staged_without_transaction_then_migrated(self):
+  result,row,calls,installed=self.run_loaded_base(xkb_layout=True,xkb_uncached=True)
+  self.assertEqual(result,0,row['issues']);self.assertEqual(row['xkb_migration']['status'],'installed-original-preserved')
+  self.assertEqual(len([c for c,e in calls if '--download-only' in c]),1)
+ def test_xkb_original_is_restored_when_install_fails(self):
+  result,row,calls,installed=self.run_loaded_base(xkb_layout=True,fail_install=True)
+  self.assertEqual(result,2);self.assertEqual(row['xkb_migration']['status'],'restored-after-failure')
+  self.assertIn('Package installation failed',' '.join(row['issues']))
+ def test_custom_xkb_data_stops_before_install(self):
+  result,row,calls,installed=self.run_loaded_base(xkb_layout='custom')
+  self.assertEqual(result,2);self.assertIn('untracked',' '.join(row['issues']));self.assertFalse(row['changes_started'])
+  self.assertFalse(any('--yes' in c for c,e in calls))
  def test_full_base_update_prunes_unused_dependencies_and_verifies_actual_removal(self):
   result,row,calls,installed=self.run_loaded_base(prune_dependency=True)
   self.assertEqual(result,0,row['issues']);self.assertNotIn('legacy-runtime',installed)

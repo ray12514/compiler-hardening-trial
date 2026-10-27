@@ -7,7 +7,7 @@ No external incident test endpoint is contacted.
 
 ## Update Conda and base packages in the existing installation
 
-Revision 20 keeps the installed Miniforge distribution, prefix, module selection
+Revision 21 keeps the installed Miniforge distribution, prefix, module selection
 and Spack version pin. Miniforge `24.11.2-1` does not itself require a reinstall
 for an in-place Conda/base package update. No installer is downloaded or rerun.
 The default scope is **the loaded base only**. Other environments require an
@@ -20,7 +20,7 @@ python3 patch_miniforge_trust.py --base-only
 python3 patch_miniforge_trust.py --base-only --apply
 ```
 
-`python3 patch_miniforge_trust.py --version` should print revision 20. Each run
+`python3 patch_miniforge_trust.py --version` should print revision 21. Each run
 also records its revision so an older copied script can be identified directly.
 
 Use `--ca-bundle /path/to/CSE-existing-bundle.pem` when a particular existing site
@@ -98,6 +98,43 @@ not as a claim that upstream deprecated them. Availability and ABI compatibility
 come from channel metadata for the actual host; the script does not guess that
 every package can move to its individually newest release.
 
+### XKB directory-to-symlink migration
+
+New `xkeyboard-config` packages expose `share/X11/xkb` as the relative symlink
+`../xkeyboard-config-2`. Older installations have a directory at that path.
+A failed cleanup of that directory can surface as `FileExistsError` while Conda
+tries to create the symlink. This is a filesystem/linking failure. Conda supports
+updating its own package in place; replacing the Miniforge installer is not required.
+
+Revision 21 handles this specific migration in the selected base. It checks the
+planned package's extracted payload for the expected symlink. If that payload
+is not cached, a `--download-only` stage prepares the validated packages without
+executing a package transaction. Older Conda can report successful cache preparation
+as `CondaExitZero` on stderr; the exit status and a subsequent payload check determine
+whether preparation succeeded.
+
+Before installation, the updater validates the old directory against installed
+`xkeyboard-config` file records, then moves it intact to a private directory under
+`BASE/share/X11/.cse-trust-path-backups/xkb-*/xkb`. This same-parent-tree rename
+preserves file contents, owners, groups and modes. It also keeps `share/X11`
+nonempty so Conda's rollback cleanup cannot remove the containing directory.
+The private backup is excluded from recursive permission normalization. A manifest
+records the source, backup, original inode/ownership and migration state before
+data moves. Existing file-conflict checks remain enabled.
+
+Custom/untracked files, other-package files, special files, symlinked parents or
+a symlinked replacement-data root stop the migration before the source is moved.
+Write/traverse access to the containing `share/X11` directory is required; the
+old package files do not need to be chmodded or recursively deleted. A failed
+package installation restores the old tree when Conda's package records roll back
+and the destination can be restored safely. Partial rollback or unexpected active
+contents retain the backup and report `recovery-needed` with its manifest path.
+This is a backup of the XKB tree, not a complete environment rollback facility.
+
+Successful installs verify the new symlink and keyboard data. `summary.json` and
+`--report` show `xkb_migration`, its status and recovery paths. Diagnostic dry runs
+do not perform this migration. The normal base update command needs no extra flag.
+
 ### An update is rejected
 
 Use the current script's normal base update first; do not repeat the older
@@ -115,7 +152,7 @@ this script still use their stored settings. The module/Spack Miniforge release
 selection remains unchanged. A package-version pin is separate from a PEM file.
 Non-base environments retain their existing targeted maintenance and pin policy.
 
-If a base run still reports a configured-pin conflict, first verify revision 20
+If a base run still reports a configured-pin conflict, first verify the current revision
 and that `--no-pin` appears on both saved install commands. Actual dependency,
 platform and channel compatibility requirements remain enforced.
 
@@ -199,7 +236,7 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
 
 The script was updated at commit `3cfb223ceb8ca59a128523627df0d187a75bc9a0`.
 That historical revision uses classic solving rather than the current single
-libmamba base transaction. Use the current `main` retrieval for revision 20.
+libmamba base transaction. Use the current `main` retrieval for revision 21.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
