@@ -1,11 +1,39 @@
 import importlib.util
 import pathlib
 import unittest
-import tempfile, json, subprocess, io
+import tempfile, json, subprocess, io, os
 from unittest.mock import patch
 
 spec=importlib.util.spec_from_file_location('maintenance',pathlib.Path(__file__).with_name('patch_miniforge_trust.py'))
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+
+class ClassicConflictTests(unittest.TestCase):
+ def test_maintenance_disables_broken_hints_even_if_inherited_enabled(self):
+  with patch.dict(os.environ,{'CONDA_UNSATISFIABLE_HINTS':'true'}):
+   env=m.safe_environment()
+   self.assertEqual(env['CONDA_UNSATISFIABLE_HINTS'],'false')
+   self.assertEqual(os.environ['CONDA_UNSATISFIABLE_HINTS'],'true')
+ def test_saved_type_error_identifies_conflict_reporting_crash(self):
+  category,advice=m.failure_category("TypeError: unsupported operand type(s) for |: 'set' and 'tuple'")
+  self.assertEqual(category,'Conda classic conflict-reporting bug')
+  self.assertIn('dependency conflict',advice)
+ @unittest.skipUnless(os.environ.get('CSE_CONDA_PYTHON'),'Set CSE_CONDA_PYTHON to an installed Conda Python for the real solver regression')
+ def test_real_conda_conflict_path_rejects_without_type_error(self):
+  probe='''
+import json
+from conda.resolve import Resolve
+from conda.models.match_spec import MatchSpec
+try:
+    Resolve({}).find_conflicts({MatchSpec('python >=3.11')}, (MatchSpec('conda >=26.9.4'),))
+except Exception as exc:
+    print(json.dumps({'exception':type(exc).__name__,'message':str(exc)}))
+else:
+    raise AssertionError('Conflicting specifications were not rejected')
+'''
+  env=m.safe_environment();env['CONDA_JSON']='true';env['PYTHONDONTWRITEBYTECODE']='1'
+  result=subprocess.run([os.environ['CSE_CONDA_PYTHON'],'-I','-c',probe],env=env,text=True,
+                        stdout=subprocess.PIPE,stderr=subprocess.PIPE,check=True,timeout=30)
+  self.assertEqual(json.loads(result.stdout)['exception'],'UnsatisfiableError',result.stdout+result.stderr)
 
 class ChannelRegressionTests(unittest.TestCase):
  def test_host_only_installed_origin_ignored(self):
@@ -248,6 +276,7 @@ class CondaBootstrapTests(unittest.TestCase):
    self.assertTrue(env['CONDA_SSL_VERIFY'].endswith('/etc/cse-trust/ca-bundle.pem'))
    self.assertEqual(env['REQUESTS_CA_BUNDLE'],env['CONDA_SSL_VERIFY'])
    self.assertEqual(env['CONDA_DRY_RUN'],'false')
+   self.assertEqual(env['CONDA_UNSATISFIABLE_HINTS'],'false')
    self.assertNotIn('ssl_verify=false',' '.join(cmd).lower())
    self.assertNotIn('miniforge3',' '.join(cmd));self.assertNotIn('conda init',' '.join(cmd))
  def test_preview_never_bootstraps_or_contacts_package_channels(self):

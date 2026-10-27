@@ -7,7 +7,7 @@ No external incident test endpoint is contacted.
 
 ## Update Conda in the loaded installation first
 
-Revision 14 keeps the existing Miniforge installation and discovers it from the
+Revision 15 keeps the existing Miniforge installation and discovers it from the
 loaded module's `CONDA_EXE` or `conda` on `PATH`. No system name or explicit base
 path is needed. The default scope is now **the loaded base only**. Discovery and
 updates of other environments require `--all-envs`; `--only PATH` selects exact
@@ -79,6 +79,31 @@ or `.condarc` dry-run settings, while planning commands explicitly use `--dry-ru
 If an install nevertheless returns a dry-run result, it is reported directly
 instead of proceeding to a misleading minimum-version failure.
 
+### Conda crashes with `unsupported operand type(s) for |: 'set' and 'tuple'`
+
+This can originate in Conda's classic solver, inside
+`conda/resolve.py:build_conflict_map`, while it tries to explain an unsatisfiable
+request. Some `--update-deps` paths pass a tuple of requested specifications to
+code that assumes a set. The resulting TypeError hides the dependency conflict.
+
+Revision 15 sets `CONDA_UNSATISFIABLE_HINTS=false` only in maintenance subprocesses
+to bypass this broken detailed explanation. It preserves normal solver rejection,
+site pins, exact-plan verification and TLS settings. Installed Conda files and the
+parent shell configuration are not patched. A genuinely incompatible request still
+fails with `UnsatisfiableError`; this workaround does not establish that an upgrade
+has completed. It also avoids the expensive conflict-hint graph traversal.
+
+For an already downloaded revision 14, the equivalent temporary workaround is:
+
+```bash
+CONDA_UNSATISFIABLE_HINTS=false python3 patch_miniforge_trust.py --base-only --apply
+```
+
+Saved reports now identify this specific upstream crash. Use `--report latest`
+to see whether it occurred during bootstrap or the subsequent full base update.
+After bypassing the crash, review any remaining dependency failure and explicit
+site pins using the saved command output; do not remove pins merely to hide it.
+
 Private logs retain `base-conda-bootstrap-search.json`, `base-conda-bootstrap-plan.json`,
 `base-conda-bootstrap-install.json`, and a separate `conda_bootstrap` result in
 `summary.json`. If the later full update fails, the report distinguishes a
@@ -132,7 +157,7 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
 
 The script was updated at commit `3cfb223ceb8ca59a128523627df0d187a75bc9a0`.
 That historical revision performs the full base update but does not have the
-separate Conda bootstrap above. Use the current `main` retrieval for revision 14.
+separate Conda bootstrap above. Use the current `main` retrieval for revision 15.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
@@ -294,7 +319,7 @@ hosting domain or add Anaconda `defaults` in response to the generic conda messa
 
 ## Full updates are permitted in the base environment
 
-Revision 14 first checks/bootstraps Conda as described above, then retains
+Revision 15 first checks/bootstraps Conda as described above, then retains
 revision 12's full conda package-update scope for the Miniforge base. It no
 longer rejects changes to `krb5`, NumPy, matplotlib, matplotlib-base, Python or other
 base packages as unrelated. The base solve uses `--update-all` with no script-generated
@@ -707,6 +732,18 @@ simulated preview/offline apply. Tests also cover newest-version selection when
 the minimum is already installed, downgrade guards, stale metadata, and default
 base-only scope with unchanged sibling PEM/configuration files. Actual SUSE/RHEL deployment remains
 a target-system validation task.
+
+To include the real installed classic-solver conflict regression:
+
+```bash
+CSE_CONDA_PYTHON=/path/to/miniforge/bin/python \
+  python3 -m unittest discover -s scripts -p test_channel_regressions.py
+```
+
+That check invokes the installed Conda library with a tuple of requested specs and
+requires normal `UnsatisfiableError` rejection instead of the upstream TypeError.
+It performs no package transaction or network access. Without `CSE_CONDA_PYTHON`,
+that integration check is skipped.
 
 ## References
 
