@@ -58,6 +58,82 @@ logs or the previous separate CSE copy. It is read-only and does not connect to
 external test sites. As before, fingerprint screening alone does not establish
 full certificate-chain rejection or proxy remediation.
 
+## Verify normal user operations after installation
+
+Revision 28 adds an explicit post-install check. Run it after the base update and
+native PEM maintenance, in a fresh shell with the usual site/compiler and
+Miniforge modules loaded. Run separately for each GCC/Intel installation, ideally
+as a representative ordinary user. This mode needs no `cse` group membership or
+shared-prefix write access:
+
+```bash
+python3 patch_miniforge_trust.py --version  # revision 28
+python3 patch_miniforge_trust.py --verify-user "$HOME/cse-user-check-gcc-1"
+python3 patch_miniforge_trust.py --report "$HOME/cse-user-check-gcc-1"
+```
+
+For the Intel setup, load its usual modules in a fresh shell and use a different
+new directory, such as `$HOME/cse-user-check-intel-1`. No system name is required;
+the loaded Miniforge supplies the base path. The destination must be new, under
+your home, and outside existing Conda environments. `--verify-user` performs its
+private transactions directly; do not combine it with `--apply`, promotion,
+staging, other-environment scopes, or `--offline`.
+
+The checks are:
+
+| Check | What it establishes |
+| --- | --- |
+| Base trust | Screens native, Python/pip and explicitly selected CA bundles for the four known incident roots; rejects disabled Conda verification, pip trusted-host bypasses and HTTP package sources |
+| Conda create | Uses the installed base's Conda/libmamba to create a fresh private environment with the base Python major/minor, corrected CA packages, pip, setuptools and wheel |
+| Private trust | Screens the new environment's own PEM files and effective inherited trust settings before further downloads |
+| Conda install | Solves, downloads and installs `click` through approved channels, then verifies installed records against the validated plan |
+| pip download/install | Forces an uncached HTTPS wheel download and install of `packaging` using the current pip index configuration, including your approved private index if configured |
+| Local pip build | Builds a tiny known local Python project without build isolation or network access, installs its wheel privately, and runs `pip check` |
+| Activation/imports | Sources the installation's `conda.sh` in a child Bash shell, activates the private environment, checks its Python prefix, and imports click, packaging, the locally built module and compiled zlib |
+| Private permissions | Creates, renames and removes test files in the private environment and cache/build directories; records effective base access for this account |
+| Base unchanged | Compares base package/control metadata and native PEM hashes before and after; a concurrent change prevents a passing result |
+
+The base's Conda manages this test environment; another Conda installation inside
+it is unnecessary. Python and pip are installed as private environment packages.
+The shared package cache is not used. A fresh private cache deliberately requires
+real package retrieval, so a successful run cannot come solely from an already
+populated shared cache. Installs, caches, build files, temporary files and private
+reports stay under the new directory. TLS/source settings are preserved rather
+than replaced with a newly filtered CA file to make the checks pass. Existing
+pip destination/user/log overrides are rejected if they could redirect writes.
+External plugin discovery is disabled for the controlled Conda solver, as in the
+maintenance workflow. The check does not load arbitrary login startup files.
+
+Normal configured package endpoints are contacted. No live incident test hosts
+are probed. Successful downloads test positive HTTPS access; fingerprint screening
+alone does not prove that every compromised chain is rejected. With approved
+incident-chain PEM fixtures already available locally, add:
+
+```bash
+python3 patch_miniforge_trust.py --verify-user "$HOME/cse-user-check-gcc-2" \
+  --chains-dir /path/to/approved/local/chains
+```
+
+This uses OpenSSL 3 to test rejection offline against the checked bundles. Missing,
+malformed, unexpectedly accepted or inconclusive chains fail that check. Without
+`--chains-dir`, it is explicitly `not-tested`; the other user-operation checks can
+still pass. No fixtures are downloaded automatically.
+
+`verification.md` gives each result; `verification-summary.json` and private
+`command-NNN.json` files retain the evidence. URLs in these command reports are
+redacted. The environment is retained for inspection and follow-up application
+tests. Exit 0 requires all requested checks to pass; exit 2 records a failure and
+leaves the private partial work for diagnosis. Reading `--report` never reruns a
+network check or installation.
+
+A passing run applies to the account, loaded modules, index/channel configuration
+and operations tested. Repeat with an ordinary user account before declaring user
+access ready. A Python wheel build does not validate a C/C++/Fortran compiler,
+Intel/MPI linkage, every scientific application, all users' startup settings, or
+the inspection proxy's upstream certificate policy. Use normal application smoke
+tests for those requirements. This mode changes no shared permissions or base
+packages and does not automatically run during promotion.
+
 ## Build a private candidate and compare before changing base
 
 Revision 24 introduced a separate staging workflow for reviewing a complete base rebuild;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 27 (2026-10-28).
+"""CSE Miniforge certificate maintenance, revision 28 (2026-10-28).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -19,8 +19,16 @@ Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --only /path/to/env    # preview one prefix
   python3 patch_miniforge_trust.py --all-envs             # opt into discovery
   python3 patch_miniforge_trust.py --trust-only --apply   # existing native PEMs only
+  python3 patch_miniforge_trust.py --verify-user ~/cse-user-check-1 # online private user checks
 
-No test-site connections, connectivity probes, remote execution or OS writes.
+No incident test-site connections, remote execution or OS writes.
+--verify-user NEW_PRIVATE_DIR explicitly exercises HTTPS package downloads,
+private environment creation, activation, imports, a local pip wheel build and
+user write access. It changes only that new private directory, requires no cse
+membership and makes no base updates. It preserves the loaded TLS settings;
+insecure settings or known incident roots fail before package downloads. Optional
+--chains-dir checks supplied incident chains offline. Reports cover this account
+and these exercises, not every user, application, compiler or proxy trust policy.
 Default preview is local-only: inventory, CA inspection, ownership and permissions.
 --promote previews are dependency dry runs of a reviewed set; --apply installs it
 at its original base prefix after freshness/access checks. Stage each system
@@ -197,7 +205,7 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 27
+SCRIPT_REVISION = 28
 BASE_REPLACEMENTS = {'boost':('libboost-python-devel',),'boost-cpp':('libboost-devel',)}
 ROOTS = {
  '7DD78D5F4F13459A83DFF9ABBBA62EDBAF6F2D102BF257FD712F4D9F2746ED8D': 'emSign Root TLS CA - G3',
@@ -1504,6 +1512,7 @@ def report_directory(directory):
 
 def report_existing(directory, verbose=False):
     directory = report_directory(directory)
+    if (directory/'verification-summary.json').is_file():return report_user_verification(directory)
     if (directory/'permission-summary.json').is_file() and not (directory/'summary.json').is_file():
         print('READ-ONLY PERMISSION REPORT: '+str(directory))
         print((directory/'permission-preflight/permissions.txt').read_text())
@@ -2514,11 +2523,269 @@ def stage_base(args, base, env):
     return 0 if summary['status']=='ready-for-review' else 2
 
 
+USER_TRUST_AUDIT = AUDIT.replace('print(json.dumps(d))', '''
+d['ssl_paths'] = ssl.get_default_verify_paths()._asdict()
+import hashlib
+d['default_ca_fingerprints'] = [hashlib.sha256(c).hexdigest().upper()
+    for c in ssl.create_default_context().get_ca_certs(binary_form=True)]
+print(json.dumps(d))
+''')
+
+USER_IMPORT_PROBE = r'''
+import sys, json, pathlib, zlib, click, packaging, cse_user_probe
+assert pathlib.Path(sys.prefix).resolve() == pathlib.Path(sys.argv[1]).resolve()
+assert cse_user_probe.answer() == 42
+assert zlib.decompress(zlib.compress(b'CSE')) == b'CSE'
+print(json.dumps({'prefix':sys.prefix,'python':sys.version,'click':click.__file__,
+                 'packaging':packaging.__file__,'local_build':cse_user_probe.__file__}))
+'''
+
+
+def verification_source_url(value):
+    parsed=urlsplit(value)
+    if parsed.scheme!='https' or not parsed.hostname:
+        raise RuntimeError('User download verification requires HTTPS package sources')
+    if 'emudhra' in parsed.hostname.lower() or parsed.hostname.lower().endswith('we-have-a-problem.com'):
+        raise RuntimeError('Incident test-site connections are forbidden; use local offline chains')
+
+
+def redact_verification(text):
+    def clean(match):
+        try:
+            p=urlsplit(match.group(0));host=p.hostname or ''
+            if p.port:host+=':'+str(p.port)
+            path=re.sub(r'/t/[^/]+','/t/<REDACTED>',p.path)
+            return urlunsplit((p.scheme,host,path,'<REDACTED>' if p.query else '', ''))
+        except ValueError:return '<REDACTED URL>'
+    return re.sub(r'https?://[^\s\"\'<>]+',clean,text)
+
+
+def check_user_trust(prefix, config, env, audit, pip_config):
+    setting=config.get('ssl_verify',True)
+    if setting is False or str(setting).lower() in ('false','0','no'):
+        raise RuntimeError('Conda certificate verification is disabled')
+    if str(env.get('CONDA_SSL_VERIFY','')).lower() in ('false','0','no') or env.get('PYTHONHTTPSVERIFY')=='0':
+        raise RuntimeError('Certificate verification is disabled by the current environment')
+    paths=set(native_bundle_paths(prefix))
+    paths.update(Path(value).expanduser() for value in audit.get('bundles',{}).values() if value)
+    if isinstance(setting,str) and setting.lower() not in ('true','truststore'):
+        paths.add(Path(os.path.expandvars(setting)).expanduser())
+    for key in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','CURL_CA_BUNDLE','SSL_CERT_FILE','PIP_CERT'):
+        value=env.get(key)
+        if value and value.lower() not in ('true','false','truststore','1','0'):
+            paths.add(Path(os.path.expandvars(value)).expanduser())
+    for key,value in pip_config.items():
+        if key.endswith('.trusted-host') and value:
+            raise RuntimeError('pip trusted-host bypasses normal TLS verification; remove it before this check')
+        if key.endswith(('.index-url','.extra-index-url')) and value:
+            for url in str(value).split():verification_source_url(url)
+        if key.endswith('.cert') and value:paths.add(Path(value).expanduser())
+        if (key.endswith(('.target','.prefix','.root','.log')) and value) or (key.endswith('.user') and str(value).lower() in ('1','true','yes')):
+            raise RuntimeError('pip destination/user/log overrides prevent a private-only verification run')
+    if env.get('PIP_TRUSTED_HOST'):raise RuntimeError('pip trusted-host bypasses normal TLS verification')
+    if str(env.get('PIP_NO_INDEX','')).lower() in ('1','true','yes'):
+        raise RuntimeError('pip is configured offline; this mode must verify a real package download')
+    for key in ('PIP_INDEX_URL','PIP_EXTRA_INDEX_URL'):
+        for url in env.get(key,'').split():verification_source_url(url)
+    if any(env.get(key) for key in ('PIP_TARGET','PIP_PREFIX','PIP_ROOT','PIP_LOG')) or str(env.get('PIP_USER','')).lower() in ('1','true','yes'):
+        raise RuntimeError('pip destination/user/log overrides prevent a private-only verification run')
+    directories={value for value in (env.get('SSL_CERT_DIR'),audit.get('ssl_paths',{}).get('capath')) if value}
+    for value in directories:
+        for directory in value.split(os.pathsep):
+            if not directory:continue
+            folder=Path(directory)
+            if not folder.is_dir():raise RuntimeError('Configured CA directory is unavailable: '+str(folder))
+            for path in folder.iterdir():
+                if path.is_file() and '-----BEGIN CERTIFICATE-----' in path.read_text(errors='replace'):paths.add(path)
+    matched=set(audit.get('default_ca_fingerprints',())) & set(ROOTS)
+    evidence=[]
+    for path in sorted(paths):
+        data=path.read_bytes();present=set(dict(pem_entries(data.decode()))) & set(ROOTS)
+        matched.update(present)
+        evidence.append({'path':str(path),'sha256':hashlib.sha256(data).hexdigest(),'incident_roots':sorted(present)})
+    if matched:raise RuntimeError('Known incident roots remain in selected trust: '+', '.join(ROOTS[h] for h in sorted(matched)))
+    return evidence
+
+
+def report_user_verification(directory):
+    summary=json.loads((directory/'verification-summary.json').read_text())
+    print('SAVED USER VERIFICATION: '+summary['status']+' | base: '+summary['base'])
+    for name,result in summary['checks'].items():print('  '+name+': '+result['status'])
+    for issue in summary['issues']:print('  ATTENTION: '+issue)
+    print('Saved evidence for account '+str(summary['uid'])+'; no checks rerun or files changed.')
+    return 0
+
+
+def verify_user_install(args, base, env):
+    root=args.verify_user.expanduser().resolve()
+    home=Path.home().resolve()
+    if root.exists() or root==home or home not in root.parents or base==root or base in root.parents:
+        raise RuntimeError('Choose a new private directory under your home, outside the base installation')
+    if any((p/'conda-meta/history').exists() for p in root.parents):
+        raise RuntimeError('Choose a new private directory outside existing Conda environments')
+    if any(c in str(root) for c in (os.pathsep,',','\n')):raise RuntimeError('Private directory has an unsupported path delimiter')
+    original_umask=os.umask(0o077)
+    try:root.mkdir(mode=0o700,parents=True,exist_ok=False)
+    except BaseException:os.umask(original_umask);raise
+    prefix=root/'env';env=dict(env)
+    env.update(CONDA_PKGS_DIRS=str(root/'pkgs'),CONDA_ENVS_PATH=str(root/'envs'),CONDA_REGISTER_ENVS='false',
+               CONDA_OFFLINE='false',CONDA_DRY_RUN='false',CONDA_AUTO_UPDATE_CONDA='false',
+               CONDA_NOTIFY_OUTDATED_CONDA='false',CONDA_NUMBER_CHANNEL_NOTICES='0',CONDA_REPORT_ERRORS='false',
+               PYTHONDONTWRITEBYTECODE='1',PYTHONUSERBASE=str(root/'python-user'),PIP_DISABLE_PIP_VERSION_CHECK='1',
+               PIP_CACHE_DIR=str(root/'pip-cache'),TMPDIR=str(root/'tmp'),XDG_CACHE_HOME=str(root/'user-cache'))
+    for key in ('CSE_CONDA_PERMISSION_HOLDS','CSE_CONDA_APPROVED_PLAN'):env.pop(key,None)
+    for name in ('pkgs','envs','pip-cache','tmp','user-cache'):(root/name).mkdir(mode=0o700)
+    names=('base-trust','conda-create','private-trust','conda-install','pip-download-install','pip-local-build',
+           'activation-imports','private-permissions','base-unchanged','offline-chain-rejection')
+    summary={'script_revision':SCRIPT_REVISION,'base':str(base),'prefix':str(prefix),'uid':os.geteuid(),
+             'status':'running','checks':{name:{'status':'not-run'} for name in names},'issues':[],
+             'limits':['This account and these exercises only; repeat as a representative ordinary user.',
+                       'No full application/compiler validation or proxy-upstream trust verification.',
+                       'Root fingerprint screening is separate from offline chain-rejection testing.']}
+    baseline=None;native_before=None;phase='prepare';command_number=0
+    log=(root/'run.log').open('w',buffering=1)
+    def say(message):message=redact_verification(message);print(message,flush=True);log.write(message+'\n')
+    def run(command, raw=False, allow_failure=False):
+        nonlocal command_number
+        command=list(map(str,command));command_number+=1
+        display=command if '-c' not in command else command[:command.index('-c')]+['-c','<local verification program>']
+        say('Check: '+phase)
+        finished=threading.Event();started=time.monotonic()
+        def progress():
+            while not finished.wait(30):say('Still checking %s (%ds elapsed)'%(phase,time.monotonic()-started))
+        heartbeat=threading.Thread(target=progress,daemon=True);heartbeat.start()
+        timed_out=False
+        try:result=subprocess.run(command,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=600)
+        except subprocess.TimeoutExpired as exc:
+            decode=lambda value:value.decode(errors='replace') if isinstance(value,bytes) else value or ''
+            result=subprocess.CompletedProcess(command,None,decode(exc.stdout),decode(exc.stderr));timed_out=True
+        finally:finished.set();heartbeat.join()
+        (root/('command-%03d.json'%command_number)).write_text(redact_verification(json.dumps({
+            'phase':phase,'argv':display,'returncode':result.returncode,'timed_out':timed_out,'stdout':result.stdout,'stderr':result.stderr},indent=2)))
+        if timed_out:raise RuntimeError('User verification command timed out after 600 seconds; private work may be partial')
+        if result.returncode and not allow_failure:raise RuntimeError(diagnostic_text(result.stdout,result.stderr))
+        if allow_failure:return result
+        if raw:return result.stdout
+        data=json.loads(result.stdout)
+        if isinstance(data,dict) and (data.get('success') is False or data.get('dry_run') and '--dry-run' not in command):
+            raise RuntimeError('Command did not perform the requested transaction')
+        return data
+    def conda(values,raw=False):return run([base/'bin/python','-I','-B','-c',LIBMAMBA_CLI]+values,raw=raw)
+    def check(name,operation):
+        nonlocal phase
+        phase=name
+        try:
+            value=operation();summary['checks'][name]={'status':'passed','evidence':value};return value
+        except Exception as exc:
+            summary['checks'][name]={'status':'failed','detail':redact_verification(str(exc))};raise
+    def pip_config(py):
+        settings={}
+        for line in run([py,'-I','-B','-m','pip','config','list'],raw=True).splitlines():
+            if '=' in line:
+                key,value=line.split('=',1)
+                try:settings[key]=ast.literal_eval(value)
+                except (ValueError,SyntaxError):settings[key]=value
+        return settings
+    def solve_install(verb,specs):
+        common=[verb,'-p',str(prefix),'--solver','libmamba','--json','--no-pin']+channel_args
+        if verb=='create':common+=['--copy','--no-default-packages','--no-shortcuts']
+        plan=conda(common+specs+['--dry-run']);check_plan(plan,None,{spec_name(value) for value in specs})
+        for record in plan.get('actions',{}).get('LINK',[]):
+            if record.get('url'):verification_source_url(record['url'])
+        final,exact=exact_plan_specs(records(prefix) if prefix.exists() else {},plan,{},args.channel,config)
+        conda(common+exact+['--yes'])
+        installed=records(prefix);verify_installed_plan(final,installed)
+        verify_minimums({name:{} for name in ('pip','certifi','ca-certificates')},installed)
+        return {'requested':specs,'installed':sorted(installed)}
+    try:
+        say('PRIVATE USER VERIFICATION | base: '+str(base)+' | account UID: '+str(os.geteuid()))
+        summary['base_access']=[access_snapshot(path) for path in (base,base/'bin',base/'bin/python',base/'bin/conda')]
+        before=records(base);baseline=stage_source_state(base,before)
+        native_before={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in native_bundle_paths(base)}
+        config=conda(['config','--show','--json'])
+        _,urls,channel_args,_,_,_=environment_channels(before,args.channel,config)
+        for url in urls:verification_source_url(url)
+        audit=run([base/'bin/python','-I','-B','-c',USER_TRUST_AUDIT])
+        trust=check('base-trust',lambda:check_user_trust(base,config,env,audit,pip_config(base/'bin/python')))
+        python_version=before['python']['version'].split('.')
+        specs=['python='+'.'.join(python_version[:2]),'pip>='+MINIMUM['pip'],'certifi>='+MINIMUM['certifi'],
+               'ca-certificates>='+MINIMUM['ca-certificates'],'setuptools','wheel']
+        check('conda-create',lambda:solve_install('create',specs))
+        audit=run([prefix/'bin/python','-I','-B','-c',USER_TRUST_AUDIT])
+        trust+=check('private-trust',lambda:check_user_trust(prefix,config,env,audit,pip_config(prefix/'bin/python')))
+        check('conda-install',lambda:solve_install('install',['click']))
+        audit=run([prefix/'bin/python','-I','-B','-c',USER_TRUST_AUDIT])
+        trust+=check('private-trust',lambda:check_user_trust(prefix,config,env,audit,pip_config(prefix/'bin/python')))
+        py=prefix/'bin/python'
+        def pip_download():
+            run([py,'-I','-B','-m','pip','install','--no-input','--no-user','--disable-pip-version-check','--no-cache-dir','--no-deps',
+                 '--only-binary=:all:','--force-reinstall','--report',root/'pip-install.json','packaging'],raw=True)
+            report=json.loads((root/'pip-install.json').read_text())
+            if not report.get('install'):raise RuntimeError('pip reported no package download/install')
+            for entry in report['install']:verification_source_url(entry['download_info']['url'])
+            return {'report':'pip-install.json'}
+        check('pip-download-install',pip_download)
+        project=root/'local-project';project.mkdir()
+        (project/'pyproject.toml').write_text('[build-system]\nrequires = ["setuptools", "wheel"]\nbuild-backend = "setuptools.build_meta"\n')
+        (project/'setup.cfg').write_text('[metadata]\nname = cse-user-probe\nversion = 0.0.1\n[options]\npy_modules = cse_user_probe\n')
+        (project/'cse_user_probe.py').write_text('def answer():\n    return 42\n')
+        wheels=root/'built-wheels';wheels.mkdir()
+        def local_build():
+            run([py,'-I','-B','-m','pip','wheel','--no-input','--no-index','--no-deps','--no-build-isolation',
+                 '--wheel-dir',wheels,project],raw=True)
+            run([py,'-I','-B','-m','pip','install','--no-input','--no-user','--no-index','--no-deps','--find-links',wheels,'cse-user-probe'],raw=True)
+            run([py,'-I','-B','-m','pip','check'],raw=True)
+            return {'project':'local-project','wheels':'built-wheels'}
+        check('pip-local-build',local_build)
+        shell='set -eu; source "$1"; conda activate "$2"; python -I -B -c "$3" "$2"'
+        check('activation-imports',lambda:run(['bash','--noprofile','--norc','-c',shell,'cse-user-verification',
+                                              base/'etc/profile.d/conda.sh',prefix,USER_IMPORT_PROBE]))
+        def permissions():
+            evidence=[]
+            for path in (prefix,prefix/'lib',root/'pkgs',wheels):
+                probe=path/'.cse-write-probe';renamed=path/'.cse-rename-probe'
+                probe.write_text('check');probe.rename(renamed);renamed.unlink()
+                evidence.append(access_snapshot(path))
+            return evidence
+        check('private-permissions',permissions)
+        if args.chains_dir:
+            def chains():
+                openssl=prefix/'bin/openssl' if (prefix/'bin/openssl').is_file() else Path(shutil.which('openssl') or '/usr/bin/openssl')
+                for path in dict.fromkeys(row['path'] for row in trust):
+                    verify_chains(openssl,Path(path),args.chains_dir.expanduser().resolve(),env,lambda command,allow_failure=False:run(command,allow_failure=allow_failure))
+                return {'bundles_checked':len(trust),'network_test_sites_contacted':False}
+            check('offline-chain-rejection',chains)
+        else:summary['checks']['offline-chain-rejection']={'status':'not-tested','detail':'Supply approved local --chains-dir files for offline rejection tests.'}
+        summary['status']='passed'
+    except (Exception,KeyboardInterrupt) as exc:
+        summary['status']='failed';summary['issues'].append(redact_verification(str(exc)));say('Check failed: '+str(exc))
+    finally:
+        try:
+            def unchanged():
+                if baseline is None:raise RuntimeError('No initial source fingerprint was captured')
+                if stage_source_state(base)!=baseline or {str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in native_bundle_paths(base)}!=native_before:
+                    raise RuntimeError('Base metadata, configuration or PEM files changed during verification; review concurrent activity')
+                return {'metadata_and_native_pems':'unchanged','shared_package_cache':'not selected for writes'}
+            check('base-unchanged',unchanged)
+        except Exception as exc:summary['status']='failed';summary['issues'].append(redact_verification(str(exc)))
+        try:
+            (root/'verification-summary.json').write_text(redact_verification(json.dumps(summary,indent=2)))
+            lines=['# Miniforge user verification','', 'Status: '+summary['status'],'','Base: `'+str(base)+'`',
+                   '','| Check | Result |','| --- | --- |']
+            lines+=['| '+name+' | '+item['status']+' |' for name,item in summary['checks'].items()]
+            lines+=['','## Issues']+['- '+issue for issue in summary['issues']]+['','## Coverage limits']+['- '+limit for limit in summary['limits']]
+            (root/'verification.md').write_text('\n'.join(lines)+'\n')
+            say('User verification: '+summary['status'].upper()+' | report: '+str(root/'verification.md'))
+        finally:log.close();os.umask(original_umask)
+    return 0 if summary['status']=='passed' else 2
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--version',action='version',version='patch_miniforge_trust.py revision %d'%SCRIPT_REVISION)
     ap.add_argument('miniforge', nargs='?', type=Path)
     ap.add_argument('--apply', action='store_true')
+    ap.add_argument('--verify-user',type=Path,metavar='NEW_HOME_DIR',help='Post-install online user checks in a new private home directory; no base updates or cse membership needed')
     ap.add_argument('--stage',type=Path,metavar='NEW_PRIVATE_DIR',help='Solve and install a fresh private base candidate with comparison reports; source base stays read only; no --apply needed')
     ap.add_argument('--stage-skip',action='append',default=[],metavar='PACKAGE',help='Omit this application request from --stage; repeatable; dependencies may still require it')
     ap.add_argument('--promote',type=Path,metavar='REVIEWED_STAGE_DIR',help='Validate the reviewed exact set against its original base; add --apply to install it in place')
@@ -2544,6 +2811,12 @@ def main():
     ap.add_argument('--chains-dir',type=Path,help='Approved local incident chain directory; no downloads')
     ap.add_argument('--log-dir',type=Path)
     args = ap.parse_args()
+    if args.verify_user:
+        if args.apply or args.stage or args.stage_skip or args.promote or args.check_permissions or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.all_envs or args.only or args.include or args.exclude or args.scan_root or args.log_dir or args.upgrade_conda or args.offline or args.ca_bundle or args.extra_ca or args.diagnostic_timeout is not None:
+            ap.error('--verify-user is an online private user check; combine only with source prefix, --channel, --chains-dir or --verbose')
+        if os.geteuid()==0:ap.error('Run user verification as an ordinary account, not root')
+        env=os.environ.copy();env['PYTHONDONTWRITEBYTECODE']='1'
+        return verify_user_install(args,find_base(args.miniforge,env),env)
     if args.trust_only and (args.all_envs or args.only or args.include or args.exclude or args.scan_root or args.channel or args.upgrade_conda or args.chains_dir):
         ap.error('--trust-only maintains the loaded base PEMs only; do not combine it with package, chain-check, or other-environment options')
     if args.stage_skip and not args.stage:ap.error('--stage-skip requires --stage')
