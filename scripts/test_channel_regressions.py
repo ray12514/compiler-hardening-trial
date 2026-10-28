@@ -107,6 +107,47 @@ class DiagnosticTests(unittest.TestCase):
    self.assertLess(out.getvalue().index('DIAGNOSTIC TIMED OUT after 7 seconds'),out.getvalue().index(warning.decode()))
    self.assertNotIn('Retry with more time',out.getvalue());self.assertIn('explicit pins',out.getvalue());self.assertIn('no conflict conclusion',out.getvalue())
 
+class CachePermissionTests(unittest.TestCase):
+ def test_readonly_cache_file_can_be_removed_from_writable_directory(self):
+  with tempfile.TemporaryDirectory() as directory:
+   parent=pathlib.Path(directory)/'__pycache__';parent.mkdir()
+   cache=parent/'android_deploy.cpython-312.pyc';cache.write_bytes(b'cache');cache.chmod(0o444)
+   snapshot=m.access_snapshot(cache)
+   self.assertTrue(snapshot['parent_directory']['access']['write'])
+   cache.unlink()  # Directory entry access matters; file write access is not required.
+   self.assertFalse(cache.exists())
+ @unittest.skipIf(os.geteuid()==0,'Root can bypass the directory access denial')
+ def test_writable_cache_file_does_not_allow_removal_from_readonly_directory(self):
+  with tempfile.TemporaryDirectory() as directory:
+   parent=pathlib.Path(directory)/'__pycache__';parent.mkdir()
+   cache=parent/'android_deploy.cpython-312.pyc';cache.write_bytes(b'cache');parent.chmod(0o555)
+   try:
+    snapshot=m.access_snapshot(cache)
+    self.assertTrue(snapshot['access']['write']);self.assertFalse(snapshot['parent_directory']['access']['write'])
+    with self.assertRaises(PermissionError):cache.rename(cache.with_suffix('.pyc.c~'))
+    self.assertEqual(cache.read_bytes(),b'cache')
+    output=[];m.print_access(snapshot,output.append)
+    self.assertTrue(any('Containing directory: '+str(parent) in line for line in output))
+   finally:parent.chmod(0o755)
+ def test_missing_cache_file_still_reports_parent_and_sticky_mode_without_changes(self):
+  with tempfile.TemporaryDirectory() as directory:
+   parent=pathlib.Path(directory);parent.chmod(0o1755);cache=parent/'missing.pyc'
+   before=parent.stat()
+   snapshot=m.access_snapshot(cache)
+   self.assertIn('stat_error',snapshot);self.assertTrue(snapshot['parent_directory']['sticky'])
+   self.assertEqual(snapshot['parent_directory']['octal'],'1755')
+   self.assertEqual(parent.stat().st_mode,before.st_mode);self.assertFalse(cache.exists())
+ def test_conda_multierror_tuple_and_rename_permission_paths_are_extracted(self):
+  path='/prefix/bin/__pycache__/android_deploy.cpython-312.pyc'
+  for error in (f"CondaMultiError: PermissionError(13, 'Permission denied', '{path}')",
+                f"PermissionError: [Errno 13] Permission denied: '{path}' -> '{path}.c~'"):
+   with self.subTest(error=error):self.assertEqual(m.denied_paths(error),[path])
+ def test_bytecode_access_failure_explains_cache_and_directory_without_recommending_bypass(self):
+  category,advice=m.failure_category("PermissionError: [Errno 13] Permission denied: '/prefix/bin/__pycache__/android_deploy.cpython-312.pyc'")
+  self.assertEqual(category,'Filesystem access');self.assertIn('generated Python bytecode',advice)
+  self.assertIn('owner/admin',advice);self.assertIn('non-writable directory',advice)
+  self.assertIn('skips alone are nonfatal',advice)
+
 class ClassicConflictTests(unittest.TestCase):
  def test_maintenance_disables_broken_hints_even_if_inherited_enabled(self):
   with patch.dict(os.environ,{'CONDA_UNSATISFIABLE_HINTS':'true'}):

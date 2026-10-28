@@ -7,7 +7,7 @@ No external incident test endpoint is contacted.
 
 ## Update Conda and base packages in the existing installation
 
-Revision 21 keeps the installed Miniforge distribution, prefix, module selection
+Revision 22 keeps the installed Miniforge distribution, prefix, module selection
 and Spack version pin. Miniforge `24.11.2-1` does not itself require a reinstall
 for an in-place Conda/base package update. No installer is downloaded or rerun.
 The default scope is **the loaded base only**. Other environments require an
@@ -20,7 +20,7 @@ python3 patch_miniforge_trust.py --base-only
 python3 patch_miniforge_trust.py --base-only --apply
 ```
 
-`python3 patch_miniforge_trust.py --version` should print revision 21. Each run
+`python3 patch_miniforge_trust.py --version` should print revision 22. Each run
 also records its revision so an older copied script can be identified directly.
 
 Use `--ca-bundle /path/to/CSE-existing-bundle.pem` when a particular existing site
@@ -236,7 +236,7 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
 
 The script was updated at commit `3cfb223ceb8ca59a128523627df0d187a75bc9a0`.
 That historical revision uses classic solving rather than the current single
-libmamba base transaction. Use the current `main` retrieval for revision 21.
+libmamba base transaction. Use the current `main` retrieval for revision 22.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
@@ -566,6 +566,46 @@ can recover a filename and take a current snapshot where the legacy log contains
 a missing path cannot be reconstructed reliably. Snapshots are evidence at their
 capture time, not permission repairs. The script does not fix
 this by recursively widening unrelated directories or changing another user's owner UID.
+
+### Permission denied on `bin/__pycache__/android_deploy.cpython-*.pyc`
+
+A `.pyc` file is generated Python bytecode; `android_deploy` is an application tool,
+not a Conda bootstrap requirement. Its source package can still be part of the
+validated base update. Conda may need to rename or remove the old cache while
+replacing package files, so an access failure can stop the entire transaction even
+when nobody is using that tool. The filename alone does not establish that its
+source package is deprecated or safe to remove from the environment.
+
+Check the exact denied path and its containing `bin/__pycache__` directory. On
+Unix, renaming/removing a file normally needs write and traversal access to that
+directory, plus traversal through ancestors. A foreign-owned `755` directory is
+not group writable; `700` also denies other group members traversal. A `755` file
+alone does not establish that removal is blocked. Sticky bits, ACLs, read-only
+mounts and filesystem policy may impose additional restrictions. Group membership
+does not let you chmod or chgrp another user's files.
+
+Have the owner/admin repair the specific shared directory access if that is the
+blocker, using the site's group or ACL policy. For a directory intended for the
+script's shared policy, that is group `cse`, mode `2775`; ordinary cache files use
+`0664`. These are owner/admin changes on foreign-owned paths, not an instruction
+to recursively change the prefix or its parents. Removing one disposable cache
+file may clear one obstruction but leaves a non-writable directory broken.
+
+Revision 22 captures the containing directory's owner/group, mode, effective
+access, ACL presence and sticky bit alongside the denied filename. It prints this
+snapshot when a command fails and saves it in the failed-command JSON. Read the
+saved report without rerunning an update or solver:
+
+```bash
+python3 patch_miniforge_trust.py --report latest
+```
+
+For older failed-command logs, the report can take a current snapshot when the
+denied path was not already recorded, including CondaMultiError's tuple format.
+Existing snapshots remain evidence from the time they were captured. A final
+permissions-stage `SKIP PATH` / `updated-with-skips` is nonfatal; an install-phase
+`PermissionError` / `incomplete` is a failed package update. Revision 22 improves
+this diagnosis; it does not grant missing site access or skip transaction files.
 
 ## Apply
 
