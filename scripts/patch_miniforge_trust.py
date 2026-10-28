@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 26 (2026-10-28).
+"""CSE Miniforge certificate maintenance, revision 27 (2026-10-28).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -18,7 +18,7 @@ Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --base-only            # preview base only
   python3 patch_miniforge_trust.py --only /path/to/env    # preview one prefix
   python3 patch_miniforge_trust.py --all-envs             # opt into discovery
-  python3 patch_miniforge_trust.py --trust-only --ca-bundle /path/to/site.pem --apply
+  python3 patch_miniforge_trust.py --trust-only --apply   # existing native PEMs only
 
 No test-site connections, connectivity probes, remote execution or OS writes.
 Default preview is local-only: inventory, CA inspection, ownership and permissions.
@@ -118,9 +118,14 @@ otherwise base/ssl/cacert.pem or cert.pem, then OS fallback. --extra-ca PATH add
 explicit organizational roots. The source must be plain PEM certificates; trust
 policy/AUX/private-key/other PEM blocks are rejected rather than losing policy.
 An unavailable configured source fails closed. No CAs are removed from /etc.
---trust-only requires an explicit --ca-bundle and does not invoke conda or update
-packages. It writes only the managed CSE trust files and a shell snippet on apply;
-existing environments/modulefiles are not configured automatically in this mode.
+--trust-only is a separate native-file mode: filter the loaded base's existing
+ssl and certifi PEM bundles in place. No --ca-bundle is required, no CSE copy or
+shell snippet is created, and no package/configuration command is run. Existing
+script-created CSE-path overrides in base configuration are redirected to its
+native ssl PEM; unrelated settings are preserved. Already clean files are not
+rewritten. Package updates can replace these PEM files; rerun this local check
+afterward. Explicit --ca-bundle/--extra-ca sources add organizational certificates
+to the existing bundles without writing to those source paths.
 --inspect-trust reads actual bundles, versions and local configuration separately
 from past run status. A stored filtered file is not proof that every app uses it.
 Replacing the source later with a corrected vendor/site bundle rebuilds this copy.
@@ -192,7 +197,7 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 26
+SCRIPT_REVISION = 27
 BASE_REPLACEMENTS = {'boost':('libboost-python-devel',),'boost-cpp':('libboost-devel',)}
 ROOTS = {
  '7DD78D5F4F13459A83DFF9ABBBA62EDBAF6F2D102BF257FD712F4D9F2746ED8D': 'emSign Root TLS CA - G3',
@@ -485,6 +490,131 @@ def choose_source(args, config, base):
     for rel in ('ssl/cacert.pem','ssl/cert.pem'):
         if (base/rel).is_file(): return (base/rel).resolve()
     return system_bundle()
+
+
+def native_bundle_paths(base):
+    """Resolve aliases only within the selected prefix, never into an OS store."""
+    candidates=[base/rel for rel in ('ssl/cacert.pem','ssl/cert.pem')]
+    candidates.extend(sorted(base.glob('lib/python*/site-packages/certifi/cacert.pem')))
+    candidates.extend(sorted(base.glob('lib/python*/site-packages/pip/_vendor/certifi/cacert.pem')))
+    paths=[]
+    for candidate in candidates:
+        if not candidate.exists() and not candidate.is_symlink(): continue
+        target=candidate.resolve(strict=True)
+        if base not in target.parents or any(base/part in target.parents for part in ('pkgs','envs')):
+            raise RuntimeError('Refusing CA target outside the selected prefix: '+str(candidate)+' -> '+str(target))
+        if not target.is_file(): raise RuntimeError('CA target is not a file: '+str(target))
+        if target not in paths: paths.append(target)
+    if not paths: raise RuntimeError('No existing Miniforge PEM bundles found under '+str(base))
+    return paths
+
+
+def replace_preserving_metadata(path, data):
+    """Replace a regular target, preserving symlink aliases and detaching hardlinks."""
+    st=path.stat()
+    fd,temporary=tempfile.mkstemp(prefix='.cse-ca-',dir=str(path.parent))
+    try:
+        with os.fdopen(fd,'wb') as stream:
+            stream.write(data)
+            current=os.fstat(stream.fileno())
+            if (current.st_uid,current.st_gid)!=(st.st_uid,st.st_gid):
+                os.fchown(stream.fileno(),st.st_uid,st.st_gid)
+            os.fchmod(stream.fileno(),stat.S_IMODE(st.st_mode))
+        os.replace(temporary,str(path))
+    finally:
+        if os.path.exists(temporary): os.unlink(temporary)
+
+
+def legacy_trust_edits(base, bundle):
+    """Migrate only exact paths emitted by this script's previous trust-copy mode."""
+    legacy=str(base/'etc/cse-trust/ca-bundle.pem')
+    edits=[]
+    condarc=base/'.condarc'
+    if condarc.exists():
+        text=condarc.read_text()
+        def replace(match):
+            value=match.group(2).split('#',1)[0].strip().strip('\"\'')
+            return match.group(1)+json.dumps(str(bundle)) if value==legacy else match.group(0)
+        updated=re.sub(r'(?m)^(ssl_verify[ \t]*:[ \t]*)([^\n]*)$',replace,text)
+        if updated!=text: edits.append((condarc,updated.encode()))
+    state=base/'conda-meta/state'
+    if state.exists():
+        text=state.read_text();data=json.loads(text)
+        variables=data.get('env_vars',{});changed=False
+        for key in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','CURL_CA_BUNDLE','PIP_CERT'):
+            if variables.get(key)==legacy: variables[key]=str(bundle);changed=True
+        if variables.get('SSL_CERT_DIR')==str(base/'etc/cse-trust/empty-ca-dir'):
+            del variables['SSL_CERT_DIR'];changed=True
+        if changed: edits.append((state,(json.dumps(data,indent=2)+'\n').encode()))
+    for path,data in edits:
+        if base not in path.resolve(strict=True).parents or path.is_symlink():
+            raise RuntimeError('Refusing linked/outside-prefix configuration edit: '+str(path))
+    return edits
+
+
+def maintain_native_trust(base, args):
+    """Local PEM maintenance only; intentionally bypass every package-update step."""
+    logdir=(args.log_dir or Path.home()/'.cse-trust-logs'/datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')).expanduser().resolve()
+    if logdir==base or base in logdir.parents: raise RuntimeError('Logs must be outside the base installation')
+    logdir.mkdir(mode=0o700,parents=True,exist_ok=False);os.chmod(str(logdir),0o700)
+    with open(str(logdir/'run.log'),'w') as log:
+        def say(message): print(message,flush=True);log.write(message+'\n');log.flush()
+        say('Mode: '+('APPLY' if args.apply else 'LOCAL PREVIEW; no network operations'))
+        say('Scope: existing native Miniforge PEM files | base: '+str(base))
+        say('No package updates or environment permission normalization.')
+        lock=None
+        try:
+            if args.apply:
+                lock=open(str(base/'.cse-certificate-maintenance.lock'),'a')
+                fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+            paths=native_bundle_paths(base)
+            extras=([args.ca_bundle] if args.ca_bundle else [])+args.extra_ca
+            staged=[];details=[]
+            for path in paths:
+                before=path.read_bytes()
+                text,removed=filtered_bundle([path]+extras)
+                after=text.encode() if removed or extras else before
+                changed=after!=before
+                details.append({'path':str(path),'changed':changed,'roots_removed':removed,
+                                'sha256':hashlib.sha256(after).hexdigest()})
+                if changed: staged.append((path,after))
+                say(('Would filter: ' if changed and not args.apply else 'Filter: ' if changed else 'Already clean: ')+str(path))
+            edits=legacy_trust_edits(base,paths[0])
+            for path,data in staged+edits:
+                st=path.stat()
+                if st.st_uid!=os.geteuid() or st.st_mode & (stat.S_ISUID|stat.S_ISGID):
+                    raise RuntimeError('Owner review required before preserving file metadata: '+str(path))
+                if hasattr(os,'listxattr') and any('acl' in key.lower() for key in os.listxattr(str(path))):
+                    raise RuntimeError('Extended ACL needs owner/admin review: '+str(path))
+            # Validate all contents before changing any file. Private backups include
+            # metadata; replacements never modify a shared package-cache inode.
+            if args.apply:
+                for index,(path,data) in enumerate(staged+edits):
+                    backup=logdir/('%03d-before-'%index+path.name)
+                    backup.write_bytes(path.read_bytes())
+                    st=path.stat()
+                    (logdir/('%03d-file.json'%index)).write_text(json.dumps({'path':str(path),'backup':str(backup),'uid':st.st_uid,'gid':st.st_gid,'mode':stat.S_IMODE(st.st_mode)},indent=2))
+                    replace_preserving_metadata(path,data)
+                for path in paths:
+                    if set(dict(pem_entries(path.read_text()))) & set(ROOTS):
+                        raise RuntimeError('Known incident roots remain in '+str(path))
+            status={'status':('written' if staged or edits else 'unchanged') if args.apply else 'planned',
+                    'bundle':str(paths[0]),'mode':'native-pem','bundles':details,
+                    'configuration_migrations':[str(p) for p,d in edits],
+                    'sha256':hashlib.sha256(paths[0].read_bytes()).hexdigest() if args.apply else None}
+            (logdir/'certificate-status.json').write_text(json.dumps(status,indent=2))
+            (logdir/'summary.json').write_text(json.dumps([{'prefix':str(base),'status':'updated' if args.apply else 'previewed','issues':[],'changes_started':bool(args.apply and (staged or edits)),'package_changes':[],'trust_configuration':'existing native PEM files','certificate_status':status}],indent=2))
+            say('Native certificate stage: '+status['status'].upper())
+            if edits: say('Previous script-created CSE-path settings '+('redirected' if args.apply else 'would be redirected')+' to the existing native PEM.')
+            legacy=str(base/'etc/cse-trust')+'/'
+            stale=[key for key in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','CURL_CA_BUNDLE','PIP_CERT','SSL_CERT_DIR') if os.environ.get(key,'').startswith(legacy)]
+            if stale: say('Current shell still has previous CSE-path exports: '+', '.join(stale)+'. Clear those old exports or start a fresh shell; a child process cannot change them.')
+            say('No use-ca.sh or modulefile change is required for clients using the native bundles.')
+            say('External custom trust settings and other environments are unchanged.')
+            say('Private logs: '+str(logdir))
+            return 0
+        finally:
+            if lock: lock.close()
 
 
 def discover(base, conda, env, includes, scans, excludes, skipped=None):
@@ -1835,9 +1965,12 @@ def allowed_pin_origin(origin,names,urls,config):
 
 def inspect_trust(base, prefixes=()):
     print('READ-ONLY CERTIFICATE CHECK | base: '+str(base))
-    bundle=base/'etc/cse-trust/ca-bundle.pem'
-    good=False
-    paths=[bundle]
+    try: native=native_bundle_paths(base)
+    except (OSError,RuntimeError) as exc:
+        print('Native PEM discovery failed: '+str(exc));native=[]
+    bundle=native[0] if native else base/'ssl/cacert.pem'
+    good=bool(native)
+    paths=native+[base/'etc/cse-trust/ca-bundle.pem']
     for prefix in dict.fromkeys([base]+list(prefixes)):
         print('Prefix: '+str(prefix)+(' [BASE]' if prefix==base else ''))
         try:
@@ -1867,19 +2000,20 @@ def inspect_trust(base, prefixes=()):
             data=path.read_bytes();entries=pem_entries(data.decode())
             present=[ROOTS[h] for h,pem in entries if h in ROOTS]
             print('Bundle: %s\n  SHA256=%s\n  Certificates=%d; known incident roots=%s' % (path,hashlib.sha256(data).hexdigest(),len(entries),', '.join(present) or 'NONE OF THE FOUR MATCHED'))
-            if path==bundle: good=not present
+            if path in native and present: good=False
         except FileNotFoundError:
-            if path==bundle: print('CSE managed bundle: ABSENT at '+str(path))
+            if path in native: good=False;print('Native bundle: ABSENT at '+str(path))
         except (OSError,ValueError,RuntimeError) as exc:
             print('Bundle check failed: %s | %s'%(path,exc))
+            if path in native: good=False
             if isinstance(exc,PermissionError):print_access(access_snapshot(path),print)
     marker=base/'etc/cse-trust/managed-by-patch-miniforge-trust'
     try: print('Managed marker: '+marker.read_text().strip())
     except OSError as exc: print('Managed marker unavailable: '+str(exc))
     print('Current shell CA variables: '+json.dumps({k:os.environ[k] for k in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','CURL_CA_BUNDLE','PIP_CERT','SSL_CERT_DIR') if k in os.environ},sort_keys=True))
     selected=[k for k in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','CURL_CA_BUNDLE','PIP_CERT') if os.environ.get(k)==str(bundle)]
-    print('Current shell variables selecting CSE copy: '+(', '.join(selected) or 'NONE; application-specific configuration may still apply'))
-    print('CSE bundle screening: '+('PRESENT, PARSEABLE, FOUR KNOWN ROOTS ABSENT' if good else 'NOT CONFIRMED'))
+    print('Current shell variables selecting native PEM: '+(', '.join(selected) or 'NONE; native defaults or application-specific configuration may apply'))
+    print('Native Miniforge bundle screening: '+('PRESENT, PARSEABLE, FOUR KNOWN ROOTS ABSENT' if good else 'NOT CONFIRMED'))
     print('Stored bundle, package versions and active application trust are separate. This does not prove full chain rejection or proxy remediation.')
     print('No changes, package updates or external TLS connections were made.')
     return 0 if good else 2
@@ -2390,7 +2524,7 @@ def main():
     ap.add_argument('--promote',type=Path,metavar='REVIEWED_STAGE_DIR',help='Validate the reviewed exact set against its original base; add --apply to install it in place')
     ap.add_argument('--check-permissions',action='store_true',help='Read-only complete known-path permission preflight with private owner-grouped reports; may combine with --promote to inspect candidate paths')
     ap.add_argument('--inspect-trust',action='store_true',help='Read actual CSE/base CA files and configuration; no updates')
-    ap.add_argument('--trust-only',action='store_true',help='Only prepare/write the CSE bundle and shell snippet; no package/environment permission changes')
+    ap.add_argument('--trust-only',action='store_true',help='Filter existing base Miniforge PEM files in place; no packages, new CA path, or shell snippet')
     scope=ap.add_mutually_exclusive_group()
     scope.add_argument('--base-only',action='store_true',help='Select only the loaded base; update Conda and compatible base packages together')
     scope.add_argument('--only',type=Path,action='append',default=[],help='Select only this exact environment; repeatable; still uses the base conda/CSE bundle')
@@ -2410,6 +2544,8 @@ def main():
     ap.add_argument('--chains-dir',type=Path,help='Approved local incident chain directory; no downloads')
     ap.add_argument('--log-dir',type=Path)
     args = ap.parse_args()
+    if args.trust_only and (args.all_envs or args.only or args.include or args.exclude or args.scan_root or args.channel or args.upgrade_conda or args.chains_dir):
+        ap.error('--trust-only maintains the loaded base PEMs only; do not combine it with package, chain-check, or other-environment options')
     if args.stage_skip and not args.stage:ap.error('--stage-skip requires --stage')
     if args.check_permissions and (args.apply or args.stage or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.all_envs or args.only or args.include or args.exclude or args.scan_root or args.channel or args.upgrade_conda or args.chains_dir or args.diagnostic_timeout is not None):
         ap.error('--check-permissions is read only and base scoped; combine only with --promote, --log-dir and source/offline options')
@@ -2460,14 +2596,14 @@ def main():
         env.update(CONDA_PKGS_DIRS=str(approved['root']/'pkgs'),CONDA_REGISTER_ENVS='false',CONDA_SHORTCUTS='false',
                    CONDA_NUMBER_CHANNEL_NOTICES='0',CONDA_REPORT_ERRORS='false',CONDA_SAFETY_CHECKS='enabled',
                    CONDA_EXTRA_SAFETY_CHECKS='true',CONDA_ROLLBACK_ENABLED='true')
-    if args.trust_only and not args.ca_bundle: ap.error('--trust-only requires --ca-bundle with your approved CSE PEM source')
+    if args.trust_only: return maintain_native_trust(base,args)
     config_cmd=[base/'bin/python','-I','-B','-c',LIBMAMBA_CLI,'config','--show','--json'] if approved else [conda,'config','--show','--json']
-    config = {} if args.trust_only else json.loads(capture(config_cmd,env))
+    config = json.loads(capture(config_cmd,env))
     channel_names,channel_urls,channel_args = requested_channels(args.channel,{k:v for k,v in config.items() if k!='pinned_packages'})
     source = choose_source(args,config,base)
     bundle_text, removed = filtered_bundle([source] + args.extra_ca)
     skipped_paths = []
-    if args.trust_only or (not args.all_envs and not args.only): prefixes=[base]
+    if not args.all_envs and not args.only: prefixes=[base]
     elif args.only: prefixes=list(dict.fromkeys(p.expanduser().resolve() for p in args.only))
     else: prefixes=discover(base,conda,env,args.include,args.scan_root,args.exclude,skipped_paths)
     exclusions=[p.expanduser().resolve() for p in args.exclude]
@@ -2488,7 +2624,7 @@ def main():
     say('Solver: installed libmamba only; external plugin discovery disabled; base Conda and packages update together.')
     say('Fallback/explicit package channels: '+', '.join(channel_names)+'; Anaconda defaults excluded; external plugins disabled; no PyPI fallback')
     say('Resolved channel URLs: '+', '.join(channel_urls))
-    say('Scope: '+('CSE trust files only' if args.trust_only else ', '.join(str(p)+(' [BASE]' if p==base else '') for p in prefixes)))
+    say('Scope: '+', '.join(str(p)+(' [BASE]' if p==base else '') for p in prefixes))
     say('Base: '+str(base)); say('Source CA: '+str(source));say('Private logs: '+str(logdir))
     say('Current UID/groups: %s / %s' % (os.geteuid(),','.join(map(str,sorted(groups())))))
     say('Shared permissions target: cse (GID %d); directories 2775, files 0664, executables 0775' % cse_gid)
@@ -2592,14 +2728,6 @@ def main():
     if approved:say('Promotion uses a private CA copy for planning/downloads; shared trust is configured only after the reviewed packages verify.')
     else:say('Certificate preparation reads the source into one shared CSE copy. Only selected prefixes receive package/configuration updates; their package-owned PEMs may be replaced by conda.')
     if certificate_status['sha256']: say('CSE bundle SHA256: '+certificate_status['sha256'])
-    if args.trust_only:
-        say('No package updates or environment permission normalization attempted.')
-        say('Existing CA packages/embedded bundles remain separate update work.')
-        if args.apply: say('For the current shell after loading your module: . '+shlex.quote(str(trustdir/'use-ca.sh')))
-        say('Certificate stage report: '+str(logdir/'certificate-status.json'))
-        log.close()
-        if lockfile: lockfile.close()
-        return 0
     for i,prefix in enumerate(prefixes):
         row = {'prefix':str(prefix),'status':'incomplete','issues':[],'skipped_paths':[],'changes_started':False,'ownership':path_owner(prefix)};results.append(row)
         if preflight:row['permission_preflight']={key:preflight['summary'][key] for key in ('report_directory','affected_path_count','repair_target_count','inspection_gap_count')}

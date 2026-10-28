@@ -908,4 +908,94 @@ class BaseTransactionTests(unittest.TestCase):
   with patch.object(m.sys,'argv',['script','--scan-root','/site']),patch('sys.stderr',io.StringIO()):
    with self.assertRaises(SystemExit):m.main()
 
+class NativeTrustTests(unittest.TestCase):
+ def setUp(self):
+  import ssl, hashlib
+  self.directory=tempfile.TemporaryDirectory();self.addCleanup(self.directory.cleanup)
+  self.root=pathlib.Path(self.directory.name).resolve();self.base=self.root/'mf'
+  (self.base/'bin').mkdir(parents=True);(self.base/'bin/conda').touch()
+  (self.base/'ssl').mkdir();self.bundle=self.base/'ssl/cacert.pem'
+  certs=ssl.create_default_context().get_ca_certs(binary_form=True)[:2]
+  self.original=''.join(ssl.DER_cert_to_PEM_cert(c) for c in certs)
+  self.blocked=hashlib.sha256(certs[0]).hexdigest().upper()
+  self.bundle.write_text(self.original);self.bundle.chmod(0o640)
+  (self.base/'ssl/cert.pem').symlink_to('cacert.pem')
+ def run_trust(self,apply=True,extra=()):
+  logdir=self.root/('logs-'+str(len(list(self.root.glob('logs-*')))))
+  argv=['script',str(self.base),'--trust-only','--log-dir',str(logdir)]+(['--apply'] if apply else [])+list(extra)
+  with patch.object(m.sys,'argv',argv),patch.object(m,'maintenance_gid',return_value=m.os.getegid()),patch.dict(m.ROOTS,{self.blocked:'incident root'},clear=True),patch.object(m.subprocess,'run',side_effect=AssertionError('No Conda or Python subprocess expected')),patch('sys.stdout',io.StringIO()) as out:
+   result=m.main()
+  return result,json.loads((logdir/'certificate-status.json').read_text()),out.getvalue()
+ def test_filters_native_files_preserves_symlink_and_permissions(self):
+  result,status,output=self.run_trust()
+  self.assertEqual(result,0);self.assertEqual(status['status'],'written')
+  self.assertNotIn(self.blocked,dict(m.pem_entries(self.bundle.read_text())))
+  self.assertEqual(len(m.pem_entries(self.bundle.read_text())),1)
+  self.assertTrue((self.base/'ssl/cert.pem').is_symlink())
+  self.assertEqual(self.bundle.stat().st_mode & 0o777,0o640)
+  self.assertFalse((self.base/'etc/cse-trust').exists())
+  self.assertFalse((self.base/'.condarc').exists());self.assertNotIn('source ',output)
+ def test_repeat_is_unchanged_without_rewriting_native_bundle(self):
+  self.run_trust();before=self.bundle.stat()
+  result,status,output=self.run_trust()
+  self.assertEqual(result,0);self.assertEqual(status['status'],'unchanged')
+  self.assertEqual(self.bundle.stat().st_ino,before.st_ino)
+  self.assertEqual(self.bundle.stat().st_mtime_ns,before.st_mtime_ns)
+ def test_preview_writes_no_installation_files(self):
+  before=set(self.base.rglob('*'));self.run_trust(apply=False)
+  self.assertEqual(self.bundle.read_text(),self.original);self.assertEqual(set(self.base.rglob('*')),before)
+ def test_external_symlink_is_refused_without_touching_admin_file(self):
+  admin=self.root/'admin.pem';admin.write_text(self.original)
+  self.bundle.unlink();self.bundle.symlink_to(admin)
+  with self.assertRaisesRegex(RuntimeError,'outside.*prefix'):self.run_trust()
+  self.assertEqual(admin.read_text(),self.original)
+ def test_native_and_certifi_copies_are_filtered_independently(self):
+  certifi=self.base/'lib/python3.12/site-packages/certifi/cacert.pem'
+  certifi.parent.mkdir(parents=True);certifi.write_text(self.original)
+  self.run_trust()
+  self.assertEqual(len(m.pem_entries(certifi.read_text())),1)
+  self.assertEqual(len(m.pem_entries(self.bundle.read_text())),1)
+ def test_hardlinked_cache_is_not_changed(self):
+  cache=self.root/'cached.pem';m.os.link(str(self.bundle),str(cache))
+  self.run_trust();self.assertEqual(cache.read_text(),self.original)
+  self.assertNotEqual(cache.stat().st_ino,self.bundle.stat().st_ino)
+ def test_migrates_only_previous_script_trust_overrides(self):
+  legacy=str(self.base/'etc/cse-trust/ca-bundle.pem')
+  condarc=self.base/'.condarc';condarc.write_text('channels:\n  - conda-forge\nssl_verify: '+legacy+'\n')
+  state=self.base/'conda-meta/state';state.parent.mkdir()
+  state.write_text(json.dumps({'env_vars':{'REQUESTS_CA_BUNDLE':legacy,'SSL_CERT_DIR':str(self.base/'etc/cse-trust/empty-ca-dir'),'KEEP':'value','PIP_CERT':'/other/site.pem'}}))
+  result,status,output=self.run_trust()
+  self.assertIn('ssl_verify: '+json.dumps(str(self.bundle)),condarc.read_text())
+  variables=json.loads(state.read_text())['env_vars']
+  self.assertEqual(variables['REQUESTS_CA_BUNDLE'],str(self.bundle))
+  self.assertNotIn('SSL_CERT_DIR',variables);self.assertEqual(variables['KEEP'],'value')
+  self.assertEqual(variables['PIP_CERT'],'/other/site.pem')
+ def test_explicit_source_cannot_redirect_writes_outside_prefix(self):
+  source=self.root/'site.pem';source.write_text(self.original)
+  self.run_trust(extra=['--ca-bundle',str(source)])
+  self.assertEqual(source.read_text(),self.original)
+  self.assertEqual(len(m.pem_entries(self.bundle.read_text())),1)
+ def test_malformed_second_bundle_stops_before_any_pem_write(self):
+  certifi=self.base/'lib/python3.12/site-packages/certifi/cacert.pem'
+  certifi.parent.mkdir(parents=True);certifi.write_text('invalid PEM')
+  with self.assertRaisesRegex(RuntimeError,'plain CERTIFICATE'):self.run_trust()
+  self.assertEqual(self.bundle.read_text(),self.original)
+ def test_inspect_uses_native_files_when_separate_copy_is_absent(self):
+  self.run_trust()
+  with patch.dict(m.ROOTS,{self.blocked:'incident root'},clear=True),patch('sys.stdout',io.StringIO()) as out:
+   self.assertEqual(m.inspect_trust(self.base),0)
+  self.assertIn('Native Miniforge bundle screening: PRESENT',out.getvalue())
+ def test_loaded_module_discovers_base_without_config_or_install(self):
+  argv=['script','--trust-only','--apply','--log-dir',str(self.root/'module-logs')]
+  def discovery(cmd,**kwargs):
+   self.assertEqual(list(map(str,cmd)),[str(self.base/'bin/conda'),'info','--base'])
+   return subprocess.CompletedProcess(cmd,0,str(self.base)+'\n','')
+  with patch.object(m.sys,'argv',argv),patch.dict(m.os.environ,{'CONDA_EXE':str(self.base/'bin/conda')}),patch.object(m,'maintenance_gid',return_value=m.os.getegid()),patch.dict(m.ROOTS,{self.blocked:'incident root'},clear=True),patch.object(m.subprocess,'run',side_effect=discovery) as run,patch('sys.stdout',io.StringIO()):
+   self.assertEqual(m.main(),0)
+  self.assertEqual(run.call_count,1)
+ def test_unrelated_custom_trust_configuration_is_preserved(self):
+  condarc=self.base/'.condarc';before='ssl_verify: /admin/site.pem\nchannels: [conda-forge]\n'
+  condarc.write_text(before);self.run_trust()
+  self.assertEqual(condarc.read_text(),before)
+
 if __name__=='__main__':unittest.main()

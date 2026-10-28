@@ -1,9 +1,62 @@
 # CSE Miniforge trust maintenance
 
 The maintenance script is [scripts/patch_miniforge_trust.py](../scripts/patch_miniforge_trust.py).
-It updates selected shared conda environments and builds a CSE-managed, incident-filtered
-CA bundle from your existing site PEM. It leaves the OS and the inspection proxy unchanged.
+It offers local maintenance of existing Miniforge PEM files and a separate workflow
+for updating shared Conda packages with a managed site CA bundle. It leaves the OS and the inspection proxy unchanged.
 No external incident test endpoint is contacted.
+
+## Packages already installed: update the existing PEM files only
+
+Revision 27 (2026-10-28) makes `--trust-only` maintain Miniforge's existing
+certificate files in place. Load your usual Miniforge module and preview:
+
+```bash
+python3 patch_miniforge_trust.py --trust-only
+```
+
+Then apply that local certificate work:
+
+```bash
+python3 patch_miniforge_trust.py --trust-only --apply
+```
+
+No system name, base path, source PEM path, or `use-ca.sh` step is needed. The
+base is discovered from the loaded module's `CONDA_EXE` or `conda` on `PATH`.
+That discovery may run `conda info --base`; no package solve, install, download,
+or environment-permission normalization is performed.
+
+This mode filters existing `ssl/cacert.pem`, `ssl/cert.pem`, certifi, and pip's
+vendored certifi PEM files found inside the base prefix. Each existing bundle
+keeps its other roots, including organizational CAs. It removes only the four
+incident-root fingerprints already used by this script. Symlink aliases within
+the prefix remain links; external targets (including admin trust files) are
+refused. Replacing a hardlinked file does not change the package-cache copy.
+File ownership and permissions are retained. Already clean files are reported
+as `Already clean` and are not rewritten, so repeat runs are quick local checks.
+Private logs contain before-file backups and certificate hashes.
+
+No new trust location, module configuration, activation variables, or shell
+snippet is created. Clients already using these native bundles use the changed
+files on their next read. This does not redirect clients that have independently
+configured another trust store, and it does not update other environments.
+`--ca-bundle` and `--extra-ca`, if explicitly supplied in this mode, add approved
+certificates to each existing bundle while leaving their source files unchanged.
+Package updates may replace the PEM files; repeat this check afterward.
+
+If an earlier full run configured base `.condarc` or `conda-meta/state` to select
+`BASE/etc/cse-trust/ca-bundle.pem`, this mode redirects only those exact old
+script paths to the native PEM. It also removes that script's empty-directory
+`SSL_CERT_DIR` override from the saved activation state. Other configuration is
+preserved and changed files are backed up. Old CSE files are left in place for
+reference. The process cannot undo exports in an already running parent shell;
+it reports old CSE-path exports if present. Clear those old exports or use a
+fresh shell, and reactivate an already active environment after changing its
+saved activation settings. No new `use-ca.sh` step is required.
+
+`--inspect-trust` now checks the actual native bundles independently of old run
+logs or the previous separate CSE copy. It is read-only and does not connect to
+external test sites. As before, fingerprint screening alone does not establish
+full certificate-chain rejection or proxy remediation.
 
 ## Build a private candidate and compare before changing base
 
@@ -259,8 +312,9 @@ with the installation because the original Spack DAG hash does not describe thos
 updated package contents.
 
 Preview remains local-only and does not load a solver, contact channels or install
-packages. `--trust-only` still prepares only the managed trust files. Successful
-prefixes print the shell snippet to source after loading the module.
+packages. Revision 27 `--trust-only` maintains the existing base PEM files in place
+as described above. Successful full package updates still print their separate
+shell snippet; it is not part of native PEM maintenance.
 
 Private logs include `base-package-intent.json` (retained requests, dependencies,
 pins and known replacements), `base-conda-search.json`, `NNN-plan.json`, command output and
@@ -477,7 +531,8 @@ python3 patch_miniforge_trust.py /actual/path/to/miniforge --inspect-trust
 This is read-only and uses no external TLS connections. With an explicit installation
 path, it does not execute conda or the environment's Python. It reports:
 
-- Whether the actual managed `etc/cse-trust/ca-bundle.pem` exists and parses.
+- Whether the native Miniforge PEM files parse and lack the four incident roots.
+- Any previous `etc/cse-trust/ca-bundle.pem` copy, for comparison.
 - Its SHA256 and presence/absence of the four known incident-root fingerprints.
 - Base CA package versions relative to this script's minimums.
 - Base `ssl/cert.pem`, `ssl/cacert.pem`, and discoverable Python certifi/pip bundles.
@@ -489,39 +544,13 @@ screening, not full chain verification. The command returns 0 if the managed bun
 parseable with those four roots absent; otherwise 2. That return code does not certify
 other bundles, application activation, organizational CA completeness, or the proxy.
 
-### Prepare the CSE bundle independently of package updates
+### Certificate-only maintenance uses the existing files
 
-If the managed copy is absent or needs rebuilding, explicitly select your approved
-existing CSE PEM source. Start with a preview:
-
-```bash
-python3 patch_miniforge_trust.py /actual/path/to/miniforge \
-  --trust-only --ca-bundle /actual/path/to/CSE-existing-bundle.pem
-```
-
-Then apply that stage alone:
-
-```bash
-python3 patch_miniforge_trust.py /actual/path/to/miniforge \
-  --trust-only --ca-bundle /actual/path/to/CSE-existing-bundle.pem --apply
-```
-
-This writes the filtered CSE copy, the managed marker/lock, the dedicated empty CA
-lookup directory and `use-ca.sh`. It does not invoke conda, install packages, configure
-individual environments, or recursively normalize environment permissions. Your account
-still needs maintenance access to the installation and membership in `cse`. The source
-PEM is retained; organizational roots are kept except any exact incident-root match.
-It remains interim broad-root filtering, not a fresh public CA collection.
-
-`certificate-status.json` records `planned` or `written`, the source, destination and
-written bundle SHA256. Normal apply also saves this status before package work, and
-prints the certificate stage separately at the end. A startup failure before that
-record is written requires checking the actual files with `--inspect-trust`.
-
-The new bundle takes effect for the current shell only when you source the printed
-`use-ca.sh` after loading your module, or implement the equivalent module settings.
-An application may still use its own trust configuration. This stage does not replace
-outdated CA packages, pip's embedded bundles, system trust, or proxy upstream policy.
+Use `python3 patch_miniforge_trust.py --trust-only --apply` as described at the top.
+Before revision 27 this flag wrote a separate CSE copy and required an explicit
+source PEM. The native-file workflow replaces that behavior. The full package
+and promotion workflows retain their existing separate-copy trust behavior;
+do not rerun those workflows just to maintain already installed PEM files.
 
 ## Startup error: expected a URL, got auth/location/name fields
 
@@ -1092,7 +1121,10 @@ parent owner/admin review traversal or move the environment into an approved sha
 software location. All selected eligible environments, including ones in your home,
 use the same `cse` group target; the user owner UID stays unchanged.
 
-## Certificate behavior and activation
+## Full package-update certificate behavior and activation
+
+This section applies to package updates and promotion. For revision 27
+`--trust-only`, use the native PEM instructions at the top.
 
 Certificate preparation reads the source PEM and writes a separate managed copy:
 
@@ -1108,8 +1140,8 @@ be replaced by its package update; external site/OS source files are only read.
 With the default scope, those package/configuration changes
 are confined to base. No bundle is copied over every discovered PEM path.
 Environments already configured to use the shared managed bundle see its new contents
-too, even when their own files are outside this run's scope. Use `--trust-only` for
-managed-bundle preparation without package/configuration/permission updates.
+too, even when their own files are outside this run's scope. Revision 27
+`--trust-only` instead maintains only the loaded base's existing native PEM files.
 
 The new bundle preserves certificates other than four exact incident-root fingerprints.
 This is interim root-removal mitigation, not a complete refresh of your custom public
