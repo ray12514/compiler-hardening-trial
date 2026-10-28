@@ -8,7 +8,8 @@ No external incident test endpoint is contacted.
 ## Build a private candidate and compare before changing base
 
 Revision 24 introduced a separate staging workflow for reviewing a complete base rebuild;
-revision 25 adds promotion of the reviewed set to that installation.
+revision 25 added promotion of the reviewed set to that installation. Revision 26
+collects all detectable permission blockers and reports them by repair-path owner.
 It uses the existing Miniforge's solver to create a **fresh environment in a new
 private directory**. It does not update, clone, configure or normalize permissions
 in the source base, use its package cache, change module/Spack selection, or promote
@@ -19,7 +20,7 @@ does not require maintenance write access or membership in `cse`.
 Load the usual module, refresh the standalone script from `main`, and run:
 
 ```bash
-python3 patch_miniforge_trust.py --version  # revision 25
+python3 patch_miniforge_trust.py --version  # revision 26
 python3 patch_miniforge_trust.py --stage "$HOME/cse-base-review-1"
 python3 patch_miniforge_trust.py --report "$HOME/cse-base-review-1"
 ```
@@ -109,12 +110,12 @@ builds, changed versions, dependencies not selected by the new graph, and unchan
 packages. `not-selected` is not a failed installation count. Review the recorded
 security checks and actual package versions as well as those counts.
 
-After accepting that result, refresh to revision 25 and load the same site
+After accepting that result, refresh to revision 26 and load the same site
 environment and Miniforge used for staging. First validate the reviewed update
 against the current base, then apply it:
 
 ```bash
-python3 patch_miniforge_trust.py --version  # revision 25
+python3 patch_miniforge_trust.py --version  # revision 26
 python3 patch_miniforge_trust.py --promote "$HOME/cse-base-review-1"
 python3 patch_miniforge_trust.py --promote "$HOME/cse-base-review-1" --apply
 ```
@@ -139,9 +140,12 @@ trust is configured after the package verification; the source PEM is not rewrit
 by this trust configuration. Normal package-owned PEM updates remain package work.
 
 Promotion does not defer an older, conflicting package in place of an accepted new
-one. Access blockers on packages that must change are reported **before any base
-changes**. For the foreign-owned `bin/__pycache__` case, the owner/admin must repair
-the particular directory's write/traverse access if it is still blocked. Membership
+one. Every promotion first collects known permission problems across installed and
+candidate package paths. Access blockers on packages that must change are reported
+**before any base changes**, with private reports grouped by repair-path owner (see
+the permission preflight below). For the foreign-owned `bin/__pycache__` case, the
+owner/admin should review that directory's write/traverse access or the reported
+cache-preservation option. Membership
 in `cse` alone cannot chmod another owner's paths. After an access-only repair,
 unchanged package/control fingerprints permit retrying the accepted promotion.
 An unexpected failure during installation is still incomplete; native rollback and
@@ -185,7 +189,7 @@ it uses the reviewed Conda package set and each site's existing surrounding setu
 
 ## Update Conda and base packages in the existing installation
 
-Revision 25 keeps the installed Miniforge distribution, prefix, module selection
+Revision 26 keeps the installed Miniforge distribution, prefix, module selection
 and Spack version pin. Miniforge `24.11.2-1` does not itself require a reinstall
 for an in-place Conda/base package update. No installer is downloaded or rerun.
 The default scope is **the loaded base only**. Other environments require an
@@ -198,7 +202,7 @@ python3 patch_miniforge_trust.py --base-only
 python3 patch_miniforge_trust.py --base-only --apply
 ```
 
-`python3 patch_miniforge_trust.py --version` should print revision 25. Each run
+`python3 patch_miniforge_trust.py --version` should print revision 26. Each run
 also records its revision so an older copied script can be identified directly.
 
 Use `--ca-bundle /path/to/CSE-existing-bundle.pem` when a particular existing site
@@ -421,7 +425,7 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
 
 The script was updated at commit `3cfb223ceb8ca59a128523627df0d187a75bc9a0`.
 That historical revision uses classic solving rather than the current single
-libmamba base transaction. Use the current `main` retrieval for revision 25.
+libmamba base transaction. Use the current `main` retrieval for revision 26.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
@@ -752,6 +756,86 @@ a missing path cannot be reconstructed reliably. Snapshots are evidence at their
 capture time, not permission repairs. The script does not fix
 this by recursively widening unrelated directories or changing another user's owner UID.
 
+### Collect permission problems before contacting owners
+
+An installation can have several independent permission problems. Through revision
+25, the package preflight continued across packages but retained only the first
+blocked path per package. A native Conda transaction can also stop when it first
+encounters an access failure. Fixing that one path did not establish that the rest
+of the installation was accessible.
+
+Revision 26 checks every known installed manifest path and source-associated Python
+cache path, collects multiple blockers within the same package, and continues with
+other readable package manifests. It also checks base control paths such as history,
+configuration, bootstrap executables and the maintenance trust directory. Run this
+as the maintenance account, not root, so the effective-access checks reflect the
+account that will perform the update:
+
+```bash
+python3 patch_miniforge_trust.py --check-permissions
+# Include paths from your reviewed candidate without installing it:
+python3 patch_miniforge_trust.py --check-permissions \
+  --promote "$HOME/cse-base-review-1"
+```
+
+Put `/actual/path/to/miniforge` before the flags when selecting an explicit base.
+Do not add `--apply`. This command does not solve dependencies, change the base,
+change permissions or require `cse` membership. With an explicit base path it does
+not execute Conda at all; automatic discovery uses `conda info --base`. It creates private reports
+outside Conda environments. Use `--log-dir /new/private/report-directory` to choose
+a new destination; otherwise it prints a fresh `~/.cse-trust-logs/permissions-*`
+directory. Exit status `2` means problems or inspection gaps were found; `0` means
+no blockers were detected within the reported coverage.
+
+Every `--promote` command runs this preflight automatically, including the apply
+command. A blocker required for that promotion stops it before source changes.
+Potential issues on unchanged packages are still listed; the native plan guard
+also checks whether a package actually needs to be unlinked or relinked.
+
+The printed report directory contains:
+
+| File | Contents |
+| --- | --- |
+| `permissions.txt` | All repair targets, owners, groups, modes, effective access, ACL presence, reasons and affected paths |
+| `permissions.csv` / `permissions.json` | Every affected known path, its package and repair target; the CSV distinguishes repair-target UID from leaf-file UID |
+| `permissions-by-owner.json` | Repair targets grouped by their owner's account |
+| `permissions-owner-UID.txt` | A separate text report to review and forward to that owner/admin yourself |
+
+The script sends no messages or invitations. It names the directory whose access
+blocks replacement, which can have a different owner from the leaf file. A
+read-only package file in a writable, traversable parent is not automatically a
+replacement blocker; control files that must be opened for writing are checked
+for that operation separately. Candidate paths that do not yet exist are marked
+`exists=false`; an inaccessible path has unknown existence rather than being
+reported as absent.
+
+Unreadable/malformed manifests and untraversable or redirected directories are
+reported as inspection gaps while accessible siblings continue. Hidden contents,
+untracked files, immutable flags, server policy and later filesystem changes cannot
+be fully proved by a read-only check. The reports explicitly identify that limited
+coverage instead of claiming that one successful scan guarantees a transaction.
+
+For a blocked `__pycache__`, the report may identify a reviewable workaround when
+its parent is writable and traversable and sticky rules permit a rename: preserve
+the old cache directory by renaming it and create a fresh shared cache **only after
+confirming its contents are disposable generated caches**. Opaque contents require
+owner/admin review first; filesystem policy can still restrict the rename. The
+script does not move, delete or chmod the cache automatically. Otherwise have the
+reported owner/admin repair the specific directory or ACL under site policy.
+
+After repairs, rerun the check with a fresh log directory. This tests whether the
+repair cleared the problem and finds any newly accessible paths. Read a saved
+result without rescanning or attempting an update:
+
+```bash
+python3 patch_miniforge_trust.py --report /path/to/permissions-report-root
+```
+
+`--report latest` selects the most recently written summary, whether it is a normal
+maintenance report or a permission preflight. Ordinary `--base-only --apply` still
+uses the package-deferral behavior below; permission normalization skips after an
+update remain distinct from install-time blockers.
+
 ### Permission denied on `bin/__pycache__/android_deploy.cpython-*.pyc`
 
 A `.pyc` file is generated Python bytecode; `android_deploy` is an application tool,
@@ -827,7 +911,7 @@ transaction failure remains a failure and is not retried around a partial update
 Use the normal command after refreshing the script from `main`:
 
 ```bash
-python3 patch_miniforge_trust.py --version  # revision 23
+python3 patch_miniforge_trust.py --version  # revision 26
 python3 patch_miniforge_trust.py --base-only --apply
 ```
 
@@ -1082,8 +1166,14 @@ verification, one-transaction base updates, stale-plan/installed-version guards,
 offline package policy, preservation of original before/after inventories, and
 simulated preview/offline apply. Tests also cover newest-version selection when
 the minimum is already installed, downgrade guards, stale metadata, and default
-base-only scope with unchanged sibling PEM/configuration files. Actual SUSE/RHEL deployment remains
-a target-system validation task.
+base-only scope with unchanged sibling PEM/configuration files. Permission-preflight
+tests exercise multiple blocked paths in one package, later packages, unreadable and
+malformed inventories, opaque trees, candidate-only paths, repair-owner grouping,
+sticky restrictions, control files, and stopping promotion before source changes.
+A rootless CLI fixture detects three blockers together, then two after repairing
+only the first, then none after all repairs; source bytes, modes, inodes and mtimes
+stay unchanged during each check. Actual SUSE/RHEL deployment remains a
+target-system validation task.
 
 To include the installed solver/allowlist and legacy-classic regressions:
 
