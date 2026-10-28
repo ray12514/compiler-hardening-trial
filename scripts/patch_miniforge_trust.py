@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 21 (2026-10-27).
+"""CSE Miniforge certificate maintenance, revision 22 (2026-10-28).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -168,7 +168,7 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 21
+SCRIPT_REVISION = 22
 BASE_REPLACEMENTS = {'boost':('libboost-python-devel',),'boost-cpp':('libboost-devel',)}
 ROOTS = {
  '7DD78D5F4F13459A83DFF9ABBBA62EDBAF6F2D102BF257FD712F4D9F2746ED8D': 'emSign Root TLS CA - G3',
@@ -1091,6 +1091,8 @@ def failure_category(text):
     if 'non-conda' in value or 'conda-forge migration' in value:
         return 'Mixed package ownership', 'Review the named pip/uv-managed tool and its requirements; do not overwrite it with conda in bulk.'
     if any(x in value for x in ('permission denied','permissionerror','not writable','notwritableerror','read-only file system')):
+        if '__pycache__' in value or '.pyc' in value:
+            return 'Filesystem access', 'The denied path is generated Python bytecode. Conda may need to rename/remove it during package replacement, even if the application is unused. Check the containing directory write/traverse access, sticky bit and ACLs; group membership does not grant chmod on another owner\'s file. Have the owner/admin repair the specific blocker. Deleting one cache file does not repair a non-writable directory. Permission-normalization skips alone are nonfatal.'
         return 'Filesystem access', 'Check the exact denied path, its parent traversal, ACLs, mount policy and cache location; environment ownership alone is insufficient.'
     if any(x in value for x in ('fileexistserror','clobbererror','file exists','directory-to-symlink','xkb migration')):
         return 'Package file collision', 'Check the named filesystem path and any saved XKB migration manifest. A longer dependency solve will not repair an existing-path collision. Existing package-owned XKB directories are preserved before the known symlink migration; custom/other-package contents require review.'
@@ -1334,17 +1336,25 @@ def diagnose_existing(directory, base, offline=False, timeout_seconds=600):
 def access_snapshot(path):
     """Read current access metadata; never chmod to make a check pass."""
     p = Path(os.path.abspath(os.path.expanduser(str(path))))
-    result = dict(path=str(p),captured_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),**path_owner(p))
-    try:
-        st = p.lstat()
-        result.update(mode=stat.filemode(st.st_mode),octal='%04o'%stat.S_IMODE(st.st_mode),
-                      symlink_target=str(p.resolve()) if stat.S_ISLNK(st.st_mode) else None)
-        result['access'] = {name:os.access(str(p),flag) for name,flag in
-                            (('read',os.R_OK),('write',os.W_OK),('execute_or_traverse',os.X_OK))}
+    def describe(candidate):
+        entry = dict(path=str(candidate),**path_owner(candidate))
         try:
-            result['extended_acl'] = 'system.posix_acl_access' in os.listxattr(str(p)) if hasattr(os,'listxattr') else 'unknown'
-        except OSError as exc: result['extended_acl'] = 'unreadable: '+str(exc)
-    except OSError as exc: result['stat_error'] = str(exc)
+            st = candidate.lstat()
+            entry.update(mode=stat.filemode(st.st_mode),octal='%04o'%stat.S_IMODE(st.st_mode),
+                         symlink_target=str(candidate.resolve()) if stat.S_ISLNK(st.st_mode) else None,
+                         sticky=bool(st.st_mode & stat.S_ISVTX))
+            entry['access'] = {name:os.access(str(candidate),flag) for name,flag in
+                              (('read',os.R_OK),('write',os.W_OK),('execute_or_traverse',os.X_OK))}
+            try:
+                entry['extended_acl'] = 'system.posix_acl_access' in os.listxattr(str(candidate)) if hasattr(os,'listxattr') else 'unknown'
+            except OSError as exc: entry['extended_acl'] = 'unreadable: '+str(exc)
+        except OSError as exc: entry['stat_error'] = str(exc)
+        return entry
+    result = describe(p)
+    result['captured_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    # Renaming/removing a directory entry requires access to its parent, even
+    # when the file itself is writable. File ownership/mode alone is insufficient.
+    result['parent_directory'] = describe(p.parent)
     result['blocked_parents'] = []
     for parent in p.parents:
         if not os.access(str(parent),os.X_OK):
@@ -1354,7 +1364,8 @@ def access_snapshot(path):
 
 def denied_paths(text):
     found = []
-    patterns = (r"[Pp]ermission denied:?\s*['\"]([^'\"]+)['\"]",
+    patterns = (r"[Pp]ermission denied['\"]\s*,\s*['\"](/[^'\"]+)['\"]",
+                r"[Pp]ermission denied:?\s*['\"]([^'\"]+)['\"]",
                 r"[Pp]ermission denied:?\s*(/[^\n|]+)",
                 r"(?:path|filename)\s*[:=]\s*['\"](/[^'\"]+)['\"]",
                 r"(?:path|filename)\s*:\s*(/[^\n|]+)")
@@ -1369,6 +1380,12 @@ def print_access(snapshot, say):
     say('  Path access snapshot: %s | owner=%s group=%s mode=%s | %s | ACL=%s' % (
         snapshot['path'],snapshot['owner'],snapshot['group'],snapshot.get('mode','unknown'),
         snapshot.get('access',snapshot.get('stat_error','unknown')),snapshot.get('extended_acl','unknown')))
+    parent = snapshot.get('parent_directory')
+    if parent:
+        say('    Containing directory: %s | owner=%s group=%s mode=%s | %s | ACL=%s | sticky=%s' % (
+            parent['path'],parent['owner'],parent['group'],parent.get('mode','unknown'),
+            parent.get('access',parent.get('stat_error','unknown')),parent.get('extended_acl','unknown'),parent.get('sticky','unknown')))
+        say('    Rename/remove needs directory write and traversal access; sticky bits, ACLs and filesystem policy may also restrict it.')
     for parent in snapshot['blocked_parents']:
         say('    Parent not traversable by current account: %s | owner=%s group=%s' % (parent['path'],parent['owner'],parent['group']))
 
@@ -1705,9 +1722,10 @@ def main():
         diagnostic = reason or diagnostic_text(stdout,stderr)
         event = {'command':display[:500],'detail':diagnostic,'returncode':code,'file':filename,
                  'phase':row.get('phase','not recorded')}
-        event['access_details']=[access_snapshot(p) for p in denied_paths(diagnostic)]
+        event['access_details']=[access_snapshot(p) for p in denied_paths(stdout+'\n'+stderr+'\n'+diagnostic)]
         (logdir/filename).write_text(json.dumps(dict(event,argv=list(map(str,cmd)),stdout=stdout,stderr=stderr),indent=2))
         row.setdefault('command_failures',[]).append(event)
+        for snapshot in event['access_details']:print_access(snapshot,say)
         return RuntimeError('Command failed during %s (exit %s): %s | %s | full output: %s' %
                             (event['phase'],code,display[:180],diagnostic,logdir/filename))
     def run(cmd, allow_failure=False):
