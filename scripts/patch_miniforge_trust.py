@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 24 (2026-10-28).
+"""CSE Miniforge certificate maintenance, revision 25 (2026-10-28).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -7,6 +7,8 @@ Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --apply               # apply, approved channels
   python3 patch_miniforge_trust.py --stage ~/cse-candidate # build privately; review before changing base
   python3 patch_miniforge_trust.py --stage ~/cse-retry --stage-skip PACKAGE
+  python3 patch_miniforge_trust.py --promote ~/cse-candidate        # dry-run reviewed set
+  python3 patch_miniforge_trust.py --promote ~/cse-candidate --apply
   python3 patch_miniforge_trust.py --apply --offline     # approved cached packages
   python3 patch_miniforge_trust.py --apply --upgrade-conda
   python3 patch_miniforge_trust.py --report latest        # explain saved logs only
@@ -18,7 +20,10 @@ Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --trust-only --ca-bundle /path/to/site.pem --apply
 
 No test-site connections, connectivity probes, remote execution or OS writes.
-Preview is local-only: inventory, CA inspection, ownership and permissions.
+Default preview is local-only: inventory, CA inspection, ownership and permissions.
+--promote previews are dependency dry runs of a reviewed set; --apply installs it
+at its original base prefix after freshness/access checks. Stage each system
+separately after loading that site's environment and Miniforge.
 Apply reuses non-default channels recorded in each environment's installed conda
 packages. Non-base requests preserve per-package sources; base uses channel priority. conda-forge remains a
 fallback; --channel adds an explicit community channel/mirror when metadata is absent. Anaconda defaults/repo.anaconda.com sources are excluded.
@@ -186,7 +191,7 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 24
+SCRIPT_REVISION = 25
 BASE_REPLACEMENTS = {'boost':('libboost-python-devel',),'boost-cpp':('libboost-devel',)}
 ROOTS = {
  '7DD78D5F4F13459A83DFF9ABBBA62EDBAF6F2D102BF257FD712F4D9F2746ED8D': 'emSign Root TLS CA - G3',
@@ -428,7 +433,7 @@ def records(prefix):
 
 def safe_environment():
     env = os.environ.copy()
-    for k in ('PYTHONPATH','PYTHONHOME','LD_PRELOAD','LD_LIBRARY_PATH','CSE_CONDA_PERMISSION_HOLDS',
+    for k in ('PYTHONPATH','PYTHONHOME','LD_PRELOAD','LD_LIBRARY_PATH','CSE_CONDA_PERMISSION_HOLDS','CSE_CONDA_APPROVED_PLAN',
               'OPENSSL_CONF','OPENSSL_MODULES','OPENSSL_ENGINES',
               'SSL_CERT_DIR','PIP_TRUSTED_HOST'):
         env.pop(k, None)
@@ -998,10 +1003,17 @@ def local_channel_str(self):
 match_spec_module.ChannelMatch.__str__=local_channel_str
 from conda_libmamba_solver.solver import LibMambaSolver
 import conda_libmamba_solver.solver as solver_module
+approved_path=os.environ.get('CSE_CONDA_APPROVED_PLAN')
+if approved_path:
+    with open(approved_path) as stream:approved=json.load(stream)
+else:approved={}
 def retired_names(state):
     replacements=__CSE_BASE_REPLACEMENTS__
-    return {old for old,new in replacements.items() if state.prune and old in state.installed and
-            old not in state.requested and all(n in state.requested for n in new)}
+    retired={old for old,new in replacements.items() if state.prune and old in state.installed and
+             old not in state.requested and all(n in state.requested for n in new)}
+    if state.prune and approved and os.path.realpath(str(state.prefix))==approved['prefix']:
+        retired.update(set(state.installed)-set(approved['packages']))
+    return retired
 # Conda 24.11's install CLI parses --prune but omits it from the solver call.
 # Honor the explicit flag through the public transaction API in this process.
 class RetainedBaseSolver(LibMambaSolver):
@@ -1019,6 +1031,24 @@ class RetainedBaseSolver(LibMambaSolver):
                 if touched:
                     from conda.exceptions import CondaError
                     raise CondaError('Transaction would replace permission-held packages: '+', '.join(sorted(touched))+'; no transaction attempted')
+            if approved and os.path.realpath(setup.target_prefix)==approved['prefix']:
+                from conda.core.prefix_data import PrefixData
+                from conda.exceptions import CondaError
+                installed={r.name:r for r in PrefixData(setup.target_prefix).iter_records()}
+                before={n:[r.version,r.build] for n,r in installed.items()}
+                if before!=approved['before']:
+                    raise CondaError('Base package inventory changed since promotion preflight; no transaction attempted')
+                for record in setup.unlink_precs:installed.pop(record.name,None)
+                installed.update({r.name:r for r in setup.link_precs})
+                differences=set(installed)^set(approved['packages'])
+                for name in set(installed)&set(approved['packages']):
+                    record=installed[name];expected=approved['packages'][name]
+                    if (record.version,record.build,record.subdir)!=(expected['version'],expected['build'],expected['subdir']):
+                        differences.add(name);continue
+                    common=[key for key in ('sha256','md5') if expected.get(key) and getattr(record,key,None)]
+                    if not common or any(expected[key]!=getattr(record,key) for key in common):differences.add(name)
+                if differences:
+                    raise CondaError('Solver result differs from reviewed package versions/builds/checksums: '+', '.join(sorted(differences))+'; no transaction attempted')
         return transaction
     # Explicitly retire the old names during the solve, so they cannot bias it
     # toward older replacement versions before post-solve dependency pruning.
@@ -1171,6 +1201,11 @@ def final_summary(results, apply, bundle, say):
         if row.get('package_policy'):say('  Package policy: '+row['package_policy'])
         if row.get('package_pin_policy'):say('  Package pins: '+row['package_pin_policy'])
         if row.get('ignored_pins'):say('  Ignored base pin specs: '+', '.join(row['ignored_pins']))
+        if row.get('promotion'):
+            p=row['promotion'];say('  Reviewed promotion: %s | %d packages | SHA256=%s | stage=%s'%(
+                p['status'],p['package_count'],p['manifest_sha256'],p['stage']))
+        if row.get('reviewed_security_versions'):
+            say('  Reviewed security versions (candidate): '+', '.join('%s=%s'%(n,v['version']) for n,v in sorted(row['reviewed_security_versions'].items())))
         for hold in row.get('permission_holds',[]):
             say('  Deferred package: %s=%s=%s | %s | %s'%(hold['name'],hold['version'],hold['build'],hold['path'],hold['reason']))
         if row.get('permission_python_constraint'):say('  Python constraint for deferred packages: '+row['permission_python_constraint'])
@@ -1211,7 +1246,9 @@ def final_summary(results, apply, bundle, say):
             for snapshot in event.get('access_details',[]): print_access(snapshot,say)
     say('Environment counts: '+', '.join('%s=%d'%(s,sum(r['status']==s for r in results)) for s in ('previewed','previewed-with-skips','updated','updated-with-skips','skipped','incomplete')))
     say('Counts are environments, not package versions. Deferred packages remain installed at their listed versions. Incomplete means a required package/check failed or needs review; reasons appear above.')
-    if not apply: say('Preview targets are requests, not solved upgrades. No dependency solve ran; exact versions/builds are validated during apply.')
+    if not apply:
+        if any(row.get('promotion') for row in results):say('Reviewed promotion performed a dependency dry run; no package/configuration/permission changes were applied to base.')
+        else:say('Preview targets are requests, not solved upgrades. No dependency solve ran; exact versions/builds are validated during apply.')
 
 
 def diagnostic_text(stdout, stderr):
@@ -1308,14 +1345,16 @@ def report_existing(directory, verbose=False):
     failures = []
     for row in results:
         counts[row['status']] = counts.get(row['status'],0)+1
-        if row['status'] not in ('incomplete','skipped') and not row.get('permission_holds') and not verbose: continue
+        if row['status'] not in ('incomplete','skipped') and not row.get('permission_holds') and not row.get('promotion') and not verbose: continue
         issues = row.get('issues',[])
         evidence = row.get('command_failures',[])
         if not evidence and any('Command failed; see private run.log' in issue for issue in issues):
             inferred = legacy_failure_details(logtext,row['prefix'])
             if inferred: evidence = [inferred]
         cause_text = '\n'.join(issues+[e['detail'] for e in evidence])
-        if row.get('permission_holds') and not issues:
+        if row.get('promotion') and not issues:
+            category,advice='Reviewed promotion', 'Saved promotion status: '+row['promotion']['status']+'. No new update or runtime check was performed by this report.'
+        elif row.get('permission_holds') and not issues:
             category='Deferred packages'
             advice=('The validated update completed with the listed packages held at their installed versions.'
                     if row['status'].startswith('updated') else 'Local preview found the listed access-blocked packages; no update was performed.')
@@ -1336,6 +1375,9 @@ def report_existing(directory, verbose=False):
             if 'Command failed; see private run.log' not in issue: print('  Reason: '+issue)
         if row.get('package_pin_policy'):print('  Package pins: '+row['package_pin_policy'])
         if row.get('ignored_pins'):print('  Ignored base pin specs: '+', '.join(row['ignored_pins']))
+        if row.get('promotion'):
+            p=row['promotion'];print('  Reviewed promotion: %s | %d packages | SHA256=%s | stage=%s'%(
+                p['status'],p['package_count'],p['manifest_sha256'],p['stage']))
         for hold in row.get('permission_holds',[]):
             print('  Deferred package: %s=%s=%s | %s | %s'%(hold['name'],hold['version'],hold['build'],hold['path'],hold['reason']))
         if row.get('permission_python_constraint'):print('  Python constraint for deferred packages: '+row['permission_python_constraint'])
@@ -1794,6 +1836,61 @@ def inspect_trust(base, prefixes=()):
     return 0 if good else 2
 
 
+def promotion_differences(actual, expected):
+    differences=set(actual)^set(expected)
+    for name in set(actual)&set(expected):
+        record=actual[name];target=expected[name]
+        if any(record.get(key)!=target.get(key) for key in ('version','build','subdir')):
+            differences.add(name);continue
+        common=[key for key in ('sha256','md5') if record.get(key) and target.get(key)]
+        if not common or any(record[key]!=target[key] for key in common):differences.add(name)
+    return sorted(differences)
+
+
+def load_promotion(directory, base):
+    root=directory.expanduser().resolve(strict=True)
+    if base==root or base in root.parents or root in base.parents:
+        raise RuntimeError('Reviewed stage must be outside the live base')
+    summary=json.loads((root/'stage-summary.json').read_text())
+    if summary.get('status')!='ready-for-review' or summary.get('source_metadata_unchanged') is not True or summary.get('source_ca_unchanged') is not True:
+        raise RuntimeError('Promotion requires a ready-for-review stage with unchanged source metadata and CA')
+    if Path(summary['source_base']).resolve()!=base:
+        raise RuntimeError('This stage belongs to '+summary['source_base']+', not '+str(base)+'. Load the correct site environment/Miniforge, or stage this system separately.')
+    if stage_source_state(base)!=summary['source_state_after']:
+        raise RuntimeError('Base package/control metadata changed since staging; stage and review this system again')
+    packages=json.loads((root/'candidate-packages.json').read_text())
+    if not packages or not {'conda','python','conda-libmamba-solver'}<=set(packages):raise RuntimeError('Reviewed candidate lacks its required Conda/Python/solver packages')
+    for name,record in packages.items():
+        if record.get('name')!=name or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*',name):raise RuntimeError('Invalid reviewed package name: '+str(name))
+        if any(not re.fullmatch(r'[A-Za-z0-9_.+!-]+',str(record.get(key,''))) for key in ('version','build')):raise RuntimeError('Invalid reviewed version/build: '+name)
+        hashes=[key for key,size in (('sha256',64),('md5',32)) if re.fullmatch(r'[0-9a-f]{%d}'%size,str(record.get(key,'')))]
+        if any(record.get(key) and not re.fullmatch(r'[0-9a-f]{%d}'%size,str(record[key])) for key,size in (('sha256',64),('md5',32))):
+            raise RuntimeError('Malformed reviewed package checksum: '+name)
+        if not hashes or not record.get('subdir'):raise RuntimeError('Reviewed package lacks platform/checksum metadata: '+name)
+        if not recorded_origin(record) or any(forbidden_channel(record.get(key,'')) for key in ('channel','url','base_url')):
+            raise RuntimeError('Reviewed package has an excluded or unidentified source: '+name)
+    plan=json.loads((root/'candidate-plan.json').read_text())
+    check_plan(plan,None,set(packages))
+    expected={r['name']:(r['version'],r.get('build_string') or r.get('build')) for r in plan.get('actions',{}).get('LINK',[])}
+    verify_installed_plan(expected,packages)
+    verify_retained(expected,summary['requested_roots'])
+    target=max((CONDA_MINIMUM,summary.get('conda_update',{}).get('target',CONDA_MINIMUM)),key=version)
+    verification=verify_minimums(packages,packages,True,target)
+    if (root/'env/conda-meta').is_dir():
+        differences=promotion_differences(records(root/'env'),packages)
+        if differences:raise RuntimeError('Staged candidate changed after review: '+', '.join(differences))
+    before=records(base);holds=permission_holds(base,before)
+    blocked=[h for n,h in holds.items() if n not in packages or
+             (before[n]['version'],before[n]['build'])!=(packages[n]['version'],packages[n]['build'])]
+    if blocked:
+        raise RuntimeError('Reviewed promotion requires owner/admin access repair before any base changes: '+
+                           '; '.join('%s: %s (%s)'%(h['name'],h['path'],h['reason']) for h in blocked))
+    identity={n:{key:r.get(key) for key in ('version','build','subdir','sha256','md5')} for n,r in sorted(packages.items())}
+    digest=hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest()
+    return {'root':root,'summary':summary,'packages':packages,'identity':identity,'manifest_sha256':digest,
+            'security_verification':verification,'target':target}
+
+
 def stage_source_state(base, meta=None):
     """Fingerprint source package records and control files without changing them."""
     if meta is None:meta=records(base)
@@ -1927,6 +2024,7 @@ def stage_base(args, base, env):
                      ('XDG_DATA_HOME','user-data'),('XDG_STATE_HOME','user-state')):
         env[key]=str(root/name)
     env.pop('CSE_CONDA_PERMISSION_HOLDS',None)
+    env.pop('CSE_CONDA_APPROVED_PLAN',None)
     for key in list(env):
         if re.fullmatch(r'CONDA_PREFIX(?:_\d+)?',key) or key in ('CONDA_EXE','CONDA_PYTHON_EXE','CONDA_DEFAULT_ENV',
                 'CONDA_SHLVL','CONDA_PROMPT_MODIFIER','CONDA_ROOT_PREFIX','MAMBA_ROOT_PREFIX'):
@@ -2072,6 +2170,7 @@ def main():
     ap.add_argument('--apply', action='store_true')
     ap.add_argument('--stage',type=Path,metavar='NEW_PRIVATE_DIR',help='Solve and install a fresh private base candidate with comparison reports; source base stays read only; no --apply needed')
     ap.add_argument('--stage-skip',action='append',default=[],metavar='PACKAGE',help='Omit this application request from --stage; repeatable; dependencies may still require it')
+    ap.add_argument('--promote',type=Path,metavar='REVIEWED_STAGE_DIR',help='Validate the reviewed exact set against its original base; add --apply to install it in place')
     ap.add_argument('--inspect-trust',action='store_true',help='Read actual CSE/base CA files and configuration; no updates')
     ap.add_argument('--trust-only',action='store_true',help='Only prepare/write the CSE bundle and shell snippet; no package/environment permission changes')
     scope=ap.add_mutually_exclusive_group()
@@ -2095,12 +2194,14 @@ def main():
     args = ap.parse_args()
     if args.stage_skip and not args.stage:ap.error('--stage-skip requires --stage')
     if args.stage:
-        if args.apply or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.all_envs or args.only or args.include or args.exclude or args.scan_root or args.log_dir or args.chains_dir or args.upgrade_conda or args.diagnostic_timeout is not None:
+        if args.apply or args.promote or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.all_envs or args.only or args.include or args.exclude or args.scan_root or args.log_dir or args.chains_dir or args.upgrade_conda or args.diagnostic_timeout is not None:
             ap.error('--stage cannot be combined with apply/report/diagnose/trust or other-environment modes; logs stay in the new private stage directory')
         if any(not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*',name) for name in args.stage_skip):ap.error('--stage-skip takes package names only')
         if os.geteuid()==0:ap.error('Run staging as your normal account, not root')
         env=safe_environment();env['PYTHONDONTWRITEBYTECODE']='1'
         return stage_base(args,find_base(args.miniforge,env),env)
+    if args.promote and (args.report or args.diagnose or args.inspect_trust or args.trust_only or args.all_envs or args.only or args.include or args.exclude or args.scan_root or args.upgrade_conda or args.channel):
+        ap.error('--promote targets only its staged source base and approved channels; do not combine it with other scopes/modes')
     if args.diagnostic_timeout is not None and (not args.diagnose or args.diagnostic_timeout<=0):
         ap.error('--diagnostic-timeout requires --diagnose and a positive number of seconds')
     if (args.include or args.scan_root) and not args.all_envs:
@@ -2121,10 +2222,17 @@ def main():
     cse_gid = maintenance_gid()  # validate before any deployment changes
     os.umask(0o002)
     env = safe_environment()
+    if args.promote:env['PYTHONDONTWRITEBYTECODE']='1'
     base = find_base(args.miniforge,env); conda = base/'bin/conda'
     if not maintainable(base): raise RuntimeError('No user/group maintenance access to base')
+    approved=load_promotion(args.promote,base) if args.promote else None
+    if approved:
+        env.update(CONDA_PKGS_DIRS=str(approved['root']/'pkgs'),CONDA_REGISTER_ENVS='false',CONDA_SHORTCUTS='false',
+                   CONDA_NUMBER_CHANNEL_NOTICES='0',CONDA_REPORT_ERRORS='false',CONDA_SAFETY_CHECKS='enabled',
+                   CONDA_EXTRA_SAFETY_CHECKS='true',CONDA_ROLLBACK_ENABLED='true')
     if args.trust_only and not args.ca_bundle: ap.error('--trust-only requires --ca-bundle with your approved CSE PEM source')
-    config = {} if args.trust_only else json.loads(capture([conda,'config','--show','--json'],env))
+    config_cmd=[base/'bin/python','-I','-B','-c',LIBMAMBA_CLI,'config','--show','--json'] if approved else [conda,'config','--show','--json']
+    config = {} if args.trust_only else json.loads(capture(config_cmd,env))
     channel_names,channel_urls,channel_args = requested_channels(args.channel,{k:v for k,v in config.items() if k!='pinned_packages'})
     source = choose_source(args,config,base)
     bundle_text, removed = filtered_bundle([source] + args.extra_ca)
@@ -2145,7 +2253,7 @@ def main():
     def detail(s):
         if args.verbose: print(s,flush=True)
         log.write(s+'\n')
-    say('Mode: '+('APPLY' if args.apply else 'LOCAL PREVIEW; no network operations'))
+    say('Mode: '+('APPLY' if args.apply else 'REVIEWED PROMOTION DRY RUN; no base changes' if approved else 'LOCAL PREVIEW; no network operations'))
     say('Script revision: %d'%SCRIPT_REVISION)
     say('Solver: installed libmamba only; external plugin discovery disabled; base Conda and packages update together.')
     say('Fallback/explicit package channels: '+', '.join(channel_names)+'; Anaconda defaults excluded; external plugins disabled; no PyPI fallback')
@@ -2184,7 +2292,11 @@ def main():
         heartbeat.start()
         try:
             limit=30 if '__cse_solver_probe__' in cmd or XKB_CACHE_PROBE in cmd else (180 if 'search' in cmd or ('install' in cmd and '--dry-run' in cmd) else None)
-            r = subprocess.run(solver_invocation(base,cmd),env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=limit)
+            invocation=solver_invocation(base,cmd)
+            if approved and str(cmd[0])==str(conda):invocation=[str(base/'bin/python'),'-I','-B','-c',LIBMAMBA_CLI]+list(map(str,cmd[1:]))
+            elif approved and str(cmd[0])==str(base/'bin/python') and '-I' in cmd and '-B' not in cmd:
+                invocation=list(map(str,cmd));invocation.insert(2,'-B')
+            r = subprocess.run(invocation,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=limit)
         except subprocess.TimeoutExpired as exc:
             decoded=lambda value: value.decode(errors='replace') if isinstance(value,bytes) else (value or '')
             raise record_failure(cmd,decoded(exc.stdout),decoded(exc.stderr),None,
@@ -2232,17 +2344,24 @@ def main():
         if empty.stat().st_uid == os.geteuid():
             os.chown(str(empty), -1, cse_gid); os.chmod(str(empty), 0o2775)
         if any(empty.iterdir()): raise RuntimeError('Expected dedicated empty CA directory')
-        atomic_write(bundle,bundle_text)
-        atomic_write(trustdir/'use-ca.sh','# Source after loading your CSE module.\n'+''.join('export %s=%s\n'%(k,shlex.quote(v)) for k,v in values.items()))
-        env.update(values)
-        env['CONDA_OFFLINE'] = 'true' if args.offline else 'false'
-    certificate_status={'status':'written' if args.apply else 'planned','bundle':str(bundle),'source':str(source),'roots_selected_for_removal':removed,
-                        'sha256':hashlib.sha256(bundle.read_bytes()).hexdigest() if args.apply else None,
+        if not approved:
+            atomic_write(bundle,bundle_text)
+            atomic_write(trustdir/'use-ca.sh','# Source after loading your CSE module.\n'+''.join('export %s=%s\n'%(k,shlex.quote(v)) for k,v in values.items()))
+            env.update(values)
+            env['CONDA_OFFLINE'] = 'true' if args.offline else 'false'
+    if approved:
+        preview_bundle=logdir/'promotion-ca-bundle.pem';preview_bundle.write_text(bundle_text);os.chmod(str(preview_bundle),0o600)
+        preview_empty=logdir/'empty-ca-dir';preview_empty.mkdir(mode=0o700)
+        env.update({k:str(preview_bundle) for k in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','CURL_CA_BUNDLE','PIP_CERT')})
+        env['SSL_CERT_DIR']=str(preview_empty);env['CONDA_OFFLINE']='true' if args.offline else 'false'
+    certificate_status={'status':'pending verified promotion' if approved and args.apply else 'written' if args.apply else 'planned','bundle':str(bundle),'source':str(source),'roots_selected_for_removal':removed,
+                        'sha256':hashlib.sha256(bundle.read_bytes()).hexdigest() if args.apply and not approved else None,
                         'activation':'shell snippet available; each application/environment must use it; OS/proxy unchanged'}
     (logdir/'certificate-status.json').write_text(json.dumps(certificate_status,indent=2))
     say('CSE certificate stage: '+certificate_status['status'].upper()+' | '+str(bundle))
-    say('Certificate preparation reads the source into one shared CSE copy. Only selected prefixes receive package/configuration updates; their package-owned PEMs may be replaced by conda.')
-    if args.apply: say('CSE bundle SHA256: '+certificate_status['sha256'])
+    if approved:say('Promotion uses a private CA copy for planning/downloads; shared trust is configured only after the reviewed packages verify.')
+    else:say('Certificate preparation reads the source into one shared CSE copy. Only selected prefixes receive package/configuration updates; their package-owned PEMs may be replaced by conda.')
+    if certificate_status['sha256']: say('CSE bundle SHA256: '+certificate_status['sha256'])
     if args.trust_only:
         say('No package updates or environment permission normalization attempted.')
         say('Existing CA packages/embedded bundles remain separate update work.')
@@ -2293,6 +2412,7 @@ def main():
                             raise RuntimeError('Channel-qualified prefix pin outside requested channels: '+pin)
             upgrade_conda = args.upgrade_conda or broad
             row['package_policy']='base applications retained; all package pins ignored; dependencies solved together and unused dependencies pruned' if broad else 'targeted maintenance; application packages pinned'
+            if approved:row['package_policy']='promote the reviewed exact package set; versions/builds/checksums locked; packages absent from the candidate removed'
             say('Package policy: '+row['package_policy'])
             holds={}
             if broad:
@@ -2315,13 +2435,34 @@ def main():
                     say('Base package replacement: '+migration['name']+' -> '+', '.join(migration['replacements']))
                 say('Conda update: '+row['conda_update']['status']+
                     ' | current='+str(row['conda_update']['before'])+' | minimum='+CONDA_MINIMUM)
+                if approved:
+                    row['base_intent'].update(roots=sorted(approved['packages']),dependencies=[])
+                    row['promotion']={'stage':str(approved['root']),'manifest_sha256':approved['manifest_sha256'],
+                                      'status':'preflight','package_count':len(approved['packages'])}
+                    row['reviewed_security_versions']=approved['security_verification']
+                    row['conda_update'].update(target=approved['packages']['conda']['version'],
+                        reviewed_latest_available=approved['summary'].get('conda_update',{}).get('latest_available'),
+                        source=recorded_origin(approved['packages']['conda']),
+                        policy='Reviewed candidate target; no new version search')
+                    guard={'prefix':str(base),'packages':approved['identity'],
+                           'before':{n:[r['version'],r['build']] for n,r in meta.items()}}
+                    guard_file=logdir/'approved-promotion-plan.json';guard_file.write_text(json.dumps(guard,indent=2));os.chmod(str(guard_file),0o600)
+                    env['CSE_CONDA_APPROVED_PLAN']=str(guard_file)
+                    _,channel_urls,channel_args,origins,excluded_origins,unknown_origins=environment_channels(approved['packages'],[],package_config)
+                    if excluded_origins or unknown_origins:raise RuntimeError('Reviewed package origins are not usable on this system')
+                    row['requested_channels']=channel_urls
+                    say('Reviewed package-set SHA256: '+approved['manifest_sha256'])
             else:env.pop('CSE_CONDA_PERMISSION_HOLDS',None)
             retained=set(row['base_intent']['roots']) if broad else None
             targets,allowed,specs = plan_specs(meta,upgrade_conda,broad=broad,roots=retained)
-            if broad:
+            if broad and not approved:
                 specs,row['permission_python_constraint']=permission_hold_specs(meta,specs,holds)
+            if approved:specs=qualify_specs([n+'='+r['version']+'='+r['build'] for n,r in sorted(approved['packages'].items())],origins)
             specs=specs if broad else qualify_specs(specs,origins)
             row['package_targets'] = [{'name':n,'current':meta.get(n,{}).get('version','absent'),'request':('>='+MINIMUM[n] if n in MINIMUM else ('>='+CONDA_MINIMUM if n == 'conda' else 'compatible build')),'source':('approved channels in priority order' if broad else origins.get(n,'fallback/explicit allowed channels'))} for n in sorted(targets)]
+            if approved:
+                for target in row['package_targets']:
+                    r=approved['packages'][target['name']];target.update(request='='+r['version']+'='+r['build'],source=origins[target['name']])
             detail('Package targets: '+(', '.join(sorted(targets)) or 'none'))
             audit = {'packages':{},'bundles':{}}
             py = prefix/'bin/python'
@@ -2335,7 +2476,7 @@ def main():
                     row['issues'].append('Outdated non-conda tools require reviewed conda-forge migration: '+', '.join(sorted(unmanaged)))
                 if not broad and 'pip' in audit['packages'] and audit['python'] < [3,10] and version(audit['packages']['pip']) < version(MINIMUM['pip']):
                     row['issues'].append('Old pip on Python <3.10 needs a reviewed compatible remediation')
-            if args.apply:
+            if args.apply or approved:
                 if row['issues']: raise RuntimeError('Package review required; no package/configuration/permission changes attempted for this prefix')
                 row['phase'] = 'save configuration and conda package inventory'
                 for relative in ('.condarc','conda-meta/state','conda-meta/history','conda-meta/pinned'):
@@ -2346,7 +2487,12 @@ def main():
                 probe=runjson([conda,'__cse_solver_probe__'])
                 if probe.get('solver')!='libmamba':raise RuntimeError('Installed libmamba solver could not be loaded; no package update attempted')
                 row['solver']='libmamba'
-                if broad:
+                if approved:
+                    info=runjson([conda,'info','--json'])
+                    platforms={r['subdir'] for r in approved['packages'].values()}-{'noarch'}
+                    if platforms and platforms!={info.get('subdir') or info.get('platform')}:
+                        raise RuntimeError('Reviewed package platform differs from this system; stage this system separately')
+                if broad and not approved:
                     conda_minimum=select_conda_target(base,meta,origins,config,args.offline,runjson,logdir,row,say)
                     targets,allowed,specs=plan_specs(meta,upgrade_conda,broad=True,conda_minimum=conda_minimum,roots=retained)
                     specs,row['permission_python_constraint']=permission_hold_specs(meta,specs,holds,conda_minimum)
@@ -2373,6 +2519,15 @@ def main():
                     if broad:row['conda_update']['plan_conda_version']=final.get('conda',(None,None))[0]
                     verify_minimums(meta,{n:{'version':v} for n,(v,b) in final.items()},upgrade_conda,
                                     row.get('conda_update',{}).get('target',CONDA_MINIMUM))
+                    if approved:
+                        verify_installed_plan({n:(r['version'],r['build']) for n,r in approved['packages'].items()},
+                                              {n:{'version':v,'build':b} for n,(v,b) in final.items()})
+                        row['promotion']['status']='validated'
+                        if not args.apply:
+                            row['conda_update']['status']='reviewed-plan-validated'
+                            row['status']='previewed';row['trust_configuration']='would configure after verified package promotion'
+                            say('Reviewed promotion dry run passed; no base package/configuration/permission changes made.')
+                            continue
                     execution=[conda,'install','-p',prefix,'--solver','libmamba','--json','--yes']+(['--prune','--no-pin'] if broad else ['--freeze-installed'])+channel_args+exact
                     if args.offline: execution.append('--offline')
                     migration=None
@@ -2420,11 +2575,22 @@ def main():
                 row['security_verification']=verify_minimums(meta,after_meta,upgrade_conda,
                                                            row.get('conda_update',{}).get('target',CONDA_MINIMUM))
                 if targets:verify_installed_plan(final,after_meta)
+                if approved:
+                    differences=promotion_differences(after_meta,approved['packages'])
+                    if differences:raise RuntimeError('Installed packages differ from reviewed checksums/platforms: '+', '.join(differences))
+                    if runjson([conda,'__cse_solver_probe__']).get('solver')!='libmamba':raise RuntimeError('Promoted Conda/solver startup failed')
+                    row['promotion']['status']='packages-verified'
                 if row.get('xkb_migration'):verify_xkb_tree(prefix,row['xkb_migration'])
                 for removal in row.get('package_removals',[]):removal['status']='verified'
                 if broad:row['conda_update'].update(status='updated',after=after_meta.get('conda',{}).get('version'))
                 row['phase'] = 'configure prefix trust'
                 row['changes_started']=True
+                if approved:
+                    atomic_write(bundle,bundle_text)
+                    atomic_write(trustdir/'use-ca.sh','# Source after loading your CSE module.\n'+''.join('export %s=%s\n'%(k,shlex.quote(v)) for k,v in values.items()))
+                    env.update(values)
+                    certificate_status.update(status='written',sha256=hashlib.sha256(bundle.read_bytes()).hexdigest())
+                    (logdir/'certificate-status.json').write_text(json.dumps(certificate_status,indent=2))
                 run([conda,'config','--file',prefix/'.condarc','--set','ssl_verify',bundle])
                 run([conda,'env','config','vars','set','-p',prefix]+[k+'='+v for k,v in values.items()])
                 row['trust_configuration'] = 'configured to use'
@@ -2461,6 +2627,7 @@ def main():
             skipped_paths.extend(row['skipped_paths'])
             row['permission_warnings'] = permissions
             row['status']='incomplete' if row['issues'] else (('updated' if args.apply else 'previewed') + ('-with-skips' if permissions or holds else ''))
+            if approved and row['status'].startswith('updated'):row['promotion']['status']='completed'
         except (PermissionError,FileNotFoundError) as exc:
             row['status']='incomplete' if row['changes_started'] else 'skipped'
             row['issues'].append(str(exc))
@@ -2484,7 +2651,8 @@ def main():
             for r in skipped_paths: say('  %s | owner=%s | %s | %s' % (r['stage'],r['owner'],r['path'],r['reason']))
     say('Full summary: '+str(logdir/'summary.json'))
     if any(r['status']=='incomplete' for r in results): say('Explain this run without retrying: python3 patch_miniforge_trust.py --report '+shlex.quote(str(logdir)))
-    if args.apply:say('For the current shell after loading your module: . '+shlex.quote(str(trustdir/'use-ca.sh')))
+    if args.apply and (not approved or certificate_status['status']=='written'):
+        say('For the current shell after loading your module: . '+shlex.quote(str(trustdir/'use-ca.sh')))
     say('No external test endpoints were contacted. OS/proxy trust unchanged.')
     log.close()
     if lockfile:lockfile.close()
