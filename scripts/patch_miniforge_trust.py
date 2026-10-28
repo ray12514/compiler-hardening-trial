@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 22 (2026-10-28).
+"""CSE Miniforge certificate maintenance, revision 23 (2026-10-28).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
@@ -65,6 +65,14 @@ package pins are ignored with --no-pin, including prefix pin files and
 pinned_packages settings. Python and applications can update together; unused
 dependencies may leave. Stored pin/configuration files and the Miniforge/module/
 Spack release selection are retained. Non-base prefixes keep their pin policy.
+Base preflight defers packages whose installed paths cannot be replaced with the
+current access. Those packages receive temporary exact version/build holds and
+are retained. Python's major/minor is constrained when needed for held Python
+packages. The execution solver refuses any unlink/relink of held packages, even
+the same build. Required security/Conda targets still apply; an incompatible hold
+stops before installation. A successful run with holds is updated-with-skips and
+lists deferred packages and paths. No stored pins are changed. Preflight cannot
+prove future access, server policy or access to every incoming package path.
 Known conda-forge boost/boost-cpp names migrate to libboost-python-devel and
 libboost-devel, preserving development functionality. Unknown conflicts are not
 treated as proof of deprecation. The exact validated versions/builds and removals
@@ -168,7 +176,7 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 22
+SCRIPT_REVISION = 23
 BASE_REPLACEMENTS = {'boost':('libboost-python-devel',),'boost-cpp':('libboost-devel',)}
 ROOTS = {
  '7DD78D5F4F13459A83DFF9ABBBA62EDBAF6F2D102BF257FD712F4D9F2746ED8D': 'emSign Root TLS CA - G3',
@@ -410,7 +418,7 @@ def records(prefix):
 
 def safe_environment():
     env = os.environ.copy()
-    for k in ('PYTHONPATH','PYTHONHOME','LD_PRELOAD','LD_LIBRARY_PATH',
+    for k in ('PYTHONPATH','PYTHONHOME','LD_PRELOAD','LD_LIBRARY_PATH','CSE_CONDA_PERMISSION_HOLDS',
               'OPENSSL_CONF','OPENSSL_MODULES','OPENSSL_ENGINES',
               'SSL_CERT_DIR','PIP_TRUSTED_HOST'):
         env.pop(k, None)
@@ -555,7 +563,7 @@ def history_roots(prefix, meta):
     return roots & set(meta)
 
 
-def base_package_intent(meta, prefix=None, config=None, ignore_pins=False):
+def base_package_intent(meta, prefix=None, config=None, ignore_pins=False, held=()):
     """Preserve explicit requests and every source component of the dependency graph.
 
     Keeping source components covers every installed package initially, including
@@ -596,7 +604,7 @@ def base_package_intent(meta, prefix=None, config=None, ignore_pins=False):
         pins.extend(line.split('#',1)[0].strip() for line in pinfile.read_text().splitlines() if line.split('#',1)[0].strip())
     pinned=({spec_name(pin) for pin in pins} & names) if not ignore_pins else set()
     roots|=explicit | (set(meta) & (set(MINIMUM)|{'conda','python','mamba','conda-libmamba-solver'}))
-    roots|=pinned
+    roots|=pinned | set(held)
     # Verified conda-forge naming migration: current recipes prohibit the old
     # boost/boost-cpp names. Preserve headers/development functionality too.
     # https://github.com/conda-forge/boost-feedstock/blob/main/recipe/meta.yaml
@@ -604,13 +612,106 @@ def base_package_intent(meta, prefix=None, config=None, ignore_pins=False):
     forge.update(('conda-forge','https://conda.anaconda.org/conda-forge'))
     migrations=[]
     for old,new in sorted(BASE_REPLACEMENTS.items()):
-        if old in meta and old not in pinned and recorded_origin(meta[old]) in forge:
+        if old in meta and old not in pinned and old not in held and recorded_origin(meta[old]) in forge:
             roots.discard(old);roots.update(new)
             migrations.append({'name':old,'replacements':list(new),'reason':'conda-forge Boost package naming migration'})
     return {'roots':sorted(roots),'explicit_requests':sorted(explicit),'pinned_packages':sorted(pinned),
             'ignored_pins':sorted(set(pins)) if ignore_pins else [],
             'dependencies':sorted(set(meta)-roots-{r['name'] for r in migrations}),
             'replacements':migrations}
+
+
+def package_paths(record):
+    """Read installed prefix manifests, rejecting paths outside the prefix."""
+    values=set(record.get('files') or ())
+    values.update(p['_path'] for p in record.get('paths_data',{}).get('paths',()) if p.get('_path'))
+    for value in sorted(values):
+        p=Path(value)
+        if not value or p.is_absolute() or '..' in p.parts or '\\' in value:
+            raise RuntimeError('Unsafe installed package path: '+str(value))
+        yield p
+
+
+def permission_holds(prefix, meta):
+    """Find package replacement blockers without writing, chmod or deletion.
+
+    A foreign file owner is not itself a blocker: Unix rename/unlink depends on
+    its parent. Cache directory access checks are shared across package files.
+    This preflight cannot establish immutable flags, server policy or future ACLs.
+    """
+    holds={};directory_checks={}
+    python=meta.get('python',{}).get('version','').split('.')
+    tag=''.join(python[:2]) if len(python)>=2 else None
+    def directory_check(directory):
+        if directory in directory_checks:return directory_checks[directory]
+        if directory==prefix.parent:
+            result=(None,'Directory is outside the selected prefix')
+        else:
+            try:
+                st=directory.lstat()
+                if stat.S_ISLNK(st.st_mode):result=(None,'Package parent is a symlink; access needs review')
+                elif not stat.S_ISDIR(st.st_mode):result=(None,'Package parent is not a directory')
+                elif not os.access(str(directory),os.W_OK|os.X_OK):result=(None,'Containing directory lacks effective write/traverse access')
+                else:
+                    # Check ancestors for redirected paths, too; os.access has
+                    # already checked effective traversal through them.
+                    redirect=next((p for p in directory.parents if p!=prefix and prefix in p.parents and p.is_symlink()),None)
+                    result=(st,None) if redirect is None else (None,'Package parent traverses a symlink: '+str(redirect))
+            except FileNotFoundError:result=directory_check(directory.parent)
+            except OSError as exc:result=(None,str(exc))
+        directory_checks[directory]=result
+        return result
+    for name,record in sorted(meta.items()):
+        paths=list(package_paths(record))
+        candidates=list(paths);seen=set(paths)
+        # Native packages can leave import-generated caches out of their manifest.
+        # Associate only caches derived from a package-owned .py source, never
+        # infer package ownership just from the word android_deploy in a name.
+        for p in paths:
+            if p.suffix=='.py' and tag:
+                for suffix in ('','.opt-1','.opt-2'):
+                    cache=p.parent/'__pycache__'/(p.stem+'.cpython-'+tag+suffix+'.pyc')
+                    if cache not in seen:candidates.append(cache);seen.add(cache)
+        for relative in candidates:
+            path=prefix/relative
+            reason=None;st=None
+            try:
+                st=path.lstat()
+                if stat.S_ISDIR(st.st_mode):continue
+            except FileNotFoundError:st=None
+            except OSError as exc:
+                reason=str(exc)
+            parent,blocked=directory_check(path.parent)
+            reason=reason or blocked
+            if not reason and st is not None and parent.st_mode & stat.S_ISVTX and os.geteuid() not in (0,st.st_uid,parent.st_uid):
+                reason='Sticky containing directory prevents replacing another owner\'s file'
+            if reason:
+                holds[name]={'name':name,'version':record['version'],'build':record['build'],
+                             'path':str(path),'reason':reason,'access':access_snapshot(path),
+                             'python_files':any(p.suffix in ('.py','.pyc') for p in paths) or record.get('noarch')=='python'}
+                break
+    return holds
+
+
+def permission_hold_specs(meta, specs, holds, conda_minimum=CONDA_MINIMUM):
+    """Temporary constraints for this solve, independent of stored site pins."""
+    for name,hold in holds.items():
+        minimum=MINIMUM.get(name,conda_minimum if name=='conda' else None)
+        if minimum and version(hold['version'])<version(minimum):
+            raise RuntimeError('Permission-held package %s=%s cannot meet required >=%s; owner/admin must repair %s (%s)'%(
+                name,hold['version'],minimum,hold['path'],hold['reason']))
+    output=[s for s in specs if spec_name(s) not in holds]
+    output.extend(n+'='+r['version']+'='+r['build'] for n,r in sorted(holds.items()))
+    constraint=None
+    if 'python' in meta and 'python' not in holds and any(r['python_files'] for r in holds.values()):
+        constraint='python='+'.'.join(meta['python']['version'].split('.')[:2])+'.*'
+        output=[s for s in output if spec_name(s)!='python']+[constraint]
+    return output,constraint
+
+
+def verify_permission_holds(plan, holds):
+    touched={r['name'] for action in ('LINK','UNLINK') for r in plan.get('actions',{}).get(action,())} & set(holds)
+    if touched:raise RuntimeError('Plan would replace permission-held packages: '+', '.join(sorted(touched))+'; no transaction attempted. Repair their reported access blockers.')
 
 
 def plan_specs(meta, upgrade_conda, broad=False, conda_minimum=CONDA_MINIMUM, roots=None):
@@ -660,7 +761,11 @@ def exact_plan_specs(meta, plan, origins, extras, config):
     for record in plan.get('actions',{}).get('LINK',[]):
         name=record['name']
         final[name]=(record['version'],record.get('build_string') or record.get('build'))
-        _,_,_,planned_origins,_,_=environment_channels({name:record},extras,config)
+        # LINK JSON can use a bare canonical label for a file/site channel while
+        # base_url carries its actual location. Do not turn that label into an
+        # unrelated conda.anaconda.org repository during the execution solve.
+        source_record=dict(record,channel=record['base_url']) if record.get('base_url') else record
+        _,_,_,planned_origins,_,_=environment_channels({name:source_record},extras,config)
         if name in planned_origins:final_origins[name]=planned_origins[name]
     if any(not build for value,build in final.values()):
         raise RuntimeError('Plan omitted build identifiers')
@@ -857,6 +962,25 @@ from conda import plugins
 from conda.plugins.types import CondaSolver
 from conda.base.context import context
 from conda.cli.main import main
+from conda.models.channel import Channel
+from conda.models import match_spec as match_spec_module
+# Legacy MatchSpec parsing drops a file channel's directory and leaves only its
+# basename, which the next parse mistakes for an anaconda.org channel. Preserve
+# the actual approved file URL through the CLI/solver roundtrip, in this process.
+parse_channel = getattr(match_spec_module, '_parse_channel', None)
+if parse_channel is not None:
+    def parse_local_channel(value):
+        if value and value.startswith('file://'):
+            channel=Channel(value)
+            return channel.base_url,channel.subdir
+        return parse_channel(value)
+    match_spec_module._parse_channel=parse_local_channel
+channel_match_str=match_spec_module.ChannelMatch.__str__
+def local_channel_str(self):
+    channel=getattr(self, '_raw_value', None)
+    if getattr(channel, 'scheme', None)=='file':return channel.base_url
+    return channel_match_str(self)
+match_spec_module.ChannelMatch.__str__=local_channel_str
 from conda_libmamba_solver.solver import LibMambaSolver
 import conda_libmamba_solver.solver as solver_module
 def retired_names(state):
@@ -870,7 +994,17 @@ class RetainedBaseSolver(LibMambaSolver):
         if '--prune' in sys.argv:
             if len(args)>2:args=(*args[:2],True,*args[3:])
             else:kwargs['prune']=True
-        return super().solve_for_transaction(*args, **kwargs)
+        transaction=super().solve_for_transaction(*args, **kwargs)
+        # Recheck the execution solve before any unlink/link action. Even a
+        # same-build reinstall or Python-triggered noarch relink is forbidden.
+        guard=json.loads(os.environ.get('CSE_CONDA_PERMISSION_HOLDS','{}'))
+        for setup in transaction.prefix_setups.values():
+            if os.path.realpath(setup.target_prefix)==guard.get('prefix'):
+                touched={r.name for r in (*setup.unlink_precs,*setup.link_precs)} & set(guard['packages'])
+                if touched:
+                    from conda.exceptions import CondaError
+                    raise CondaError('Transaction would replace permission-held packages: '+', '.join(sorted(touched))+'; no transaction attempted')
+        return transaction
     # Explicitly retire the old names during the solve, so they cannot bias it
     # toward older replacement versions before post-solve dependency pruning.
     def _specs_to_tasks_add(self, in_state, out_state):
@@ -1022,6 +1156,9 @@ def final_summary(results, apply, bundle, say):
         if row.get('package_policy'):say('  Package policy: '+row['package_policy'])
         if row.get('package_pin_policy'):say('  Package pins: '+row['package_pin_policy'])
         if row.get('ignored_pins'):say('  Ignored base pin specs: '+', '.join(row['ignored_pins']))
+        for hold in row.get('permission_holds',[]):
+            say('  Deferred package: %s=%s=%s | %s | %s'%(hold['name'],hold['version'],hold['build'],hold['path'],hold['reason']))
+        if row.get('permission_python_constraint'):say('  Python constraint for deferred packages: '+row['permission_python_constraint'])
         if row.get('xkb_migration'):
             migration=row['xkb_migration']
             say('  XKB path migration: '+migration.get('status','not moved')+' | original tree: '+migration.get('backup','not moved')+' | manifest: '+migration.get('manifest','not created'))
@@ -1058,7 +1195,7 @@ def final_summary(results, apply, bundle, say):
         for event in row.get('command_failures',[]):
             for snapshot in event.get('access_details',[]): print_access(snapshot,say)
     say('Environment counts: '+', '.join('%s=%d'%(s,sum(r['status']==s for r in results)) for s in ('previewed','previewed-with-skips','updated','updated-with-skips','skipped','incomplete')))
-    say('Counts are environments, not package versions. Incomplete means a required package/check failed or needs review; reasons appear above.')
+    say('Counts are environments, not package versions. Deferred packages remain installed at their listed versions. Incomplete means a required package/check failed or needs review; reasons appear above.')
     if not apply: say('Preview targets are requests, not solved upgrades. No dependency solve ran; exact versions/builds are validated during apply.')
 
 
@@ -1090,7 +1227,7 @@ def failure_category(text):
         return 'Conda classic conflict-reporting bug', 'Conda classic crashed while explaining a dependency conflict. Use the current libmamba update path; it reports conflicts without classic hint analysis.'
     if 'non-conda' in value or 'conda-forge migration' in value:
         return 'Mixed package ownership', 'Review the named pip/uv-managed tool and its requirements; do not overwrite it with conda in bulk.'
-    if any(x in value for x in ('permission denied','permissionerror','not writable','notwritableerror','read-only file system')):
+    if any(x in value for x in ('permission denied','permissionerror','permission-held','not writable','notwritableerror','read-only file system')):
         if '__pycache__' in value or '.pyc' in value:
             return 'Filesystem access', 'The denied path is generated Python bytecode. Conda may need to rename/remove it during package replacement, even if the application is unused. Check the containing directory write/traverse access, sticky bit and ACLs; group membership does not grant chmod on another owner\'s file. Have the owner/admin repair the specific blocker. Deleting one cache file does not repair a non-writable directory. Permission-normalization skips alone are nonfatal.'
         return 'Filesystem access', 'Check the exact denied path, its parent traversal, ACLs, mount policy and cache location; environment ownership alone is insufficient.'
@@ -1155,15 +1292,21 @@ def report_existing(directory, verbose=False):
     failures = []
     for row in results:
         counts[row['status']] = counts.get(row['status'],0)+1
-        if row['status'] not in ('incomplete','skipped') and not verbose: continue
+        if row['status'] not in ('incomplete','skipped') and not row.get('permission_holds') and not verbose: continue
         issues = row.get('issues',[])
         evidence = row.get('command_failures',[])
         if not evidence and any('Command failed; see private run.log' in issue for issue in issues):
             inferred = legacy_failure_details(logtext,row['prefix'])
             if inferred: evidence = [inferred]
         cause_text = '\n'.join(issues+[e['detail'] for e in evidence])
-        category,advice = failure_category(cause_text)
-        failures.append(category)
+        if row.get('permission_holds') and not issues:
+            category='Deferred packages'
+            advice=('The validated update completed with the listed packages held at their installed versions.'
+                    if row['status'].startswith('updated') else 'Local preview found the listed access-blocked packages; no update was performed.')
+            advice+=' Repair their access before updating them.'
+        else:
+            category,advice = failure_category(cause_text)
+            failures.append(category)
         print('\n%s | %s | owner=%s' % (row['prefix'],row['status'],row.get('ownership',{}).get('owner','unknown')))
         print('  Category: '+category)
         print('  Changes started: '+str(row.get('changes_started','not recorded'))+' (not a transaction/rollback guarantee)')
@@ -1177,6 +1320,9 @@ def report_existing(directory, verbose=False):
             if 'Command failed; see private run.log' not in issue: print('  Reason: '+issue)
         if row.get('package_pin_policy'):print('  Package pins: '+row['package_pin_policy'])
         if row.get('ignored_pins'):print('  Ignored base pin specs: '+', '.join(row['ignored_pins']))
+        for hold in row.get('permission_holds',[]):
+            print('  Deferred package: %s=%s=%s | %s | %s'%(hold['name'],hold['version'],hold['build'],hold['path'],hold['reason']))
+        if row.get('permission_python_constraint'):print('  Python constraint for deferred packages: '+row['permission_python_constraint'])
         if row.get('xkb_migration'):
             migration=row['xkb_migration']
             print('  XKB path migration: '+migration.get('status','not moved')+' | original tree: '+migration.get('backup','not moved')+' | manifest: '+migration.get('manifest','not created'))
@@ -1203,7 +1349,7 @@ def report_existing(directory, verbose=False):
             print('  Non-conda inventory: '+json.dumps(row['non_conda_tools'],sort_keys=True))
     print('\nEnvironment counts: '+', '.join('%s=%d'%item for item in sorted(counts.items())))
     print('Failure/review categories: '+(', '.join('%s=%d'%(c,failures.count(c)) for c in sorted(set(failures))) or 'none'))
-    print('updated-with-skips means work completed with access/permission exceptions; it is not a failed package update.')
+    print('updated-with-skips means the validated update completed with access/permission exceptions, including any listed deferred packages left at their installed versions.')
     print('Legacy diagnostics are best-effort evidence from saved logs, not a new system test.')
     return 0
 
@@ -1851,10 +1997,18 @@ def main():
             upgrade_conda = args.upgrade_conda or broad
             row['package_policy']='base applications retained; all package pins ignored; dependencies solved together and unused dependencies pruned' if broad else 'targeted maintenance; application packages pinned'
             say('Package policy: '+row['package_policy'])
+            holds={}
             if broad:
+                row['phase']='inspect installed package path access'
+                holds=permission_holds(prefix,meta)
+                row['permission_holds']=list(holds.values())
+                (logdir/'base-permission-holds.json').write_text(json.dumps(row['permission_holds'],indent=2))
+                for hold in holds.values():
+                    say('Deferred package: %s=%s=%s | %s | %s'%(hold['name'],hold['version'],hold['build'],hold['path'],hold['reason']))
+                env['CSE_CONDA_PERMISSION_HOLDS']=json.dumps({'prefix':str(prefix.resolve()),'packages':sorted(holds)})
                 row['conda_update']=conda_update_status(meta)
-                row['base_intent']=base_package_intent(meta,prefix,config,ignore_pins=True)
-                row['package_pin_policy']='ignore all package pins for this base update; stored settings retained'
+                row['base_intent']=base_package_intent(meta,prefix,config,ignore_pins=True,held=holds)
+                row['package_pin_policy']='ignore stored package pins; apply temporary exact holds only for access-blocked packages'
                 row['ignored_pins']=row['base_intent']['ignored_pins']
                 say('Base package pins ignored: '+(', '.join(row['ignored_pins']) or 'none configured'))
                 (logdir/'base-package-intent.json').write_text(json.dumps(row['base_intent'],indent=2))
@@ -1864,8 +2018,11 @@ def main():
                     say('Base package replacement: '+migration['name']+' -> '+', '.join(migration['replacements']))
                 say('Conda update: '+row['conda_update']['status']+
                     ' | current='+str(row['conda_update']['before'])+' | minimum='+CONDA_MINIMUM)
+            else:env.pop('CSE_CONDA_PERMISSION_HOLDS',None)
             retained=set(row['base_intent']['roots']) if broad else None
             targets,allowed,specs = plan_specs(meta,upgrade_conda,broad=broad,roots=retained)
+            if broad:
+                specs,row['permission_python_constraint']=permission_hold_specs(meta,specs,holds)
             specs=specs if broad else qualify_specs(specs,origins)
             row['package_targets'] = [{'name':n,'current':meta.get(n,{}).get('version','absent'),'request':('>='+MINIMUM[n] if n in MINIMUM else ('>='+CONDA_MINIMUM if n == 'conda' else 'compatible build')),'source':('approved channels in priority order' if broad else origins.get(n,'fallback/explicit allowed channels'))} for n in sorted(targets)]
             detail('Package targets: '+(', '.join(sorted(targets)) or 'none'))
@@ -1895,6 +2052,8 @@ def main():
                 if broad:
                     conda_minimum=select_conda_target(base,meta,origins,config,args.offline,runjson,logdir,row,say)
                     targets,allowed,specs=plan_specs(meta,upgrade_conda,broad=True,conda_minimum=conda_minimum,roots=retained)
+                    specs,row['permission_python_constraint']=permission_hold_specs(meta,specs,holds,conda_minimum)
+                    if row['permission_python_constraint']:say('Python constraint for deferred packages: '+row['permission_python_constraint'])
                 if targets:
                     row['phase'] = 'solve package update (dry run)'
                     cmd=[conda,'install','-p',prefix,'--solver','libmamba','--json']+(['--update-all','--prune','--no-pin'] if broad else ['--freeze-installed'])+channel_args+specs
@@ -1902,6 +2061,7 @@ def main():
                     plan=runjson(cmd+['--dry-run'])
                     (logdir/('%03d-plan.json'%i)).write_text(json.dumps(plan,indent=2))
                     changed=check_plan(plan,allowed,retained)
+                    verify_permission_holds(plan,holds)
                     row['package_plan'] = [{'name':r['name'],'before':meta.get(r['name'],{}).get('version','absent'),'after':r['version'],'build':r.get('build_string') or r.get('build')} for r in plan.get('actions',{}).get('LINK',[])]
                     row['package_removals']=planned_removals(plan,row.get('base_intent',{}).get('replacements',[]))
                     for removal in row['package_removals']:
@@ -1999,10 +2159,11 @@ def main():
                 if n in meta or n in audit['packages']:row['issues'].append(n+' needs separate embedded-tool/dependency review')
             row['phase'] = 'normalize shared permissions'
             row['permissions'] = {}
-            permissions = public_permissions(prefix,base,args.apply,detail,row['skipped_paths'],args.exclude+[base/PATH_BACKUPS],row['permissions'])
+            permissions = public_permissions(prefix,base,args.apply,detail,row['skipped_paths'],
+                                             args.exclude+[base/PATH_BACKUPS]+[Path(h['path']).parent for h in holds.values()],row['permissions'])
             skipped_paths.extend(row['skipped_paths'])
             row['permission_warnings'] = permissions
-            row['status']='incomplete' if row['issues'] else (('updated' if args.apply else 'previewed') + ('-with-skips' if permissions else ''))
+            row['status']='incomplete' if row['issues'] else (('updated' if args.apply else 'previewed') + ('-with-skips' if permissions or holds else ''))
         except (PermissionError,FileNotFoundError) as exc:
             row['status']='incomplete' if row['changes_started'] else 'skipped'
             row['issues'].append(str(exc))

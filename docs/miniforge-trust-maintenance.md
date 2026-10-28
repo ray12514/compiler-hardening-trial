@@ -7,7 +7,7 @@ No external incident test endpoint is contacted.
 
 ## Update Conda and base packages in the existing installation
 
-Revision 22 keeps the installed Miniforge distribution, prefix, module selection
+Revision 23 keeps the installed Miniforge distribution, prefix, module selection
 and Spack version pin. Miniforge `24.11.2-1` does not itself require a reinstall
 for an in-place Conda/base package update. No installer is downloaded or rerun.
 The default scope is **the loaded base only**. Other environments require an
@@ -20,7 +20,7 @@ python3 patch_miniforge_trust.py --base-only
 python3 patch_miniforge_trust.py --base-only --apply
 ```
 
-`python3 patch_miniforge_trust.py --version` should print revision 22. Each run
+`python3 patch_miniforge_trust.py --version` should print revision 23. Each run
 also records its revision so an older copied script can be identified directly.
 
 Use `--ca-bundle /path/to/CSE-existing-bundle.pem` when a particular existing site
@@ -37,8 +37,10 @@ package retrieval. The update then:
    do not turn every old dependency into a permanent application requirement.
    Standalone packages and dependency cycles are retained conservatively.
    Python, Conda, the solver and installed security targets are retained as
-   unversioned requests or required security minimums.
-4. Solves **one full base update** with `--update-all --prune --no-pin`. All base
+   unversioned requests or required security minimums. Access-blocked packages
+   instead receive temporary exact holds, with a Python series constraint where
+   needed to prevent their relinking.
+4. Solves **one full base update** with `--update-all --prune --no-pin`. Stored base
    package pins are ignored, including `conda-meta/pinned`, `pinned_packages`
    configuration and environment settings. Python, Mamba,
    NumPy, Jupyter, Boost and their dependencies can move together. Base requests
@@ -56,6 +58,11 @@ transaction API: Conda 24.11 accepts the install CLI flag but does not forward i
 Retired names do not get update jobs; the solver explicitly removes those names
 in the same transaction, so they cannot hold their replacements to older versions.
 Both libmamba 1.x and 2.x request APIs are supported. No installed solver files are patched.
+For local/site channels, the validated plan's `base_url` takes priority over its
+short display label. The wrapper also preserves file-channel URLs through legacy
+Conda MatchSpec parsing/formatting, so the exact execution solve does not turn a
+local directory basename into an unrelated public channel. These adjustments are
+process-local and do not change stored channel configuration.
 
 There is no preliminary manager-only bootstrap and no classic conflict-hint graph
 in this path. A missing/broken installed solver fails before package updates with
@@ -236,7 +243,7 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
 
 The script was updated at commit `3cfb223ceb8ca59a128523627df0d187a75bc9a0`.
 That historical revision uses classic solving rather than the current single
-libmamba base transaction. Use the current `main` retrieval for revision 22.
+libmamba base transaction. Use the current `main` retrieval for revision 23.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
@@ -606,6 +613,53 @@ Existing snapshots remain evidence from the time they were captured. A final
 permissions-stage `SKIP PATH` / `updated-with-skips` is nonfatal; an install-phase
 `PermissionError` / `incomplete` is a failed package update. Revision 22 improves
 this diagnosis; it does not grant missing site access or skip transaction files.
+
+### Update the accessible base packages while deferring blocked packages
+
+Revision 23 does this by default in the selected base. It checks installed package
+manifests for paths that the current account cannot replace and keeps each affected
+package at its exact installed version and build. It also checks expected Python
+caches derived from package-owned `.py` sources, including unrecorded import caches.
+It does not guess a package owner from the `android_deploy` name alone. A
+foreign-owned file in a writable, traversable directory is not held just because
+the UID differs; directory access and sticky restrictions matter.
+
+The remaining base applications and dependencies are solved together for updates.
+When a held package has Python files, Python stays within its installed major/minor
+series so an interpreter change cannot force that package's noarch relink; Python
+patch updates remain possible. Other dependency constraints are solved normally.
+Before any native transaction, the restricted solver rejects every unlink or link
+of a held package, including a same-build reinstall. It checks the execution solve
+as well as the initial dry run. No individual transaction file is silently skipped.
+The reported blocked directories are excluded from permission normalization too.
+
+These are temporary constraints for the current run. Existing site/package pins
+are still ignored for the base solve, and no pin file or module/Spack selection is
+changed. Access is checked again on the next run; after the owner/admin fixes it,
+the package can update normally. Non-base environments keep their existing policy.
+
+The script still requires the selected newest stable Conda target and the security
+minimums for installed certificate and maintenance packages. If a blocked package
+is below its required minimum, or retaining it conflicts with those targets, the
+run stops before installation and reports the hold and solver error. It does not
+lower a security target to manufacture success. A preflight cannot prove server
+policy, immutable flags, future access or every new package path; an unexpected
+transaction failure remains a failure and is not retried around a partial update.
+
+Use the normal command after refreshing the script from `main`:
+
+```bash
+python3 patch_miniforge_trust.py --version  # revision 23
+python3 patch_miniforge_trust.py --base-only --apply
+```
+
+A compatible update with held packages reports `updated-with-skips`, verifies the
+installed package plan and required minimums, and lists each **Deferred package**,
+installed version/build, blocked path and reason. `base-permission-holds.json` also
+contains access snapshots. This means the allowed update completed while those
+packages remained at their listed versions; it does not mean every base package
+was upgraded or that the held packages are patched. The admin can repair the
+deferred paths separately.
 
 ## Apply
 
