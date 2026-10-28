@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 23 (2026-10-28).
+"""CSE Miniforge certificate maintenance, revision 24 (2026-10-28).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
   python3 patch_miniforge_trust.py /path/to/miniforge     # explicit install
   python3 patch_miniforge_trust.py --apply               # apply, approved channels
+  python3 patch_miniforge_trust.py --stage ~/cse-candidate # build privately; review before changing base
+  python3 patch_miniforge_trust.py --stage ~/cse-retry --stage-skip PACKAGE
   python3 patch_miniforge_trust.py --apply --offline     # approved cached packages
   python3 patch_miniforge_trust.py --apply --upgrade-conda
   python3 patch_miniforge_trust.py --report latest        # explain saved logs only
@@ -44,6 +46,13 @@ and skipped-paths.json list full paths, owners, groups, stages and reasons.
 Default output is concise; --verbose shows path details. Full details are logged.
 Final summaries repeat retained package requests, removals, permission counts and failure reasons.
 Per-owner skip reports are private review aids. A skip is not protection.
+--stage NEW_PRIVATE_DIR is a separate workflow: it solves and installs a fresh
+candidate with its own cache/trust files and writes version/build comparisons.
+The source base stays read only, including its caches and permissions. No shared
+maintenance access or cse membership is required for staging. --stage-skip NAME
+explicitly omits an application request; dependencies may still require it.
+Failed solves/installations retain honest failure reports. Staging performs no
+promotion to base; review the candidate before deciding on any live update.
 --report LOG_DIR (or latest) reads prior summaries/logs without updates or network.
 New command failures save separate JSON records with arguments, exit status, phase
 and stdout/stderr; final summaries include the underlying error rather than a wrapper.
@@ -152,6 +161,7 @@ https://p11-glue.github.io/p11-glue/p11-kit/manual/trust.html
 """
 import argparse
 import ast
+import csv
 import datetime
 import fcntl
 import grp
@@ -176,7 +186,7 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 23
+SCRIPT_REVISION = 24
 BASE_REPLACEMENTS = {'boost':('libboost-python-devel',),'boost-cpp':('libboost-devel',)}
 ROOTS = {
  '7DD78D5F4F13459A83DFF9ABBBA62EDBAF6F2D102BF257FD712F4D9F2746ED8D': 'emSign Root TLS CA - G3',
@@ -926,7 +936,7 @@ def conda_update_status(meta):
             'policy':'Conda and base packages update together in one transaction'}
 
 
-def select_conda_target(base, meta, origins, config, offline, runjson, logdir, row, say):
+def select_conda_target(base, meta, origins, config, offline, runjson, logdir, row, say, candidate_prefix=None):
     status=row['conda_update']
     if status['before'] is None:return CONDA_MINIMUM
     source=origins.get('conda') or requested_channels([],{k:v for k,v in config.items() if k!='pinned_packages'})[1][0]
@@ -945,8 +955,13 @@ def select_conda_target(base, meta, origins, config, offline, runjson, logdir, r
             latest,source,CONDA_MINIMUM,' (offline metadata may be stale)' if offline else ''))
     target=max((latest,status['before']),key=version)
     status.update(status='planned',latest_available=latest,source=source,target=target)
-    say('Base Conda update: installed=%s; newest stable=%s; target>=%s; same prefix, one base transaction'%(
-        status['before'],latest,target))
+    if candidate_prefix:
+        status['policy']='Fresh private candidate; source manager remains unchanged'
+        say('Candidate Conda target: source=%s; newest stable=%s; target>=%s; private prefix=%s'%(
+            status['before'],latest,target,candidate_prefix))
+    else:
+        say('Base Conda update: installed=%s; newest stable=%s; target>=%s; same prefix, one base transaction'%(
+            status['before'],latest,target))
     return target
 
 
@@ -1278,6 +1293,7 @@ def report_directory(directory):
 
 def report_existing(directory, verbose=False):
     directory = report_directory(directory)
+    if (directory/'stage-summary.json').is_file():return report_stage_existing(directory,verbose)
     results = json.loads((directory/'summary.json').read_text())
     logtext = (directory/'run.log').read_text(errors='replace') if (directory/'run.log').is_file() else ''
     print('READ-ONLY REPORT: '+str(directory))
@@ -1778,11 +1794,284 @@ def inspect_trust(base, prefixes=()):
     return 0 if good else 2
 
 
+def stage_source_state(base, meta=None):
+    """Fingerprint source package records and control files without changing them."""
+    if meta is None:meta=records(base)
+    controls={}
+    for name in ('.condarc','conda-meta/history','conda-meta/pinned','conda-meta/state',
+                 'etc/cse-trust/ca-bundle.pem','etc/cse-trust/use-ca.sh'):
+        try:controls[name]=hashlib.sha256((base/name).read_bytes()).hexdigest()
+        except FileNotFoundError:controls[name]=None
+        except OSError as exc:controls[name]={'unreadable':str(exc)}
+    return {'packages':hashlib.sha256(json.dumps(meta,sort_keys=True).encode()).hexdigest(),'controls':controls}
+
+
+def stage_requests(meta, intent, skipped, conda_minimum):
+    protected=set(MINIMUM)|{'conda','python','conda-libmamba-solver'}
+    unknown=set(skipped)-set(meta)-set(intent['roots'])
+    if unknown:raise RuntimeError('Unknown --stage-skip package(s): '+', '.join(sorted(unknown)))
+    if set(skipped)&protected:raise RuntimeError('Cannot omit required Conda/Python/security packages: '+', '.join(sorted(set(skipped)&protected)))
+    omitted=set(skipped)
+    for migration in intent['replacements']:
+        if migration['name'] in omitted:omitted.update(migration['replacements'])
+    roots=(set(intent['roots'])|{'conda','python','conda-libmamba-solver'})-omitted
+    specs=[n+'>='+MINIMUM[n] if n in MINIMUM else ('conda>='+conda_minimum if n=='conda' else n) for n in sorted(roots)]
+    return roots,specs,omitted
+
+
+def stage_comparison(before, after, original_roots, requested, omitted, ready):
+    rows=[]
+    for name in sorted(set(before)|set(after)|set(original_roots)):
+        old=before.get(name,{});new=after.get(name,{})
+        if not new:status='not-selected' if ready else 'not-installed'
+        elif not old:status='added'
+        elif old['version']!=new['version']:status='changed-version'
+        elif old['build']!=new['build']:status='changed-build'
+        else:status='unchanged'
+        note=''
+        if name in omitted:note='Request explicitly omitted; it may still be required as a dependency.'
+        elif not new and ready:note='Not selected by the new dependency graph; this does not establish unavailability.'
+        if not ready:note+=' Candidate is not verified; a joint solve failure does not establish individual package availability.'
+        rows.append({'package':name,'before_version':old.get('version',''),'before_build':old.get('build',''),
+                     'after_version':new.get('version',''),'after_build':new.get('build',''),'status':status,
+                     'role':'requested' if name in requested else 'original-request' if name in original_roots else 'dependency',
+                     'note':note.strip()})
+    return rows
+
+
+def write_stage_report(root, summary, before, after):
+    rows=stage_comparison(before,after,summary.get('original_roots',()),summary.get('requested_roots',()),
+                          summary.get('omitted_requests',()),summary['status']=='ready-for-review')
+    summary['comparison_counts']={s:sum(r['status']==s for r in rows) for s in sorted({r['status'] for r in rows})}
+    (root/'comparison.json').write_text(json.dumps(rows,indent=2))
+    with (root/'comparison.csv').open('w',newline='') as stream:
+        writer=csv.DictWriter(stream,fieldnames=['package','before_version','before_build','after_version','after_build','status','role','note'])
+        writer.writeheader();writer.writerows(rows)
+    (root/'stage-summary.json').write_text(json.dumps(summary,indent=2))
+    escape=lambda value:str(value).replace('|','\\|').replace('\n',' ')
+    lines=['# Private base candidate review','',
+           'Status: **'+summary['status']+'**','',
+           'Source base: `'+summary['source_base']+'`',
+           'Candidate prefix: `'+summary['candidate_prefix']+'`','',
+           'No promotion to the shared base was performed. The candidate must remain at its current prefix; it is not a relocatable replacement.',
+           'This comparison covers Conda-managed packages. Pip-installed applications are not automatically recreated.',
+           'Source package/control metadata unchanged: '+str(summary.get('source_metadata_unchanged','not checked'))+'.','',
+           'Counts: '+', '.join('%s=%d'%item for item in summary['comparison_counts'].items()),'',
+           'Version changes show the actual before/after values; they do not assert that every change is an upgrade.',
+           'Not-selected dependencies are not findings of deprecation or unavailability.','']
+    if summary.get('omitted_requests'):lines+=['Explicitly omitted requests: '+', '.join(summary['omitted_requests']), '']
+    if summary.get('non_conda_tools'):
+        lines+=['Runtime tools outside the source Conda inventory (not automatically recreated): '+
+                ', '.join('%s=%s'%item for item in sorted(summary['non_conda_tools'].items())), '']
+    if summary.get('source_permission_holds'):
+        lines+=['## Source access blockers','',
+                'These holds were not applied in the fresh private candidate. They still matter if a later update must replace files in the live base.','']
+        lines.extend('- `%s=%s=%s`: `%s` (%s)'%(h['name'],h['version'],h['build'],h['path'],h['reason']) for h in summary['source_permission_holds'])
+        lines.append('')
+    if summary['issues']:lines+=['## Issues','']+['- '+escape(issue) for issue in summary['issues']]+['']
+    lines+=['## Package comparison','','| Package | Source version / build | Candidate version / build | Result | Role |',
+            '| --- | --- | --- | --- | --- |']
+    for row in rows:
+        old=' / '.join(filter(None,(row['before_version'],row['before_build']))) or 'absent'
+        new=' / '.join(filter(None,(row['after_version'],row['after_build']))) or 'absent'
+        lines.append('| '+' | '.join(map(escape,(row['package'],old,new,row['status'],row['role'])))+' |')
+    lines+=['','See comparison.csv / comparison.json for per-package notes and command-*.json for complete solver/transaction output.',
+            'A failed candidate can contain partial files. Only ready-for-review means the complete installed plan and required minimums were verified.','']
+    (root/'review.md').write_text('\n'.join(lines))
+
+
+def report_stage_existing(root, verbose=False):
+    summary=json.loads((root/'stage-summary.json').read_text())
+    rows=json.loads((root/'comparison.json').read_text())
+    print('READ-ONLY PRIVATE CANDIDATE REPORT: '+str(root))
+    print('Captured status: '+summary['status'])
+    print('Source base: '+summary['source_base'])
+    print('Candidate prefix: '+summary['candidate_prefix'])
+    print('Source metadata unchanged at end of staging: '+str(summary.get('source_metadata_unchanged','not checked')))
+    print('Comparison: '+', '.join('%s=%s'%item for item in summary['comparison_counts'].items()))
+    for row in rows:
+        if row['status']=='unchanged' and not verbose:continue
+        print('  %s | %s=%s -> %s=%s | %s | %s'%(row['package'],row['before_version'] or 'absent',row['before_build'],
+              row['after_version'] or 'absent',row['after_build'],row['status'],row['note']))
+    for issue in summary['issues']:print('  Issue: '+issue)
+    print('Full review: '+str(root/'review.md'))
+    print('No updates, network requests or promotion performed. This is the saved staging result, not a current source or runtime check.')
+    return 0
+
+
+def stage_base(args, base, env):
+    """Build a fresh private candidate. Never update, clone or configure the source."""
+    destination=args.stage.expanduser()
+    if destination.exists() or destination.is_symlink():raise RuntimeError('Stage directory must be new; retain old candidates for comparison: '+str(destination))
+    root=destination.resolve()
+    if root.exists() or root.is_symlink():raise RuntimeError('Stage directory must be new; retain old candidates for comparison: '+str(root))
+    if root==base or base in root.parents or root in base.parents:
+        raise RuntimeError('Stage directory must be outside the source installation and its ancestors')
+    if any((p/'conda-meta/history').is_file() for p in root.parents):
+        raise RuntimeError('Stage directory must be outside existing Conda environments')
+    if any(c in str(root) for c in (os.pathsep,',','\n')):
+        raise RuntimeError('Stage path contains a Conda environment-variable path delimiter')
+    old_umask=os.umask(0o077)
+    try:root.mkdir(mode=0o700,parents=True,exist_ok=False)
+    except BaseException:
+        os.umask(old_umask);raise
+    candidate=root/'env';before={};after={};source=None;source_digest=None;baseline=None
+    summary={'script_revision':SCRIPT_REVISION,'source_base':str(base),'candidate_prefix':str(candidate),
+             'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+             'status':'preparing','phase':'prepare private stage','issues':[],'promotion_performed':False,'commands':[]}
+    env=dict(env,CONDA_PKGS_DIRS=str(root/'pkgs'),CONDA_ENVS_PATH=str(root/'environments'),
+             CONDA_REGISTER_ENVS='false',CONDA_SHORTCUTS='false',PYTHONDONTWRITEBYTECODE='1',
+             CONDA_NUMBER_CHANNEL_NOTICES='0',CONDA_REPORT_ERRORS='false',CONDA_AUTO_UPDATE_CONDA='false',
+             CONDA_NOTIFY_OUTDATED_CONDA='false')
+    for key,name in (('TMPDIR','tmp'),('XDG_CACHE_HOME','user-cache'),('XDG_CONFIG_HOME','user-config'),
+                     ('XDG_DATA_HOME','user-data'),('XDG_STATE_HOME','user-state')):
+        env[key]=str(root/name)
+    env.pop('CSE_CONDA_PERMISSION_HOLDS',None)
+    for key in list(env):
+        if re.fullmatch(r'CONDA_PREFIX(?:_\d+)?',key) or key in ('CONDA_EXE','CONDA_PYTHON_EXE','CONDA_DEFAULT_ENV',
+                'CONDA_SHLVL','CONDA_PROMPT_MODIFIER','CONDA_ROOT_PREFIX','MAMBA_ROOT_PREFIX'):
+            env.pop(key,None)
+    try:log=(root/'run.log').open('w',buffering=1)
+    except BaseException:
+        os.umask(old_umask);raise
+    def say(value):print(value,flush=True);log.write(value+'\n')
+    def run(values, phase, runtime=base, raw=False, program=None):
+        summary['phase']=phase;say('Staging: '+phase)
+        argv=[str(runtime/'bin/python'),'-I','-B','-c',program or LIBMAMBA_CLI]+([] if program else list(map(str,values)))
+        limit=None if values[0]=='create' and '--dry-run' not in values else (180 if values[0]=='search' or '--dry-run' in values else 30)
+        started=time.monotonic();finished=threading.Event()
+        def progress():
+            while not finished.wait(30):say('Still staging: %s (%ds elapsed)'%(phase,time.monotonic()-started))
+        heartbeat=threading.Thread(target=progress,daemon=True);heartbeat.start()
+        stdout=stderr='';code=None
+        try:
+            result=subprocess.run(argv,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=limit)
+            stdout,stderr,code=result.stdout,result.stderr,result.returncode
+        except subprocess.TimeoutExpired as exc:
+            decode=lambda v:v.decode(errors='replace') if isinstance(v,bytes) else v or ''
+            stdout,stderr=decode(exc.stdout),decode(exc.stderr)
+            raise RuntimeError('Private planning timed out after %ss; no candidate transaction attempted. '%limit+diagnostic_text(stdout,stderr)) from exc
+        finally:
+            finished.set();heartbeat.join()
+            name='command-%03d.json'%(len(summary['commands'])+1)
+            (root/name).write_text(json.dumps({'phase':phase,'argv':list(map(str,values)),'runtime':str(runtime),
+                                             'returncode':code,'stdout':stdout,'stderr':stderr},indent=2))
+            summary['commands'].append({'phase':phase,'file':name,'returncode':code})
+        if code:raise RuntimeError(diagnostic_text(stdout,stderr)+' | complete output: '+str(root/name))
+        if raw:return stdout
+        try:data=json.loads(stdout)
+        except ValueError as exc:raise RuntimeError('Invalid Conda JSON; see '+str(root/name)) from exc
+        if isinstance(data,dict) and data.get('success') is False:raise RuntimeError(diagnostic_text(stdout,stderr))
+        if isinstance(data,dict) and data.get('dry_run') and values[0]=='create' and '--dry-run' not in values:
+            raise RuntimeError('Candidate creation returned a dry run; no installation verified')
+        return data
+    try:
+        say('PRIVATE STAGING ONLY: '+str(root))
+        say('Source base is read only; candidate, package cache, trust files and reports stay under this private directory.')
+        for key in ('TMPDIR','XDG_CACHE_HOME','XDG_CONFIG_HOME','XDG_DATA_HOME','XDG_STATE_HOME'):
+            Path(env[key]).mkdir(mode=0o700)
+        before=records(base);baseline=stage_source_state(base,before)
+        summary['source_state_before']=baseline
+        (root/'source-packages.json').write_text(json.dumps(before,indent=2))
+        config=run(['config','--show','--json'],'read source configuration')
+        package_config={k:v for k,v in config.items() if k!='pinned_packages'}
+        _,urls,channel_args,origins,excluded,unknown=environment_channels(before,args.channel,package_config)
+        summary.update(channels=urls,excluded_sources=excluded,unknown_origins=unknown)
+        source=choose_source(args,config,base);source_digest=hashlib.sha256(source.read_bytes()).hexdigest()
+        text,removed=filtered_bundle([source]+args.extra_ca)
+        trust=root/'trust';trust.mkdir(mode=0o700);bundle=trust/'ca-bundle.pem';bundle.write_text(text)
+        empty=trust/'empty-ca-dir';empty.mkdir(mode=0o700)
+        summary.update(source_ca=str(source),source_ca_sha256=source_digest,filtered_roots=removed)
+        values={k:str(bundle) for k in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','CURL_CA_BUNDLE','PIP_CERT')}
+        values['SSL_CERT_DIR']=str(empty);env.update(values)
+        env['CONDA_OFFLINE']='true' if args.offline else 'false'
+        intent=base_package_intent(before,base,config,ignore_pins=True)
+        summary['intent']=intent
+        summary['original_roots']=sorted(set(intent['roots'])|{'conda','python','conda-libmamba-solver'})
+        summary['source_permission_holds']=list(permission_holds(base,before).values())
+        probe=run(['__cse_solver_probe__'],'load installed libmamba solver')
+        if probe.get('solver')!='libmamba':raise RuntimeError('Installed libmamba solver is unavailable')
+        source_audit=run(['<local Python audit>'],'inventory source runtime tools',program=AUDIT)
+        (root/'source-python-audit.json').write_text(json.dumps(source_audit,indent=2))
+        summary['non_conda_tools']={n:r for n,r in source_audit.get('packages',{}).items() if n not in before}
+        summary['conda_update']=conda_update_status(before)
+        search_origins=dict(origins)
+        if args.offline:
+            mirrors=[url for url in urls if url.startswith('file://')]
+            if not mirrors:raise RuntimeError('A fresh offline stage needs an approved --channel file:///mirror containing Conda and the requested packages; the source cache is not reused')
+            search_origins['conda']=mirrors[0]
+        target=select_conda_target(base,before,search_origins,config,args.offline,
+            lambda command:run(command[1:],'find newest stable Conda'),root,summary,say,candidate_prefix=candidate)
+        requested,specs,omitted=stage_requests(before,intent,args.stage_skip,target)
+        summary.update(requested_roots=sorted(requested),omitted_requests=sorted(omitted))
+        (root/'candidate-requests.txt').write_text('\n'.join(specs)+'\n')
+        (root/'source-explicit.txt').write_text(run(['list','-p',str(base),'--explicit'],'record source package URLs',raw=True))
+        common=['create','-p',str(candidate),'--solver','libmamba','--json','--no-pin','--no-default-packages','--no-shortcuts']+channel_args
+        if args.offline:common.append('--offline')
+        summary['status']='solving'
+        plan=run(common+specs+['--dry-run'],'solve fresh candidate (dry run)')
+        (root/'candidate-plan.json').write_text(json.dumps(plan,indent=2))
+        if plan.get('actions',{}).get('PREFIX',str(candidate))!=str(candidate):raise RuntimeError('Candidate plan targets another prefix')
+        check_plan(plan,None,requested)
+        final,exact=exact_plan_specs({},plan,{},args.channel,package_config)
+        verify_retained(final,requested)
+        verify_minimums(before,{n:{'version':v} for n,(v,b) in final.items()},True,target)
+        summary['status']='installing'
+        run(common+exact+['--yes'],'install exact candidate plan')
+        summary['status']='verifying';after=records(candidate)
+        (root/'candidate-packages.json').write_text(json.dumps(after,indent=2))
+        verify_installed_plan(final,after)
+        summary['security_verification']=verify_minimums(before,after,True,target)
+        if run(['__cse_solver_probe__'],'verify candidate Conda and solver',runtime=candidate).get('solver')!='libmamba':
+            raise RuntimeError('Candidate Conda/solver startup did not pass')
+        audit=run(['<local Python audit>'],'verify candidate runtime packages and bundles',runtime=candidate,program=AUDIT)
+        (root/'candidate-python-audit.json').write_text(json.dumps(audit,indent=2))
+        for name,current in audit.get('packages',{}).items():
+            if name in MINIMUM and version(current)<version(MINIMUM[name]):raise RuntimeError('Candidate runtime package below minimum: '+name)
+        for label,path in audit.get('bundles',{}).items():
+            if path and Path(path).is_file() and {h for h,pem in pem_entries(Path(path).read_text())}&set(ROOTS):
+                raise RuntimeError('Known incident roots remain in candidate '+label+': '+path)
+        run(['config','--file',str(candidate/'.condarc'),'--set','ssl_verify',str(bundle)],'configure private candidate trust',raw=True)
+        run(['env','config','vars','set','-p',str(candidate)]+[k+'='+v for k,v in values.items()],'configure private candidate activation',raw=True)
+        (root/'candidate-explicit.txt').write_text(run(['list','-p',str(candidate),'--explicit'],'record verified candidate package URLs',runtime=candidate,raw=True))
+        summary['conda_update'].update(status='candidate-verified',candidate_version=after['conda']['version'])
+        summary['status']='ready-for-review'
+    except (Exception,KeyboardInterrupt) as exc:
+        summary['status']={'solving':'solve-failed','installing':'install-failed','verifying':'verification-failed'}.get(summary['status'],'preparation-failed')
+        summary['issues'].append(str(exc));say('Candidate incomplete: '+str(exc));log.write(traceback.format_exc())
+        try:after=records(candidate) if candidate.is_dir() else {}
+        except (OSError,ValueError) as record_error:summary['issues'].append('Cannot inventory partial candidate: '+str(record_error))
+    finally:
+        try:
+            try:
+                if baseline is not None:
+                    summary['source_state_after']=stage_source_state(base)
+                    summary['source_metadata_unchanged']=summary['source_state_after']==baseline
+                    if not summary['source_metadata_unchanged']:
+                        summary['status']='source-changed';summary['issues'].append('Source metadata changed during staging; comparison is stale. No promotion performed.')
+                if source_digest is not None:
+                    summary['source_ca_unchanged']=hashlib.sha256(source.read_bytes()).hexdigest()==source_digest
+                    if not summary['source_ca_unchanged']:
+                        summary['status']='source-changed';summary['issues'].append('Source CA changed during staging; review the trust source.')
+            except (OSError,ValueError) as exc:
+                summary['status']='source-check-failed';summary['issues'].append('Cannot verify source metadata after staging: '+str(exc))
+            summary['finished_at']=datetime.datetime.now(datetime.timezone.utc).isoformat()
+            write_stage_report(root,summary,before,after)
+            say('Candidate status: '+summary['status'])
+            say('Review: '+str(root/'review.md'))
+            say('Package comparison: '+str(root/'comparison.csv'))
+            say('Shared base promotion performed: NO')
+        finally:log.close();os.umask(old_umask)
+    return 0 if summary['status']=='ready-for-review' else 2
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--version',action='version',version='patch_miniforge_trust.py revision %d'%SCRIPT_REVISION)
     ap.add_argument('miniforge', nargs='?', type=Path)
     ap.add_argument('--apply', action='store_true')
+    ap.add_argument('--stage',type=Path,metavar='NEW_PRIVATE_DIR',help='Solve and install a fresh private base candidate with comparison reports; source base stays read only; no --apply needed')
+    ap.add_argument('--stage-skip',action='append',default=[],metavar='PACKAGE',help='Omit this application request from --stage; repeatable; dependencies may still require it')
     ap.add_argument('--inspect-trust',action='store_true',help='Read actual CSE/base CA files and configuration; no updates')
     ap.add_argument('--trust-only',action='store_true',help='Only prepare/write the CSE bundle and shell snippet; no package/environment permission changes')
     scope=ap.add_mutually_exclusive_group()
@@ -1804,6 +2093,14 @@ def main():
     ap.add_argument('--chains-dir',type=Path,help='Approved local incident chain directory; no downloads')
     ap.add_argument('--log-dir',type=Path)
     args = ap.parse_args()
+    if args.stage_skip and not args.stage:ap.error('--stage-skip requires --stage')
+    if args.stage:
+        if args.apply or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.all_envs or args.only or args.include or args.exclude or args.scan_root or args.log_dir or args.chains_dir or args.upgrade_conda or args.diagnostic_timeout is not None:
+            ap.error('--stage cannot be combined with apply/report/diagnose/trust or other-environment modes; logs stay in the new private stage directory')
+        if any(not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*',name) for name in args.stage_skip):ap.error('--stage-skip takes package names only')
+        if os.geteuid()==0:ap.error('Run staging as your normal account, not root')
+        env=safe_environment();env['PYTHONDONTWRITEBYTECODE']='1'
+        return stage_base(args,find_base(args.miniforge,env),env)
     if args.diagnostic_timeout is not None and (not args.diagnose or args.diagnostic_timeout<=0):
         ap.error('--diagnostic-timeout requires --diagnose and a positive number of seconds')
     if (args.include or args.scan_root) and not args.all_envs:
