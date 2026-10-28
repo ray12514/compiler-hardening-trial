@@ -5,9 +5,105 @@ It updates selected shared conda environments and builds a CSE-managed, incident
 CA bundle from your existing site PEM. It leaves the OS and the inspection proxy unchanged.
 No external incident test endpoint is contacted.
 
+## Build a private candidate and compare before changing base
+
+Revision 24 adds a separate staging workflow for reviewing a complete base rebuild.
+It uses the existing Miniforge's solver to create a **fresh environment in a new
+private directory**. It does not update, clone, configure or normalize permissions
+in the source base, use its package cache, change module/Spack selection, or promote
+the candidate. No Miniforge installer is downloaded or rerun. Staging requires
+read access to the source and write access to your chosen private location; it
+does not require maintenance write access or membership in `cse`.
+
+Load the usual module, refresh the standalone script from `main`, and run:
+
+```bash
+python3 patch_miniforge_trust.py --version  # revision 24
+python3 patch_miniforge_trust.py --stage "$HOME/cse-base-review-1"
+python3 patch_miniforge_trust.py --report "$HOME/cse-base-review-1"
+```
+
+Pass `/actual/path/to/miniforge` before `--stage` if the loaded base is ambiguous.
+The destination must be new and outside existing Conda installations. `--stage`
+performs the private install directly; do not combine it with `--apply`. Candidate
+packages live in `cse-base-review-1/env`, with a separate cache, trust bundle,
+temporary/user-cache locations and reports under the private workspace. The
+workspace has mode `0700`; report files are private. The source PEM is read to
+prepare a private filtered copy, following the same interim trust policy described
+below. `--ca-bundle PATH` and `--extra-ca PATH` can select the site trust source.
+
+The request set comes from the source Conda inventory's application/history roots,
+with known Boost replacements and required Python, Conda, solver and security
+requests. Ordinary dependencies are selected together. Stored package pins,
+installed version/build locks and source permission holds are **not carried into
+the fresh candidate**. That lets a retained old Qt/PySide stack move to a newer
+compatible Qt/Kerberos/libpq combination. A solver message saying old Qt needs a
+particular `krb5` range is a joint dependency restriction, not evidence that Kerberos
+cannot be installed by itself. The source access holds are listed for later review;
+private staging does not repair those paths for a future in-place update.
+
+Inspect these files before deciding whether to update the real base:
+
+| File | Review purpose |
+| --- | --- |
+| `review.md` | Candidate status, issues, source access blockers and the complete comparison table |
+| `comparison.csv` / `comparison.json` | Every source/candidate package, actual versions/builds, request/dependency role and notes |
+| `candidate-requests.txt` | Application/security requests used for the fresh solve |
+| `source-packages.json` / `candidate-packages.json` | Full Conda package records; a partial failed candidate may lack the latter |
+| `source-explicit.txt` / `candidate-explicit.txt` | Exact package URLs for the source and verified candidate; not an automatic promotion command |
+| `source-python-audit.json` / `candidate-python-audit.json` | Runtime tools and certificate bundle checks |
+| `candidate-plan.json` / `command-*.json` | Validated native plan and complete command return codes/stdout/stderr |
+| `stage-summary.json` | Captured status, counts, required minimum checks and source metadata/trust fingerprints |
+
+Results distinguish `changed-version`, `changed-build`, `unchanged`, `added` and
+`not-selected`. Versions are shown explicitly; a change is not necessarily an
+upgrade. An old dependency absent from the new graph is **not** called deprecated
+or unavailable. The comparison covers Conda-managed packages. Other pip-installed
+applications are not automatically recreated; detected runtime tools outside that
+inventory are called out and need separate review.
+
+`ready-for-review` means the complete installed package records match the exact
+validated plan, required minimums passed, the candidate's own Conda/libmamba starts,
+and runtime tools/bundles passed the recorded checks. Run the normal application
+smoke checks in the candidate too. Source package/control fingerprints and the
+source CA are checked at the end; a concurrent change marks the comparison stale.
+The saved report describes that time, not a new check performed when reading it.
+
+If the joint solve fails, the solver output and comparison are still saved. No
+candidate install is attempted after a failed solve, and `not-installed` does not
+claim that each package is individually uninstallable. An install/runtime failure
+is likewise not reported as ready; the private candidate may contain partial work.
+Planning remains bounded at 180 seconds. An actual candidate transaction is not
+killed by that planning timeout. Packages are never silently dropped to make a
+failed solve appear successful.
+
+For an intentional retry without a particular application request, use another new
+workspace and exact package names from the report:
+
+```bash
+python3 patch_miniforge_trust.py --stage "$HOME/cse-base-review-2" \
+  --stage-skip PACKAGE
+```
+
+Repeat `--stage-skip` for additional requests. Conda/Python/solver and required
+security packages cannot be omitted. This removes a top-level request; another
+application may still require that package as a dependency, which the comparison
+shows. Omitting one Qt-related request does not guarantee that every Qt dependency
+disappears. To retain all applications, start without omissions and review the
+fresh candidate first. `--offline` staging requires an explicit approved
+`--channel file:///mirror` containing Conda and all requested packages; the fresh
+private cache cannot supply packages from the source cache.
+
+No command in this staging workflow commits the candidate to the shared base.
+Keep the candidate at its installed prefix: copying or renaming an entire Conda
+prefix is not a supported promotion method. A later reviewed base update must
+still handle the source permissions and revalidate the selected plan against the
+current base. Updating repository code on `main` is separate from promoting this
+private environment.
+
 ## Update Conda and base packages in the existing installation
 
-Revision 23 keeps the installed Miniforge distribution, prefix, module selection
+Revision 24 keeps the installed Miniforge distribution, prefix, module selection
 and Spack version pin. Miniforge `24.11.2-1` does not itself require a reinstall
 for an in-place Conda/base package update. No installer is downloaded or rerun.
 The default scope is **the loaded base only**. Other environments require an
@@ -20,7 +116,7 @@ python3 patch_miniforge_trust.py --base-only
 python3 patch_miniforge_trust.py --base-only --apply
 ```
 
-`python3 patch_miniforge_trust.py --version` should print revision 23. Each run
+`python3 patch_miniforge_trust.py --version` should print revision 24. Each run
 also records its revision so an older copied script can be identified directly.
 
 Use `--ca-bundle /path/to/CSE-existing-bundle.pem` when a particular existing site
@@ -243,7 +339,7 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
 
 The script was updated at commit `3cfb223ceb8ca59a128523627df0d187a75bc9a0`.
 That historical revision uses classic solving rather than the current single
-libmamba base transaction. Use the current `main` retrieval for revision 23.
+libmamba base transaction. Use the current `main` retrieval for revision 24.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
