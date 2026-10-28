@@ -148,6 +148,103 @@ class CachePermissionTests(unittest.TestCase):
   self.assertIn('owner/admin',advice);self.assertIn('non-writable directory',advice)
   self.assertIn('skips alone are nonfatal',advice)
 
+class PermissionHoldTests(unittest.TestCase):
+ def fixture(self,root):
+  prefix=pathlib.Path(root);(prefix/'bin/__pycache__').mkdir(parents=True)
+  source=prefix/'bin/android_deploy.py';source.write_text('print("old")\n')
+  cache=prefix/'bin/__pycache__/android_deploy.cpython-312.pyc';cache.write_bytes(b'original cache')
+  meta={'qt-tools':{'name':'qt-tools','version':'1','build':'old','files':['bin/android_deploy.py']},
+        'python':{'name':'python','version':'3.12.9','build':'0'},
+        'certifi':{'name':'certifi','version':'2024.12.14','build':'0'}}
+  return prefix,cache,meta
+ @unittest.skipIf(os.geteuid()==0,'Root can bypass the directory access denial')
+ def test_generated_cache_holds_its_source_package_and_updates_other_security_specs(self):
+  with tempfile.TemporaryDirectory() as directory:
+   prefix,cache,meta=self.fixture(directory);before=cache.stat();cache.parent.chmod(0o555)
+   try:
+    holds=m.permission_holds(prefix,meta)
+    self.assertEqual(set(holds),{'qt-tools'});self.assertIn('__pycache__',holds['qt-tools']['path'])
+    specs,constraint=m.permission_hold_specs(meta,['qt-tools','python','certifi>='+m.MINIMUM['certifi']],holds)
+    self.assertIn('qt-tools=1=old',specs);self.assertEqual(constraint,'python=3.12.*')
+    self.assertIn('certifi>='+m.MINIMUM['certifi'],specs)
+    self.assertEqual(cache.read_bytes(),b'original cache');self.assertEqual(cache.stat().st_ino,before.st_ino)
+    self.assertEqual(cache.parent.stat().st_mode&0o777,0o555)
+   finally:cache.parent.chmod(0o755)
+ def test_readonly_foreign_file_in_writable_directory_is_not_a_hold(self):
+  with tempfile.TemporaryDirectory() as directory:
+   prefix,cache,meta=self.fixture(directory);cache.chmod(0o444)
+   original=pathlib.Path.lstat
+   def foreign(path):
+    st=original(path)
+    if path==cache:
+     fields=list(st);fields[4]=os.geteuid()+1;return os.stat_result(fields)
+    return st
+   with patch.object(pathlib.Path,'lstat',foreign):self.assertEqual(m.permission_holds(prefix,meta),{})
+ def test_sticky_foreign_directory_and_file_are_held(self):
+  with tempfile.TemporaryDirectory() as directory:
+   prefix,cache,meta=self.fixture(directory);cache.parent.chmod(0o1777)
+   original=pathlib.Path.lstat
+   def foreign(path):
+    st=original(path)
+    if path in (cache,cache.parent):
+     fields=list(st);fields[4]=os.geteuid()+(1 if path==cache else 2);return os.stat_result(fields)
+    return st
+   # Record only the existing cache for this sticky-bit check.
+   meta['qt-tools']['files']=[str(cache.relative_to(prefix))]
+   with patch.object(pathlib.Path,'lstat',foreign):
+    holds=m.permission_holds(prefix,meta)
+   self.assertEqual(set(holds),{'qt-tools'});self.assertIn('Sticky',holds['qt-tools']['reason'])
+ def test_redirected_package_parent_is_held_without_touching_external_files(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=pathlib.Path(directory);prefix=root/'base';prefix.mkdir();outside=root/'outside';outside.mkdir()
+   (outside/'file').write_text('external');(prefix/'share').symlink_to(outside,target_is_directory=True)
+   holds=m.permission_holds(prefix,{'app':{'version':'1','build':'0','files':['share/file']}})
+   self.assertIn('app',holds);self.assertIn('symlink',holds['app']['reason'])
+   self.assertEqual((outside/'file').read_text(),'external')
+ def test_unowned_cache_name_alone_does_not_identify_a_package(self):
+  with tempfile.TemporaryDirectory() as directory:
+   prefix,cache,meta=self.fixture(directory);meta['qt-tools']['files']=[]
+   self.assertEqual(m.permission_holds(prefix,meta),{})
+ def test_security_minimum_or_newest_conda_cannot_be_relaxed_for_a_hold(self):
+  for name,current,minimum in (('certifi','2024.12.14',m.MINIMUM['certifi']),('conda','26.9.4','26.10.0')):
+   hold={'name':name,'version':current,'build':'0','path':'/blocked/cache.pyc','reason':'denied','python_files':True}
+   with self.subTest(name=name),self.assertRaisesRegex(RuntimeError,'Permission-held package '+name):
+    m.permission_hold_specs({name:hold},[name+'>='+minimum],{name:hold},minimum)
+ def test_held_dependency_is_retained_and_blocked_boost_migration_is_deferred(self):
+  meta={'app':{'depends':['dep']},'dep':{},'boost':{'channel':'conda-forge'}}
+  intent=m.base_package_intent(meta,ignore_pins=True,held={'dep','boost'})
+  self.assertIn('dep',intent['roots']);self.assertIn('boost',intent['roots'])
+  self.assertNotIn('libboost-python-devel',intent['roots']);self.assertEqual(intent['replacements'],[])
+ def test_same_build_relink_or_removal_of_held_package_is_rejected(self):
+  for action in ('LINK','UNLINK'):
+   with self.subTest(action=action),self.assertRaisesRegex(RuntimeError,'permission-held'):
+    m.verify_permission_holds({'actions':{action:[{'name':'qt-tools','version':'1','build':'old'}]}},{'qt-tools':{}})
+  m.verify_permission_holds({'actions':{'LINK':[{'name':'conda'}]}},{'qt-tools':{}})
+ def test_manifest_paths_cannot_leave_prefix(self):
+  for path in ('../outside/file','/outside/file','share/../../outside/file','share\\outside'):
+   with self.subTest(path=path),self.assertRaisesRegex(RuntimeError,'Unsafe installed package path'):
+    list(m.package_paths({'files':[path]}))
+ def test_inherited_transaction_guards_are_not_trusted(self):
+  with patch.dict(os.environ,{'CSE_CONDA_PERMISSION_HOLDS':'untrusted'}):
+   self.assertNotIn('CSE_CONDA_PERMISSION_HOLDS',m.safe_environment())
+ @unittest.skipIf(os.geteuid()==0,'Root can bypass the directory access denial')
+ def test_access_repair_releases_the_temporary_hold_on_the_next_check(self):
+  with tempfile.TemporaryDirectory() as directory:
+   prefix,cache,meta=self.fixture(directory);cache.parent.chmod(0o555)
+   try:self.assertEqual(set(m.permission_holds(prefix,meta)),{'qt-tools'})
+   finally:cache.parent.chmod(0o755)
+   self.assertEqual(m.permission_holds(prefix,meta),{});self.assertEqual(cache.read_bytes(),b'original cache')
+ def test_saved_success_report_lists_holds_without_calling_them_failed_updates(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=pathlib.Path(directory)
+   row={'prefix':'/site/base','status':'updated-with-skips','issues':[],
+        'permission_holds':[{'name':'qt-tools','version':'1','build':'old','path':'/site/base/bin/__pycache__/android_deploy.cpython-312.pyc','reason':'Directory denied'}]}
+   (root/'summary.json').write_text(json.dumps([row]))
+   with patch('sys.stdout',io.StringIO()) as output,patch.object(m.subprocess,'run') as run:
+    self.assertEqual(m.report_existing(root),0)
+   run.assert_not_called();self.assertIn('Deferred package: qt-tools=1=old',output.getvalue())
+   self.assertIn('Failure/review categories: none',output.getvalue())
+
 class ClassicConflictTests(unittest.TestCase):
  def test_maintenance_disables_broken_hints_even_if_inherited_enabled(self):
   with patch.dict(os.environ,{'CONDA_UNSATISFIABLE_HINTS':'true'}):
@@ -226,6 +323,67 @@ class LibmambaRuntimeTests(unittest.TestCase):
    self.assertEqual(linked,{'app','libboost-python-devel','libboost-devel'})
    self.assertTrue(all(r['version']=='2' for r in actions['LINK']))
    self.assertEqual(len(list((prefix/'conda-meta').glob('*.json'))),len(installed))
+
+class PermissionHoldRuntimeTests(unittest.TestCase):
+ @unittest.skipUnless(os.environ.get('CSE_CONDA_PYTHON'),'Set CSE_CONDA_PYTHON for native blocked-file transaction regression')
+ @unittest.skipIf(os.geteuid()==0,'Root can bypass the directory access denial')
+ def test_native_update_preserves_blocked_package_and_updates_free_package(self):
+  import hashlib,tarfile
+  with tempfile.TemporaryDirectory() as directory:
+   root=pathlib.Path(directory);channel=root/'channel';prefix=root/'prefix'
+   cache_path='bin/__pycache__/android_deploy.cpython-312.pyc';free_path='share/free-app.txt'
+   for subdir in ('linux-64','noarch'):
+    folder=channel/subdir;folder.mkdir(parents=True);packages={}
+    if subdir=='noarch':
+     for name,path in (('cse-held-app',cache_path),('cse-free-app',free_path)):
+      for value in ('1','2','3'):
+       record={'name':name,'version':value,'build':'0','build_number':0,
+               'depends':['cse-held-app >=2'] if name=='cse-free-app' and value=='3' else [],'subdir':'noarch','noarch':'generic'}
+       filename=name+'-'+value+'-0.tar.bz2';archive=folder/filename;content=(name+' version '+value+'\n').encode()
+       files={'info/index.json':json.dumps(record).encode(),'info/files':(path+'\n').encode(),path:content}
+       with tarfile.open(archive,'w:bz2') as tar:
+        for member,data in files.items():
+         info=tarfile.TarInfo(member);info.size=len(data);info.mode=0o644;tar.addfile(info,io.BytesIO(data))
+       payload=archive.read_bytes();packages[filename]=dict(record,size=len(payload),md5=hashlib.md5(payload).hexdigest(),sha256=hashlib.sha256(payload).hexdigest())
+    data={'info':{'subdir':subdir},'packages':packages,'packages.conda':{},'repodata_version':1}
+    for name in ('repodata.json','current_repodata.json'):(folder/name).write_text(json.dumps(data))
+   env=m.safe_environment();env.update(CONDA_OFFLINE='false',CONDA_REGISTER_ENVS='false',
+    CONDA_PKGS_DIRS=str(root/'cache'),CONDA_ENVS_PATH=str(root/'envs'),CONDA_REPODATA_USE_ZST='false')
+   common=['-p',str(prefix),'--solver','libmamba','--json','--yes','--override-channels',
+           '--channel',channel.as_uri(),'--strict-channel-priority']
+   def run(command,guard=False):
+    current=dict(env)
+    if guard:current['CSE_CONDA_PERMISSION_HOLDS']=json.dumps({'prefix':str(prefix),'packages':['cse-held-app']})
+    return subprocess.run([os.environ['CSE_CONDA_PYTHON'],'-I','-B','-c',m.LIBMAMBA_CLI]+command,
+                          env=current,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=30)
+   created=run(['create']+common+['cse-held-app=1','cse-free-app=1'])
+   self.assertEqual(created.returncode,0,created.stdout+created.stderr)
+   cache=prefix/cache_path;before=cache.stat();original=cache.read_bytes();cache.parent.chmod(0o555)
+   try:
+    denied=run(['install']+common+['cse-held-app=2','cse-free-app=2'])
+    self.assertNotEqual(denied.returncode,0);self.assertIn('Permission',denied.stdout+denied.stderr)
+    self.assertEqual(m.records(prefix)['cse-held-app']['version'],'1');self.assertEqual(cache.read_bytes(),original)
+    holds=m.permission_holds(prefix,m.records(prefix));self.assertEqual(set(holds),{'cse-held-app'})
+    refused=run(['install']+common+['cse-held-app=2','cse-free-app=2'],guard=True)
+    self.assertNotEqual(refused.returncode,0);self.assertIn('permission-held',refused.stdout+refused.stderr)
+    same_build=run(['install']+common+['--force-reinstall','cse-held-app=1'],guard=True)
+    self.assertNotEqual(same_build.returncode,0);self.assertIn('permission-held',same_build.stdout+same_build.stderr)
+    specs,_=m.permission_hold_specs(m.records(prefix),['cse-held-app','cse-free-app=2'],holds)
+    planned=run(['install']+common+['--update-all','--prune','--no-pin','--dry-run']+specs,guard=True)
+    self.assertEqual(planned.returncode,0,planned.stdout+planned.stderr)
+    plan=json.loads(planned.stdout);m.verify_permission_holds(plan,holds)
+    final,exact=m.exact_plan_specs(m.records(prefix),plan,{'cse-held-app':channel.as_uri()},[channel.as_uri()],{})
+    updated=run(['install']+common+['--prune','--no-pin']+exact,guard=True)
+    self.assertEqual(updated.returncode,0,updated.stdout+updated.stderr)
+    installed=m.records(prefix)
+    self.assertEqual(installed['cse-held-app']['version'],'1');self.assertEqual(installed['cse-free-app']['version'],'2')
+    self.assertEqual(cache.read_bytes(),original);self.assertEqual(cache.stat().st_ino,before.st_ino)
+    self.assertEqual((cache.stat().st_uid,cache.stat().st_gid,cache.stat().st_mode),(before.st_uid,before.st_gid,before.st_mode))
+    self.assertEqual(cache.parent.stat().st_mode&0o777,0o555)
+    incompatible=run(['install']+common+['cse-held-app=1','cse-free-app=3'],guard=True)
+    self.assertNotEqual(incompatible.returncode,0);self.assertIn('Unsatisfiable',incompatible.stdout+incompatible.stderr)
+    self.assertEqual(m.records(prefix)['cse-free-app']['version'],'2');self.assertEqual(cache.read_bytes(),original)
+   finally:cache.parent.chmod(0o755)
 
 class BasePinRuntimeTests(unittest.TestCase):
  @unittest.skipUnless(os.environ.get('CSE_CONDA_PYTHON'),'Set CSE_CONDA_PYTHON for native pin regression')
@@ -484,6 +642,12 @@ class BaseUpdatePolicyTests(unittest.TestCase):
   self.assertEqual(final,{'app':('2','new')});self.assertFalse(any('dep=' in spec for spec in exact))
   with self.assertRaisesRegex(RuntimeError,'removal'):m.check_plan(plan,None,{'dep'})
   with self.assertRaisesRegex(RuntimeError,'differ'):m.verify_installed_plan(final,dict(meta,app={'version':'2','build':'new'}))
+ def test_exact_plan_uses_actual_base_url_instead_of_a_canonical_site_channel_label(self):
+  for source in ('file:///opt/site/channel','https://mirror.example/site/science'):
+   with self.subTest(source=source):
+    plan={'actions':{'LINK':[{'name':'app','version':'2','build_string':'0','channel':'science','base_url':source}]}}
+    final,exact=m.exact_plan_specs({},plan,{},[source],{})
+    self.assertEqual(final,{'app':('2','0')});self.assertEqual(exact,[source+'::app=2=0'])
  def test_missing_retained_application_is_rejected(self):
   with self.assertRaisesRegex(RuntimeError,'jupyter'):m.verify_retained({'conda':('26.9.4','0')},{'conda','jupyter'})
  def test_base_plan_unpins_applications_and_updates_conda(self):
@@ -543,7 +707,8 @@ class BaseUpdatePolicyTests(unittest.TestCase):
 class BaseTransactionTests(unittest.TestCase):
  def run_loaded_base(self,apply=True,current=False,fail_install=False,offline=False,stale_install=False,
                      available=None,default_scope=False,all_envs=False,only=False,stale_plan=False,
-                     manager_stack=False,dry_run_install=False,missing_solver=False,prune_dependency=False,stale_removal=False,configured_pins=(),xkb_layout=False,xkb_uncached=False):
+                     manager_stack=False,dry_run_install=False,missing_solver=False,prune_dependency=False,stale_removal=False,configured_pins=(),xkb_layout=False,xkb_uncached=False,
+                     blocked_package=False,touch_hold=False):
   with tempfile.TemporaryDirectory() as directory:
    root=pathlib.Path(directory);base=root/'loaded-miniforge'
    (base/'bin').mkdir(parents=True);(base/'bin/conda').touch()
@@ -567,6 +732,11 @@ class BaseTransactionTests(unittest.TestCase):
    if prune_dependency:
     installed['legacy-runtime']={'name':'legacy-runtime','version':'1','build':'0','channel':'conda-forge'}
     installed['numpy']['depends']=['legacy-runtime']
+   if blocked_package:
+    name='certifi' if blocked_package=='security' else 'qt-tools'
+    if name not in installed:installed[name]={'name':name,'version':'1','build':'old','channel':'conda-forge'};updates[name]='2'
+    installed[name]['files']=['bin/android_deploy.py'];(base/'bin/android_deploy.py').write_text('original tool')
+    cache=base/'bin/__pycache__/android_deploy.cpython-312.pyc';cache.parent.mkdir();cache.write_bytes(b'original cache');cache.parent.chmod(0o555)
    if xkb_layout:
     installed['xkeyboard-config']={'name':'xkeyboard-config','version':'2.42','build':'0','channel':'conda-forge','files':[m.XKB_PATH+'/geometry/hp']};updates['xkeyboard-config']='2.48'
     source=base/m.XKB_PATH;(source/'geometry').mkdir(parents=True);(source/'geometry/hp').write_text('original map')
@@ -590,7 +760,9 @@ class BaseTransactionTests(unittest.TestCase):
       cache_ready=True
       return subprocess.CompletedProcess(cmd,0,'',json.dumps({'exception_name':'CondaExitZero','message':'Package caches prepared; transaction cancelled'}))
      elif '--dry-run' in cmd:
-      links=[dict(installed[n],version=v) for n,v in updates.items()]
+      held=set(json.loads(kwargs['env'].get('CSE_CONDA_PERMISSION_HOLDS','{}')).get('packages',()))
+      if held and 'python' in updates:updates['python']='3.12.10'
+      links=[dict(installed[n],version=v) for n,v in updates.items() if n not in held or touch_hold]
       if stale_plan:links[0]['version']=installed['conda']['version']
       output={'success':True,'actions':{'LINK':links}}
       if prune_dependency:output['actions']['UNLINK']=[dict(installed['legacy-runtime'])]
@@ -598,7 +770,9 @@ class BaseTransactionTests(unittest.TestCase):
       if dry_run_install:return subprocess.CompletedProcess(cmd,0,json.dumps({'success':True,'dry_run':True}),'')
       if fail_install:return subprocess.CompletedProcess(cmd,1,'','Package installation failed')
       if not stale_install:
-       for name,value in updates.items():installed[name]['version']=value
+       held=set(json.loads(kwargs['env'].get('CSE_CONDA_PERMISSION_HOLDS','{}')).get('packages',()))
+       for name,value in updates.items():
+        if name not in held:installed[name]['version']=value
       if prune_dependency and not stale_removal:installed.pop('legacy-runtime')
       if xkb_layout:
        new=base/'share/xkeyboard-config-2/geometry';new.mkdir(parents=True);(new/'hp').write_text('new map');(base/m.XKB_PATH).symlink_to(m.XKB_LINK)
@@ -610,6 +784,9 @@ class BaseTransactionTests(unittest.TestCase):
    argv=['patch_miniforge_trust.py']+scope+['--log-dir',str(root/'logs')]+(['--apply'] if apply else [])+(['--offline'] if offline else [])
    with patch.object(m.sys,'argv',argv),patch.dict(m.os.environ,{'CONDA_EXE':str(base/'bin/conda')}),patch.object(m.os,'geteuid',return_value=123),patch.object(m,'maintenance_gid',return_value=0),patch.object(m,'maintainable',return_value=True),patch.object(m,'choose_source',return_value=root/'source.pem'),patch.object(m,'filtered_bundle',return_value=('PEM',[])),patch.object(m,'atomic_write',side_effect=lambda path,data:pathlib.Path(path).write_text(data)),patch.object(m.subprocess,'run',side_effect=fake),patch.object(m,'public_permissions',return_value=[]),patch('sys.stdout',io.StringIO()):result=m.main()
    rows=json.loads((root/'logs/summary.json').read_text())
+   if blocked_package:
+    self.assertEqual(cache.read_bytes(),b'original cache');self.assertEqual(cache.parent.stat().st_mode&0o777,0o555)
+    cache.parent.chmod(0o755)
    if xkb_layout and apply:
     migration=rows[0].get('xkb_migration')
     if result==0:
@@ -632,6 +809,22 @@ class BaseTransactionTests(unittest.TestCase):
    self.assertIn(name,installs[0]);self.assertFalse(any('::'+name in value for value in installs[0]))
   self.assertEqual(installed['conda']['version'],'26.9.4');self.assertEqual(installed['numpy']['version'],'2.0')
   self.assertEqual(row['conda_update']['status'],'updated');self.assertNotIn('conda_bootstrap',row)
+ def test_blocked_package_is_deferred_while_conda_certifi_and_other_packages_update(self):
+  result,row,calls,installed=self.run_loaded_base(manager_stack=True,blocked_package=True)
+  self.assertEqual(result,0,row['issues']);self.assertEqual(row['status'],'updated-with-skips')
+  self.assertEqual([h['name'] for h in row['permission_holds']],['qt-tools'])
+  self.assertEqual(installed['qt-tools']['version'],'1');self.assertEqual(installed['conda']['version'],'26.9.4')
+  self.assertEqual(installed['certifi']['version'],m.MINIMUM['certifi']);self.assertEqual(installed['numpy']['version'],'2.0')
+  self.assertEqual(row['permission_python_constraint'],'python=3.12.*')
+  self.assertTrue(all('qt-tools=1=old' in c for c,e in calls if 'install' in c and '--dry-run' in c))
+ def test_blocked_outdated_security_package_stops_before_any_install(self):
+  result,row,calls,installed=self.run_loaded_base(manager_stack=True,blocked_package='security')
+  self.assertEqual(result,2);self.assertEqual(row['status'],'incomplete')
+  self.assertIn('Permission-held package certifi',' '.join(row['issues']));self.assertFalse(any('install' in c for c,e in calls))
+ def test_a_solver_plan_touching_a_hold_stops_before_the_transaction(self):
+  result,row,calls,installed=self.run_loaded_base(manager_stack=True,blocked_package=True,touch_hold=True)
+  self.assertEqual(result,2);self.assertIn('permission-held',' '.join(row['issues']))
+  self.assertFalse(any('install' in c and '--dry-run' not in c for c,e in calls))
  def test_ignored_base_channel_pin_does_not_reject_approved_channel_plan(self):
   result,row,calls,installed=self.run_loaded_base(configured_pins=['defaults::certifi==2024.12.14'])
   self.assertEqual(result,0,row['issues']);self.assertEqual(row['ignored_pins'],['defaults::certifi==2024.12.14'])
