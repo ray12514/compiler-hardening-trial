@@ -7,7 +7,8 @@ No external incident test endpoint is contacted.
 
 ## Build a private candidate and compare before changing base
 
-Revision 24 adds a separate staging workflow for reviewing a complete base rebuild.
+Revision 24 introduced a separate staging workflow for reviewing a complete base rebuild;
+revision 25 adds promotion of the reviewed set to that installation.
 It uses the existing Miniforge's solver to create a **fresh environment in a new
 private directory**. It does not update, clone, configure or normalize permissions
 in the source base, use its package cache, change module/Spack selection, or promote
@@ -18,7 +19,7 @@ does not require maintenance write access or membership in `cse`.
 Load the usual module, refresh the standalone script from `main`, and run:
 
 ```bash
-python3 patch_miniforge_trust.py --version  # revision 24
+python3 patch_miniforge_trust.py --version  # revision 25
 python3 patch_miniforge_trust.py --stage "$HOME/cse-base-review-1"
 python3 patch_miniforge_trust.py --report "$HOME/cse-base-review-1"
 ```
@@ -94,16 +95,97 @@ fresh candidate first. `--offline` staging requires an explicit approved
 `--channel file:///mirror` containing Conda and all requested packages; the fresh
 private cache cannot supply packages from the source cache.
 
-No command in this staging workflow commits the candidate to the shared base.
+No command in the staging workflow commits the candidate to the shared base.
 Keep the candidate at its installed prefix: copying or renaming an entire Conda
-prefix is not a supported promotion method. A later reviewed base update must
-still handle the source permissions and revalidate the selected plan against the
-current base. Updating repository code on `main` is separate from promoting this
+prefix is not a supported promotion method. After review, use the separate promotion
+workflow below. Updating repository code on `main` is separate from promoting the
 private environment.
+
+## Apply the accepted stage to its original base
+
+When the stage says `ready-for-review`, its packages have been fetched and installed
+under `STAGE_DIR/env`. Its five comparison categories are added packages, changed
+builds, changed versions, dependencies not selected by the new graph, and unchanged
+packages. `not-selected` is not a failed installation count. Review the recorded
+security checks and actual package versions as well as those counts.
+
+After accepting that result, refresh to revision 25 and load the same site
+environment and Miniforge used for staging. First validate the reviewed update
+against the current base, then apply it:
+
+```bash
+python3 patch_miniforge_trust.py --version  # revision 25
+python3 patch_miniforge_trust.py --promote "$HOME/cse-base-review-1"
+python3 patch_miniforge_trust.py --promote "$HOME/cse-base-review-1" --apply
+```
+
+`--promote` without `--apply` runs a real dependency dry run and leaves base packages,
+configuration and permissions unchanged. It writes private logs and can refresh the
+stage's package-cache metadata; add `--offline` to use its cached metadata/payloads.
+Both commands reject a stage from another Miniforge prefix or a source whose
+package/control metadata changed since staging. They check the saved plan against
+the candidate records, any still-present candidate environment, security minimums,
+platforms and checksums. A new Conda version search is not performed: this applies
+the accepted set rather than selecting newer releases behind the review.
+
+Apply uses the native Conda transaction at the **existing base path**. It installs
+the reviewed versions/builds, explicitly removes packages absent from the accepted
+candidate, and verifies the entire final Conda inventory. The native solver checks
+that its result matches the approved versions, builds, platforms and checksums
+before any unlink/link action, including the execution solve. Dependency/virtual
+package constraints still apply. Required Conda, certificate and maintenance
+versions, Conda/solver startup and runtime bundles are verified afterward. Shared
+trust is configured after the package verification; the source PEM is not rewritten
+by this trust configuration. Normal package-owned PEM updates remain package work.
+
+Promotion does not defer an older, conflicting package in place of an accepted new
+one. Access blockers on packages that must change are reported **before any base
+changes**. For the foreign-owned `bin/__pycache__` case, the owner/admin must repair
+the particular directory's write/traverse access if it is still blocked. Membership
+in `cse` alone cannot chmod another owner's paths. After an access-only repair,
+unchanged package/control fingerprints permit retrying the accepted promotion.
+An unexpected failure during installation is still incomplete; native rollback and
+the targeted XKB preservation/recovery apply, but the script does not claim a full
+filesystem snapshot or retry around a partial update.
+
+Use the normal maintenance window/snapshot and stop concurrent base package updates.
+The original Miniforge prefix and module/Spack selection are retained. Separate
+environments, including `BASE/envs/*`, are preserved; this is a base update, not an
+upgrade of every user's environment. Private logs contain
+`approved-promotion-plan.json`, the approved manifest SHA256, commands, removals,
+verified critical versions and the promotion status in `summary.json`. Read them
+with the normal `--report LOG_DIR` command. Restore the CSE shell settings after
+loading the site module with the printed `BASE/etc/cse-trust/use-ca.sh` snippet.
+
+### Repeat the process per system, including enterprise
+
+Different systems do not have to receive identical package inventories. On each
+distinct installation, load that system's site/enterprise environment first, then
+its own Miniforge module. Stage its base in a new system-specific private directory,
+review that result and promote it to that same base. Use explicit paths when the
+enterprise installation lives under a different directory:
+
+```bash
+# First run this site's normal enterprise-environment and Miniforge load commands.
+python3 patch_miniforge_trust.py /actual/enterprise/miniforge \
+  --stage "$HOME/cse-base-review-enterprise-1"
+python3 patch_miniforge_trust.py --report "$HOME/cse-base-review-enterprise-1"
+python3 patch_miniforge_trust.py /actual/enterprise/miniforge \
+  --promote "$HOME/cse-base-review-enterprise-1"
+python3 patch_miniforge_trust.py /actual/enterprise/miniforge \
+  --promote "$HOME/cse-base-review-enterprise-1" --apply
+```
+
+Use the actual site load commands and prefix; these examples do not invent a module
+name or switch an enterprise environment automatically. If several hosts mount one
+shared base filesystem, update that distinct installation once. Other installations
+get their own stage/review/promotion, not the first machine's manifest. This
+procedure introduces no separate GCC/compiler target or hardening-trial requirement;
+it uses the reviewed Conda package set and each site's existing surrounding setup.
 
 ## Update Conda and base packages in the existing installation
 
-Revision 24 keeps the installed Miniforge distribution, prefix, module selection
+Revision 25 keeps the installed Miniforge distribution, prefix, module selection
 and Spack version pin. Miniforge `24.11.2-1` does not itself require a reinstall
 for an in-place Conda/base package update. No installer is downloaded or rerun.
 The default scope is **the loaded base only**. Other environments require an
@@ -116,7 +198,7 @@ python3 patch_miniforge_trust.py --base-only
 python3 patch_miniforge_trust.py --base-only --apply
 ```
 
-`python3 patch_miniforge_trust.py --version` should print revision 24. Each run
+`python3 patch_miniforge_trust.py --version` should print revision 25. Each run
 also records its revision so an older copied script can be identified directly.
 
 Use `--ca-bundle /path/to/CSE-existing-bundle.pem` when a particular existing site
@@ -339,7 +421,7 @@ git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust
 
 The script was updated at commit `3cfb223ceb8ca59a128523627df0d187a75bc9a0`.
 That historical revision uses classic solving rather than the current single
-libmamba base transaction. Use the current `main` retrieval for revision 24.
+libmamba base transaction. Use the current `main` retrieval for revision 25.
 For a reproducible download, use the SSH clone block above and add this command
 immediately before its `git show` command:
 
