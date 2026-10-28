@@ -9,7 +9,7 @@ m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 class PromotionTests(unittest.TestCase):
  def fixture(self,root):
   base=root/'base';(base/'conda-meta').mkdir(parents=True);(base/'bin').mkdir()
-  (base/'bin/conda').touch();(base/'bin/python').touch();(base/'conda-meta/history').write_text('original history')
+  (base/'bin/conda').touch();(base/'bin/python').touch();(base/'bin/python').chmod(0o755);(base/'conda-meta/history').write_text('original history')
   (base/'.condarc').write_text('pinned_packages: [certifi==2024.12.14]\n')
   before={n:{'name':n,'version':v,'build':'0','subdir':'noarch','channel':'conda-forge','sha256':'a'*64,'md5':'b'*32} for n,v in (
    ('conda','24.11.2'),('python','3.12.8'),('conda-libmamba-solver','24.9.0'),('certifi','2024.12.14'),('ca-certificates','2024.12.14'),('pip','24.3.1'),('app','1'),('old-runtime','1'))}

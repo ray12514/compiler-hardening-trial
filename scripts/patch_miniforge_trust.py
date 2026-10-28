@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 25 (2026-10-28).
+"""CSE Miniforge certificate maintenance, revision 26 (2026-10-28).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py                       # preview loaded install
+  python3 patch_miniforge_trust.py --check-permissions   # read-only, all known blockers
   python3 patch_miniforge_trust.py /path/to/miniforge     # explicit install
   python3 patch_miniforge_trust.py --apply               # apply, approved channels
   python3 patch_miniforge_trust.py --stage ~/cse-candidate # build privately; review before changing base
@@ -191,7 +192,7 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 25
+SCRIPT_REVISION = 26
 BASE_REPLACEMENTS = {'boost':('libboost-python-devel',),'boost-cpp':('libboost-devel',)}
 ROOTS = {
  '7DD78D5F4F13459A83DFF9ABBBA62EDBAF6F2D102BF257FD712F4D9F2746ED8D': 'emSign Root TLS CA - G3',
@@ -638,8 +639,14 @@ def base_package_intent(meta, prefix=None, config=None, ignore_pins=False, held=
 
 def package_paths(record):
     """Read installed prefix manifests, rejecting paths outside the prefix."""
-    values=set(record.get('files') or ())
-    values.update(p['_path'] for p in record.get('paths_data',{}).get('paths',()) if p.get('_path'))
+    files=record.get('files') or ()
+    data=record.get('paths_data') or {}
+    if not isinstance(files,(list,tuple)) or not all(isinstance(p,str) for p in files) or not isinstance(data,dict):
+        raise RuntimeError('Malformed installed package file manifest')
+    paths=data.get('paths') or ()
+    if not isinstance(paths,(list,tuple)) or not all(isinstance(p,dict) for p in paths):raise RuntimeError('Malformed installed package path records')
+    values=set(files)
+    values.update(p['_path'] for p in paths if p.get('_path'))
     for value in sorted(values):
         p=Path(value)
         if not value or p.is_absolute() or '..' in p.parts or '\\' in value:
@@ -647,7 +654,26 @@ def package_paths(record):
         yield p
 
 
-def permission_holds(prefix, meta):
+def first_blocked_parent(prefix, path):
+    """Name the first untraversable ancestor whose owner may repair access."""
+    parents=list(reversed(Path(path).parents))
+    for parent in parents:
+        if not os.access(str(parent),os.X_OK):
+            # Missing directories are prospective creation paths, not hidden trees.
+            try:parent.lstat()
+            except FileNotFoundError:continue
+            except OSError:return parent
+            return parent
+    return None
+
+
+def hold_paths(holds):
+    for hold in holds.values():
+        yield from hold.get('blocked_paths') or [{'path':hold['path'],'reason':hold['reason'],
+                                                 'blocking_path':str(Path(hold['path']).parent)}]
+
+
+def permission_holds(prefix, meta, issues=None, include_directories=False):
     """Find package replacement blockers without writing, chmod or deletion.
 
     A foreign file owner is not itself a blocker: Unix rename/unlink depends on
@@ -655,29 +681,38 @@ def permission_holds(prefix, meta):
     This preflight cannot establish immutable flags, server policy or future ACLs.
     """
     holds={};directory_checks={}
-    python=meta.get('python',{}).get('version','').split('.')
+    python_record=meta.get('python',{})
+    python=str(python_record.get('version','') if isinstance(python_record,dict) else '').split('.')
     tag=''.join(python[:2]) if len(python)>=2 else None
     def directory_check(directory):
         if directory in directory_checks:return directory_checks[directory]
         if directory==prefix.parent:
-            result=(None,'Directory is outside the selected prefix')
+            result=(None,'Directory is outside the selected prefix',directory)
         else:
             try:
                 st=directory.lstat()
-                if stat.S_ISLNK(st.st_mode):result=(None,'Package parent is a symlink; access needs review')
-                elif not stat.S_ISDIR(st.st_mode):result=(None,'Package parent is not a directory')
-                elif not os.access(str(directory),os.W_OK|os.X_OK):result=(None,'Containing directory lacks effective write/traverse access')
+                if stat.S_ISLNK(st.st_mode):result=(None,'Package parent is a symlink; access needs review',directory)
+                elif not stat.S_ISDIR(st.st_mode):result=(None,'Package parent is not a directory',directory)
+                elif not os.access(str(directory),os.W_OK|os.X_OK):
+                    target=first_blocked_parent(prefix,directory/'entry') or directory
+                    result=(None,'Containing directory lacks effective write/traverse access',target)
                 else:
                     # Check ancestors for redirected paths, too; os.access has
                     # already checked effective traversal through them.
                     redirect=next((p for p in directory.parents if p!=prefix and prefix in p.parents and p.is_symlink()),None)
-                    result=(st,None) if redirect is None else (None,'Package parent traverses a symlink: '+str(redirect))
+                    result=(st,None,None) if redirect is None else (None,'Package parent traverses a symlink: '+str(redirect),redirect)
             except FileNotFoundError:result=directory_check(directory.parent)
-            except OSError as exc:result=(None,str(exc))
+            except OSError as exc:result=(None,str(exc),first_blocked_parent(prefix,directory/'entry') or directory)
         directory_checks[directory]=result
         return result
     for name,record in sorted(meta.items()):
-        paths=list(package_paths(record))
+        try:paths=list(package_paths(record))
+        except (TypeError,ValueError,RuntimeError,KeyError,AttributeError) as exc:
+            if issues is None:raise
+            issues.append({'path':str(prefix/'conda-meta'),'package':name,'reason':'Cannot inspect package manifest: '+str(exc)})
+            continue
+        directory_entries={Path(p['_path']) for p in ((record.get('paths_data') or {}).get('paths') or ())
+                           if p.get('_path') and p.get('path_type')=='directory'}
         candidates=list(paths);seen=set(paths)
         # Native packages can leave import-generated caches out of their manifest.
         # Associate only caches derived from a package-owned .py source, never
@@ -689,22 +724,28 @@ def permission_holds(prefix, meta):
                     if cache not in seen:candidates.append(cache);seen.add(cache)
         for relative in candidates:
             path=prefix/relative
-            reason=None;st=None
+            reason=None;st=None;exists=None
             try:
-                st=path.lstat()
-                if stat.S_ISDIR(st.st_mode):continue
-            except FileNotFoundError:st=None
+                st=path.lstat();exists=True
+                if stat.S_ISDIR(st.st_mode) and (not include_directories or relative in directory_entries):continue
+            except FileNotFoundError:st=None;exists=False
             except OSError as exc:
                 reason=str(exc)
-            parent,blocked=directory_check(path.parent)
+            parent,blocked,blocking_path=directory_check(path.parent)
             reason=reason or blocked
             if not reason and st is not None and parent.st_mode & stat.S_ISVTX and os.geteuid() not in (0,st.st_uid,parent.st_uid):
                 reason='Sticky containing directory prevents replacing another owner\'s file'
+                blocking_path=path.parent
             if reason:
-                holds[name]={'name':name,'version':record['version'],'build':record['build'],
-                             'path':str(path),'reason':reason,'access':access_snapshot(path),
-                             'python_files':any(p.suffix in ('.py','.pyc') for p in paths) or record.get('noarch')=='python'}
-                break
+                if name not in holds:
+                    holds[name]={'name':name,'version':record['version'],'build':record['build'],
+                                 'path':str(path),'reason':reason,'access':access_snapshot(path),
+                                 'python_files':any(p.suffix in ('.py','.pyc') for p in paths) or record.get('noarch')=='python',
+                                 'blocked_paths':[]}
+                holds[name]['blocked_paths'].append({'path':str(path),'reason':reason,
+                    'blocking_path':str(blocking_path or first_blocked_parent(prefix,path) or path.parent),
+                    'exists':exists,'file_uid':st.st_uid if st is not None else None,
+                    'file_gid':st.st_gid if st is not None else None})
     return holds
 
 
@@ -1204,6 +1245,9 @@ def final_summary(results, apply, bundle, say):
         if row.get('promotion'):
             p=row['promotion'];say('  Reviewed promotion: %s | %d packages | SHA256=%s | stage=%s'%(
                 p['status'],p['package_count'],p['manifest_sha256'],p['stage']))
+        if row.get('permission_preflight'):
+            a=row['permission_preflight'];say('  Permission preflight: %d affected paths; %d repair targets; %d inspection gaps | %s'%(
+                a['affected_path_count'],a['repair_target_count'],a['inspection_gap_count'],a['report_directory']))
         if row.get('reviewed_security_versions'):
             say('  Reviewed security versions (candidate): '+', '.join('%s=%s'%(n,v['version']) for n,v in sorted(row['reviewed_security_versions'].items())))
         for hold in row.get('permission_holds',[]):
@@ -1322,14 +1366,19 @@ def legacy_failure_details(logtext, prefix):
 def report_directory(directory):
     if str(directory)=='latest':
         root = Path.home()/'.cse-trust-logs'
-        candidates = [p for p in root.iterdir() if p.is_dir() and (p/'summary.json').is_file()]
+        candidates = [p for p in root.iterdir() if p.is_dir() and ((p/'summary.json').is_file() or (p/'permission-summary.json').is_file())]
         if not candidates: raise RuntimeError('No completed summary found under '+str(root))
-        directory = max(candidates,key=lambda p:p.name)
+        directory = max(candidates,key=lambda p:((p/'summary.json' if (p/'summary.json').is_file() else p/'permission-summary.json').stat().st_mtime_ns,p.name))
     return Path(directory).expanduser().resolve(strict=True)
 
 
 def report_existing(directory, verbose=False):
     directory = report_directory(directory)
+    if (directory/'permission-summary.json').is_file() and not (directory/'summary.json').is_file():
+        print('READ-ONLY PERMISSION REPORT: '+str(directory))
+        print((directory/'permission-preflight/permissions.txt').read_text())
+        print('Saved access evidence only; no updates, new scan or messages to owners were performed.')
+        return 0
     if (directory/'stage-summary.json').is_file():return report_stage_existing(directory,verbose)
     results = json.loads((directory/'summary.json').read_text())
     logtext = (directory/'run.log').read_text(errors='replace') if (directory/'run.log').is_file() else ''
@@ -1552,7 +1601,7 @@ def access_snapshot(path):
             try:
                 entry['extended_acl'] = 'system.posix_acl_access' in os.listxattr(str(candidate)) if hasattr(os,'listxattr') else 'unknown'
             except OSError as exc: entry['extended_acl'] = 'unreadable: '+str(exc)
-        except OSError as exc: entry['stat_error'] = str(exc)
+        except (OSError,RuntimeError) as exc: entry['stat_error'] = str(exc)
         return entry
     result = describe(p)
     result['captured_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -1847,7 +1896,174 @@ def promotion_differences(actual, expected):
     return sorted(differences)
 
 
-def load_promotion(directory, base):
+def permission_audit(base, directory=None, stage=None, ca_inputs=()):
+    started=time.monotonic();finished=threading.Event()
+    def heartbeat():
+        while not finished.wait(30):print('Permission preflight is still scanning known paths (%ds elapsed)'%(time.monotonic()-started),flush=True)
+    worker=threading.Thread(target=heartbeat,daemon=True);worker.start()
+    try:return collect_permission_audit(base,directory,stage,ca_inputs)
+    finally:finished.set();worker.join()
+
+
+def collect_permission_audit(base, directory=None, stage=None, ca_inputs=()):
+    """Collect known access blockers across packages; report only, never repair."""
+    root=(directory or Path.home()/'.cse-trust-logs'/('permissions-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))).expanduser().resolve()
+    if root==base or base in root.parents or root in base.parents or any((p/'conda-meta/history').is_file() for p in root.parents):
+        raise RuntimeError('Permission reports must be outside Conda environments')
+    root.mkdir(mode=0o700,parents=True,exist_ok=False);os.chmod(str(root),0o700)
+    report=root/'permission-preflight';report.mkdir(mode=0o700)
+    issues=[];meta={};blocks=[];record_files={}
+    try:
+        with os.scandir(base/'conda-meta') as entries:files=sorted(Path(e.path) for e in entries if e.name.endswith('.json'))
+    except OSError as exc:
+        files=[];issues.append({'path':str(base/'conda-meta'),'reason':'Cannot inventory package metadata: '+str(exc)})
+    for path in files:
+        try:
+            record=json.loads(path.read_text())
+            if not isinstance(record,dict) or not isinstance(record.get('name'),str) or not all(record.get(k) for k in ('name','version','build')):raise ValueError('Missing package identity')
+            meta[record['name']]=record
+            record_files[record['name']]=path
+        except (OSError,ValueError,TypeError) as exc:
+            issues.append({'path':str(path),'reason':'Cannot inventory this package metadata: '+str(exc)})
+    start=len(issues);holds=permission_holds(base,meta,issues=issues)
+    for issue in issues[start:]:
+        if issue.get('package') in record_files:issue['path']=str(record_files[issue['package']])
+    def append_holds(source,phase):
+        for name,hold in source.items():
+            for entry in hold.get('blocked_paths') or [{'path':hold['path'],'reason':hold['reason'],'blocking_path':str(Path(hold['path']).parent)}]:
+                blocks.append(dict(entry,package=name,phase=phase))
+    append_holds(holds,'installed package')
+    proposed={}
+    if stage:
+        try:
+            stage=stage.expanduser().resolve(strict=True)
+            summary=json.loads((stage/'stage-summary.json').read_text())
+            if Path(summary['source_base']).resolve()!=base:raise ValueError('Stage belongs to another base; load the intended environment/Miniforge')
+            proposed=json.loads((stage/'candidate-packages.json').read_text())
+            if not isinstance(proposed,dict):raise ValueError('Candidate inventory must be a package mapping')
+            valid={}
+            for name,record in proposed.items():
+                if not isinstance(record,dict) or record.get('name')!=name or not all(record.get(k) for k in ('version','build')):
+                    issues.append({'path':str(stage/'candidate-packages.json'),'package':name,'reason':'Cannot inspect malformed candidate package identity'})
+                else:valid[name]=record
+            proposed=valid
+            start=len(issues)
+            append_holds(permission_holds(base,proposed,issues=issues,include_directories=True),'candidate package')
+            for issue in issues[start:]:issue['path']=str(stage/'candidate-packages.json')
+        except (OSError,ValueError,TypeError,KeyError,RuntimeError) as exc:
+            proposed={}
+            issues.append({'path':str(stage),'reason':'Cannot inspect proposed package paths: '+str(exc)})
+    def control(path,flags,operation,optional=False):
+        try:
+            exists=path.exists()
+            if exists and os.access(str(path),flags):return
+            if not exists and optional:
+                parent=path.parent
+                while parent!=base.parent:
+                    try:
+                        parent.lstat();break
+                    except FileNotFoundError:parent=parent.parent
+                if os.access(str(parent),os.W_OK|os.X_OK):return
+                target=first_blocked_parent(base,path) or parent
+                reason='Cannot create control path: parent lacks write/traverse access'
+            else:
+                target=first_blocked_parent(base,path) or path
+                reason='Required '+operation+' access is unavailable'+(' (path missing)' if not exists else '')
+            blocks.append({'path':str(path),'blocking_path':str(target),'reason':reason,'package':'<base controls>',
+                           'phase':operation,'exists':exists})
+        except OSError as exc:
+            blocks.append({'path':str(path),'blocking_path':str(first_blocked_parent(base,path) or path),
+                           'reason':str(exc),'package':'<base controls>','phase':operation,'exists':None})
+    for path,flags,operation,optional in (
+        (base,os.R_OK|os.W_OK|os.X_OK,'base directory read/write/traverse',False),
+        (base/'conda-meta',os.R_OK|os.W_OK|os.X_OK,'metadata directory read/write/traverse',False),
+        (base/'conda-meta/history',os.R_OK|os.W_OK,'history read/write',False),
+        (base/'.condarc',os.R_OK|os.W_OK,'configuration read/write',True),
+        (base/'conda-meta/state',os.R_OK|os.W_OK,'activation state read/write',True),
+        (base/'bin/python',os.R_OK|os.X_OK,'Python bootstrap read/execute',False),
+        (base/'bin/conda',os.R_OK,'Conda entry point read',False),
+        (base/'etc/cse-trust',os.R_OK|os.W_OK|os.X_OK,'trust directory read/write/traverse',True),
+        (base/'etc/cse-trust/maintenance.lock',os.R_OK|os.W_OK,'maintenance lock read/write',True),
+        (base/'etc/cse-trust/ca-bundle.pem',os.R_OK,'existing trust bundle read',True),
+        (base/'etc/cse-trust/use-ca.sh',os.R_OK,'existing trust snippet read',True)):
+        control(path,flags,operation,optional)
+    if stage:control(stage/'pkgs',os.R_OK|os.W_OK|os.X_OK,'stage cache read/write/traverse',True)
+    for source in ca_inputs:control(Path(os.path.abspath(str(source.expanduser()))),os.R_OK,'explicit CA source read')
+    for issue in issues:
+        path=Path(issue['path']);blocks.append(dict(issue,blocking_path=str(first_blocked_parent(base,path) or path),
+            package=issue.get('package','<unknown inventory>'),phase='inspection gap',exists=None))
+    merged={};targets={}
+    for block in blocks:
+        key=(block['package'],block['path'],block['blocking_path'],block['reason'])
+        if key not in merged:merged[key]=dict(block,phases=[])
+        if block['phase'] not in merged[key]['phases']:merged[key]['phases'].append(block['phase'])
+    rows=list(merged.values())
+    for row in rows:
+        name=row['package']
+        row['required_for_promotion']=not stage or name.startswith('<') or name not in meta or name not in proposed or (
+            meta[name].get('version'),meta[name].get('build'))!=(proposed[name].get('version'),proposed[name].get('build'))
+        path=row['blocking_path']
+        if path not in targets:
+            access=access_snapshot(path)
+            opaque=access.get('mode','').startswith('l') or (not access.get('access',{}).get('execute_or_traverse',True) and access.get('mode','').startswith('d'))
+            advice='Owner/admin should review the named path access/ACL and the reported operation; then rerun this audit. No automatic chmod or deletion was performed.'
+            if Path(path).name=='__pycache__':
+                parent_record=access.get('parent_directory',{});parent=parent_record.get('access',{})
+                sticky_ok=not parent_record.get('sticky') or os.geteuid() in (0,parent_record.get('uid'),access.get('uid'))
+                if parent.get('write') and parent.get('execute_or_traverse') and sticky_ok:
+                    advice+=' Its parent is writable and traversable: preserving the old cache directory by rename and creating a fresh shared cache may be a workaround after verifying its contents are disposable generated caches; filesystem policy may still restrict it.'
+                    if opaque:advice+=' The contents could not be inspected; owner/admin review is required before treating them as disposable.'
+            targets[path]={'path':path,'access':access,'owner':access['owner'],'uid':access['uid'],'group':access['group'],
+                           'affected_packages':[],'affected_paths':[],'reasons':[],'uninspected_contents':opaque,'advice':advice}
+        target=targets[path]
+        for field,value in (('affected_packages',row['package']),('affected_paths',row['path'])):
+            if value not in target[field]:target[field].append(value)
+        if row['reason'] not in target['reasons']:target['reasons'].append(row['reason'])
+    by_owner={}
+    for target in targets.values():by_owner.setdefault(target['owner'],[]).append(target)
+    opaque_paths=[p for p,t in targets.items() if t['uninspected_contents']]
+    gap_paths={p['path'] for p in issues}|set(opaque_paths)
+    result={'base':str(base),'report_directory':str(report),'captured_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'installed_packages_inspected':len(meta),'candidate_packages_inspected':len(proposed),'affected_path_count':len(rows),
+            'repair_target_count':len(targets),'inspection_gaps':issues,'inspection_gap_count':len(gap_paths),
+            'uninspected_directories':opaque_paths,'targets':list(targets.values()),
+            'promotion_blocking_path_count':sum(r['required_for_promotion'] for r in rows),
+            'status':'blocked' if rows else 'no-detected-blockers','source_changes_attempted':False,
+            'coverage':'Known installed manifest paths, source-associated caches, optional candidate paths and base controls; inaccessible contents/untracked files, immutable flags, server policy and future changes cannot be fully proved by this read-only audit.'}
+    old_umask=os.umask(0o077)
+    try:
+        (report/'permissions.json').write_text(json.dumps({'summary':result,'paths':rows},indent=2))
+        (report/'permissions-by-owner.json').write_text(json.dumps(by_owner,indent=2))
+        def lines(items):
+            output=[]
+            for item in items:
+                a=item['access'];output+=['%s | owner=%s uid=%s group=%s mode=%s'%(item['path'],item['owner'],item['uid'],item['group'],a.get('mode','unknown')),
+                    '  Packages: '+', '.join(item['affected_packages']),'  Reasons: '+'; '.join(item['reasons']),
+                    '  Effective access: '+str(a.get('access',a.get('stat_error','unknown'))),
+                    '  ACL: '+str(a.get('extended_acl','unknown')),'  Uninspected directory contents: '+str(item['uninspected_contents']),
+                    '  Advice: '+item['advice']]
+                output.extend('    '+p for p in item['affected_paths'])
+            return '\n'.join(output)+'\n'
+        (report/'permissions.txt').write_text('Read-only permission preflight; source was not modified.\n'+result['coverage']+'\n\n'+lines(targets.values()))
+        for owner,items in by_owner.items():
+            uid=items[0]['uid'];(report/('permissions-owner-%s.txt'%(uid if uid is not None else 'unknown'))).write_text(lines(items))
+        with (report/'permissions.csv').open('w',newline='') as stream:
+            writer=csv.DictWriter(stream,fieldnames=['package','path','blocking_path','owner','uid','group','file_uid','file_gid','reason','exists','required_for_promotion','phases'])
+            writer.writeheader()
+            for row in rows:
+                target=targets[row['blocking_path']]
+                writer.writerow({key:(', '.join(row['phases']) if key=='phases' else target[key] if key in ('owner','uid','group') else row.get(key,'')) for key in writer.fieldnames})
+        (root/'permission-summary.json').write_text(json.dumps(result,indent=2))
+    finally:os.umask(old_umask)
+    print('Permission preflight: %s | %d affected paths | %d repair targets | %d inspection gaps'%(
+        result['status'],len(rows),len(targets),len(gap_paths)),flush=True)
+    print('Full owner/group report: '+str(report/'permissions.txt'),flush=True)
+    print('Reports for owner review: '+str(report/'permissions-by-owner.json')+' and permissions-owner-UID.txt',flush=True)
+    print('This scan covers known paths; hidden contents and future filesystem/runtime restrictions may require a later check.',flush=True)
+    return {'root':root,'summary':result,'holds':holds}
+
+
+def load_promotion(directory, base, holds=None):
     root=directory.expanduser().resolve(strict=True)
     if base==root or base in root.parents or root in base.parents:
         raise RuntimeError('Reviewed stage must be outside the live base')
@@ -1879,7 +2095,8 @@ def load_promotion(directory, base):
     if (root/'env/conda-meta').is_dir():
         differences=promotion_differences(records(root/'env'),packages)
         if differences:raise RuntimeError('Staged candidate changed after review: '+', '.join(differences))
-    before=records(base);holds=permission_holds(base,before)
+    before=records(base)
+    if holds is None:holds=permission_holds(base,before)
     blocked=[h for n,h in holds.items() if n not in packages or
              (before[n]['version'],before[n]['build'])!=(packages[n]['version'],packages[n]['build'])]
     if blocked:
@@ -2171,6 +2388,7 @@ def main():
     ap.add_argument('--stage',type=Path,metavar='NEW_PRIVATE_DIR',help='Solve and install a fresh private base candidate with comparison reports; source base stays read only; no --apply needed')
     ap.add_argument('--stage-skip',action='append',default=[],metavar='PACKAGE',help='Omit this application request from --stage; repeatable; dependencies may still require it')
     ap.add_argument('--promote',type=Path,metavar='REVIEWED_STAGE_DIR',help='Validate the reviewed exact set against its original base; add --apply to install it in place')
+    ap.add_argument('--check-permissions',action='store_true',help='Read-only complete known-path permission preflight with private owner-grouped reports; may combine with --promote to inspect candidate paths')
     ap.add_argument('--inspect-trust',action='store_true',help='Read actual CSE/base CA files and configuration; no updates')
     ap.add_argument('--trust-only',action='store_true',help='Only prepare/write the CSE bundle and shell snippet; no package/environment permission changes')
     scope=ap.add_mutually_exclusive_group()
@@ -2193,6 +2411,8 @@ def main():
     ap.add_argument('--log-dir',type=Path)
     args = ap.parse_args()
     if args.stage_skip and not args.stage:ap.error('--stage-skip requires --stage')
+    if args.check_permissions and (args.apply or args.stage or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.all_envs or args.only or args.include or args.exclude or args.scan_root or args.channel or args.upgrade_conda or args.chains_dir or args.diagnostic_timeout is not None):
+        ap.error('--check-permissions is read only and base scoped; combine only with --promote, --log-dir and source/offline options')
     if args.stage:
         if args.apply or args.promote or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.all_envs or args.only or args.include or args.exclude or args.scan_root or args.log_dir or args.chains_dir or args.upgrade_conda or args.diagnostic_timeout is not None:
             ap.error('--stage cannot be combined with apply/report/diagnose/trust or other-environment modes; logs stay in the new private stage directory')
@@ -2218,14 +2438,24 @@ def main():
         if args.apply or args.trust_only: ap.error('--inspect-trust cannot be combined with --apply/--trust-only')
         base=find_base(args.miniforge,safe_environment())
         return inspect_trust(base,[p.expanduser().resolve() for p in args.only])
+    preflight=None
+    if args.promote or args.check_permissions:
+        if os.geteuid()==0:ap.error('Run permission preflight as the maintenance account, not root; root access hides user restrictions')
+        audit_env=safe_environment();audit_env['PYTHONDONTWRITEBYTECODE']='1'
+        audit_base=args.miniforge.expanduser().resolve() if args.miniforge else find_base(None,audit_env)
+        preflight=permission_audit(audit_base,args.log_dir,args.promote,([args.ca_bundle] if args.ca_bundle else [])+args.extra_ca)
+        if args.check_permissions:return 2 if preflight['summary']['affected_path_count'] else 0
+        if preflight['summary']['promotion_blocking_path_count']:
+            print('Promotion stopped before base changes; review all reported paths and inspection gaps, then rerun the audit.')
+            return 2
     if os.geteuid() == 0: ap.error('Run as the software maintenance account, not root')
     cse_gid = maintenance_gid()  # validate before any deployment changes
     os.umask(0o002)
     env = safe_environment()
     if args.promote:env['PYTHONDONTWRITEBYTECODE']='1'
-    base = find_base(args.miniforge,env); conda = base/'bin/conda'
+    base = Path(preflight['summary']['base']) if preflight else find_base(args.miniforge,env); conda = base/'bin/conda'
     if not maintainable(base): raise RuntimeError('No user/group maintenance access to base')
-    approved=load_promotion(args.promote,base) if args.promote else None
+    approved=load_promotion(args.promote,base,holds=preflight['holds']) if args.promote else None
     if approved:
         env.update(CONDA_PKGS_DIRS=str(approved['root']/'pkgs'),CONDA_REGISTER_ENVS='false',CONDA_SHORTCUTS='false',
                    CONDA_NUMBER_CHANNEL_NOTICES='0',CONDA_REPORT_ERRORS='false',CONDA_SAFETY_CHECKS='enabled',
@@ -2243,10 +2473,10 @@ def main():
     exclusions=[p.expanduser().resolve() for p in args.exclude]
     prefixes=[p for p in prefixes if not any(p==x or x in p.parents for x in exclusions)]
     if not prefixes: raise RuntimeError('No prefixes selected after exclusions')
-    logdir = (args.log_dir or Path.home()/'.cse-trust-logs'/datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')).expanduser().resolve()
+    logdir = preflight['root'] if preflight else (args.log_dir or Path.home()/'.cse-trust-logs'/datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')).expanduser().resolve()
     if any(logdir == p or p in logdir.parents for p in prefixes):
         raise RuntimeError('Logs must be outside all selected environment trees')
-    logdir.mkdir(mode=0o700,parents=True,exist_ok=False)
+    if not preflight:logdir.mkdir(mode=0o700,parents=True,exist_ok=False)
     os.chmod(str(logdir),0o700)
     log = open(str(logdir/'run.log'),'w',buffering=1)
     def say(s): print(s,flush=True);log.write(s+'\n')
@@ -2372,6 +2602,7 @@ def main():
         return 0
     for i,prefix in enumerate(prefixes):
         row = {'prefix':str(prefix),'status':'incomplete','issues':[],'skipped_paths':[],'changes_started':False,'ownership':path_owner(prefix)};results.append(row)
+        if preflight:row['permission_preflight']={key:preflight['summary'][key] for key in ('report_directory','affected_path_count','repair_target_count','inspection_gap_count')}
         say('\nPrefix: '+str(prefix)+(' [BASE]' if prefix==base else ''))
         try:
             eligible = (prefix/'conda-meta/history').is_file() and maintainable(prefix) and maintainable(prefix/'conda-meta')
@@ -2417,7 +2648,7 @@ def main():
             holds={}
             if broad:
                 row['phase']='inspect installed package path access'
-                holds=permission_holds(prefix,meta)
+                holds=preflight['holds'] if preflight else permission_holds(prefix,meta)
                 row['permission_holds']=list(holds.values())
                 (logdir/'base-permission-holds.json').write_text(json.dumps(row['permission_holds'],indent=2))
                 for hold in holds.values():
@@ -2623,7 +2854,7 @@ def main():
             row['phase'] = 'normalize shared permissions'
             row['permissions'] = {}
             permissions = public_permissions(prefix,base,args.apply,detail,row['skipped_paths'],
-                                             args.exclude+[base/PATH_BACKUPS]+[Path(h['path']).parent for h in holds.values()],row['permissions'])
+                                             args.exclude+[base/PATH_BACKUPS]+sorted({Path(p['blocking_path']) for p in hold_paths(holds)}),row['permissions'])
             skipped_paths.extend(row['skipped_paths'])
             row['permission_warnings'] = permissions
             row['status']='incomplete' if row['issues'] else (('updated' if args.apply else 'previewed') + ('-with-skips' if permissions or holds else ''))
