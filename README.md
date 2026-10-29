@@ -1,7 +1,8 @@
 # Compiler hardening trial
 
 Maintaining the shared Miniforge base installations? Use the
-[base-only team rollout guide](docs/miniforge-base-rollout.md). It covers private
+[short two-file handoff README](docs/miniforge-base-handoff.md) for the normal
+sequence, or the [detailed rollout guide](docs/miniforge-base-rollout.md). They cover private
 staging, review, promotion, permissions, native PEM filtering and user checks;
 the standalone script also prints the sequence with `--base-guide`.
 User-facing package change lists are collected in the

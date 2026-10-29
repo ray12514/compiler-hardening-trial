@@ -1,5 +1,9 @@
 # Miniforge base rollout: team handoff
 
+For a transferred folder containing just the script and a short README, use the
+[short handoff instructions](miniforge-base-handoff.md). This page is the detailed
+reference, including retrieval and historical report recovery.
+
 Use this sequence for the remaining machines and each distinct GCC/Intel
 Miniforge installation. Scope: refresh **base**, normalize its eligible shared
 permissions, filter its existing PEM certificate files, and verify normal user
