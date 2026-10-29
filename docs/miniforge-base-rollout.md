@@ -15,10 +15,11 @@ Different installations get their own stage, review, promotion and reports. If
 multiple machines mount the same shared installation, update that installation
 once rather than running competing updates against it.
 
-## 1. Retrieve the current script and load the intended setup
+## 1. Retrieve the script and short README, then load the intended setup
 
-Use your usual GitHub SSH access. From the directory where you keep the
-standalone script, this retrieves it without checking out repository files:
+Use your usual GitHub SSH access. Run this from the intended handoff directory.
+It writes the standalone script and short guide (`README.md`) into that current
+directory, along with their source commit record. No repository checkout is kept:
 
 ```bash
 (
@@ -31,9 +32,14 @@ standalone script, this retrieves it without checking out repository files:
     "$cse_fetch_dir/repo"
   git -C "$cse_fetch_dir/repo" show HEAD:scripts/patch_miniforge_trust.py \
     > ./patch_miniforge_trust.py
+  git -C "$cse_fetch_dir/repo" show HEAD:docs/miniforge-base-handoff.md \
+    > ./README.md
   git -C "$cse_fetch_dir/repo" rev-parse HEAD > ./patch_miniforge_trust.commit
 )
 ```
+
+The script and README come from the same commit. Open `README.md` for the short
+step-by-step sequence; copy these files together when handing off to a teammate.
 
 Omit `--filter=blob:none` if the site's Git is too old to support it. Load the
 site's usual environment/compiler modules, then its intended Miniforge module.

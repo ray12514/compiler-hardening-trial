@@ -522,11 +522,12 @@ or not-writable path and is reported separately. The diagnostic prints your
 UID/groups and current effective access to the prefix, `conda-meta`, `.condarc`
 and the actual package caches without changing their permissions.
 
-## Retrieve just the script over SSH
+## Retrieve the script and short README over SSH
 
 Use your usual GitHub SSH key and configuration. This retrieves a shallow Git repository
-with file contents fetched on demand, then extracts only the script into your working
-directory. Repository files are not checked out. Run from a directory where you want the script:
+with file contents fetched on demand, then extracts the script and short guide as
+`README.md` into your current working directory. No repository checkout is kept.
+Run from the intended handoff directory:
 
 ```bash
 (
@@ -541,21 +542,27 @@ directory. Repository files are not checked out. Run from a directory where you 
 
   git -C "$cse_fetch_dir/repo" show HEAD:scripts/patch_miniforge_trust.py \
     > ./patch_miniforge_trust.py
+  git -C "$cse_fetch_dir/repo" show HEAD:docs/miniforge-base-handoff.md \
+    > ./README.md
 
   git -C "$cse_fetch_dir/repo" rev-parse HEAD \
     > ./patch_miniforge_trust.commit
 )
 ```
 
-The temporary Git checkout is removed; the script and its source commit record remain.
+The temporary Git checkout is removed; the script, `README.md` and source commit
+record remain. Both files come from the same commit. Open `README.md` for the
+short ordered procedure, or copy the files together into your shared handoff area.
 For older Git versions without partial-clone support, omit `--filter=blob:none`.
-That transfers more repository data but still extracts just the script.
+That transfers more repository data but still extracts only the handoff files.
 
-If you already have this repository cloned, extract the local checkout's version:
+If you already have this repository cloned, extract both files from its local commit:
 
 ```bash
 git -C /path/to/compiler-hardening-trial show HEAD:scripts/patch_miniforge_trust.py \
   > ./patch_miniforge_trust.py
+git -C /path/to/compiler-hardening-trial show HEAD:docs/miniforge-base-handoff.md \
+  > ./README.md
 ```
 
 ### Reproduce the earlier revision 12 exactly
