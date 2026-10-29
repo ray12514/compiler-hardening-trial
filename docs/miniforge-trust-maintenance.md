@@ -1,5 +1,12 @@
 # CSE Miniforge trust maintenance
 
+For the ordered base-only team procedure, start with the
+[base rollout handoff](miniforge-base-rollout.md), or run the standalone script's
+`--base-guide` (revision 29 or newer). This page is the detailed command reference.
+For user-facing package changes and recovering lists from older completed runs,
+see the handoff's [change-list instructions](miniforge-base-rollout.md#generate-the-user-facing-package-change-list)
+and the [update index](miniforge-updates/README.md).
+
 The maintenance script is [scripts/patch_miniforge_trust.py](../scripts/patch_miniforge_trust.py).
 It offers local maintenance of existing Miniforge PEM files and a separate workflow
 for updating shared Conda packages with a managed site CA bundle. It leaves the OS and the inspection proxy unchanged.

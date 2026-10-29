@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 28 (2026-10-28).
+"""CSE Miniforge certificate maintenance, revision 29 (2026-10-29).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
+  python3 patch_miniforge_trust.py --base-guide          # ordered team rollout guide
+  python3 patch_miniforge_trust.py --export-changes /path/to/run --changes-output /new/user-notes
   python3 patch_miniforge_trust.py                       # preview loaded install
   python3 patch_miniforge_trust.py --check-permissions   # read-only, all known blockers
   python3 patch_miniforge_trust.py /path/to/miniforge     # explicit install
@@ -205,7 +207,73 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 28
+SCRIPT_REVISION = 29
+BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TEAM BASE-ONLY ROLLOUT (revision 29)
+
+Repeat separately for each distinct installation, including GCC and Intel.
+Load that site's usual environment/compiler and Miniforge modules first.
+The loaded module supplies the base path; no system name is required.
+Use the maintenance account for shared changes, never root. Private staging and
+user verification require no cse membership; promotion/native PEM edits do.
+
+1. Choose a NEW private stage name under your home for this installation:
+   cse_stage="$HOME/cse-base-review-1"
+   python3 patch_miniforge_trust.py --stage "$cse_stage"
+
+2. Review before changing base:
+   python3 patch_miniforge_trust.py --report "$cse_stage"
+   Read review.md and comparison.csv there; require ready-for-review, review
+   changed/added/not-selected packages, and run the needed application checks
+   in "$cse_stage/env". A successful solve is not full application validation.
+
+3. Check all known installed/candidate permission blockers as the maintainer:
+   python3 patch_miniforge_trust.py --check-permissions --promote "$cse_stage"
+   Resolve reported owner/admin repairs and inspection gaps; rerun the check.
+   This check reports access; it does not repair permissions automatically.
+
+4. In the normal maintenance window, with snapshot/recovery arrangements and
+   concurrent base updates/jobs stopped, validate and apply the reviewed set:
+   python3 patch_miniforge_trust.py --promote "$cse_stage"
+   python3 patch_miniforge_trust.py --promote "$cse_stage" --apply
+   Stop on failure. Promotion uses the existing base path, verifies the accepted
+   package set, and normalizes eligible base permissions to cse. Read its exact
+   printed log directory with --report; review skips/updated-with-skips.
+
+5. Filter the EXISTING base PEM files after package installation:
+   python3 patch_miniforge_trust.py --trust-only
+   python3 patch_miniforge_trust.py --trust-only --apply
+   python3 patch_miniforge_trust.py --inspect-trust
+   This removes four known incident-root fingerprints and redirects earlier
+   script-created base CSE-path settings to the native PEM. No use-ca.sh step
+   is needed for this sequence. Other site CAs/settings are preserved.
+
+6. Verify user operations in a fresh shell with the same usual modules loaded,
+   ideally as an ordinary user (choose a NEW private test name):
+   python3 patch_miniforge_trust.py --verify-user "$HOME/cse-user-check-1"
+   python3 patch_miniforge_trust.py --report "$HOME/cse-user-check-1"
+   Require the requested checks to pass; read verification.md and its limits.
+   Optional --chains-dir PATH checks supplied incident chains offline; without
+   it, chain rejection is explicitly not-tested. No live incident sites are probed.
+
+Keep the stage/reports, source commit, promoted-base logs and certificate/user
+results per installation. Verified updates write NNN-user-changes/README.md,
+packages.csv, packages.json and manifest.json beside the private logs. To export
+an older run without accessing installed software:
+   python3 patch_miniforge_trust.py --export-changes /path/to/promotion-log \\
+     --changes-output "$HOME/miniforge-release-notes/base-update-1"
+Review the evidence/coverage label, then copy only the generated files to the
+approved user-readable docs location and link them from the updates index:
+https://github.com/ray12514/compiler-hardening-trial/blob/main/docs/miniforge-updates/README.md
+Candidate-only comparisons must not be published as completed changes.
+Use a new stage if the source package/control state
+changes; do not rerun a stale promotion to repair a later certificate/user check.
+Old CSE exports in an existing shell need clearing or a fresh shell.
+Do not use --all-envs/--only, delete old environments, replace Miniforge, or edit
+admin trust files in this rollout. Other baseline environments are a later sweep.
+
+Full handoff guide (script retrieval, review gates and recovery pointers):
+https://github.com/ray12514/compiler-hardening-trial/blob/main/docs/miniforge-base-rollout.md
+"""
 BASE_REPLACEMENTS = {'boost':('libboost-python-devel',),'boost-cpp':('libboost-devel',)}
 ROOTS = {
  '7DD78D5F4F13459A83DFF9ABBBA62EDBAF6F2D102BF257FD712F4D9F2746ED8D': 'emSign Root TLS CA - G3',
@@ -1420,6 +1488,7 @@ def final_summary(results, apply, bundle, say):
                 stats.get('group_changes',0),stats.get('mode_changes',0),stats.get('parent_warnings',0)))
         if row.get('trust_configuration'):
             say('  Trust configuration: '+row['trust_configuration']+' '+str(bundle))
+        if row.get('package_change_list'):say('  User package change list: '+row['package_change_list']['path'])
         if row.get('permission_warnings'): say('  Permission/access skips: %d; see skip reports' % len(row['permission_warnings']))
         if row.get('phase') and row['status']=='incomplete': say('  Failed/review phase: '+row['phase'])
         for issue in row['issues']: say('  Reason: '+issue)
@@ -1533,6 +1602,7 @@ def report_existing(directory, verbose=False):
     failures = []
     for row in results:
         counts[row['status']] = counts.get(row['status'],0)+1
+        if row.get('package_change_list'):print('User package change list: '+row['package_change_list']['path'])
         if row['status'] not in ('incomplete','skipped') and not row.get('permission_holds') and not row.get('promotion') and not verbose: continue
         issues = row.get('issues',[])
         evidence = row.get('command_failures',[])
@@ -2296,6 +2366,108 @@ def stage_comparison(before, after, original_roots, requested, omitted, ready):
     return rows
 
 
+def validate_change_inventory(data):
+    if not isinstance(data,dict):raise RuntimeError('Package inventory must be a mapping')
+    for name,record in data.items():
+        if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*',name) or not isinstance(record,dict) or not all(isinstance(record.get(key),str) and record[key] for key in ('version','build')):
+            raise RuntimeError('Incomplete package version/build identity in saved inventory: '+str(name))
+    return data
+
+
+def write_package_changes(destination, before, after, details, rows=None):
+    """Write only public package identities, never private inventories or logs."""
+    destination=Path(destination).expanduser().resolve()
+    if destination.exists():raise RuntimeError('Choose a new change-list directory; existing output is not overwritten')
+    if any((parent/'conda-meta/history').exists() for parent in destination.parents):
+        raise RuntimeError('Change lists must be outside Conda environments')
+    if rows is None:
+        validate_change_inventory(before);validate_change_inventory(after)
+        rows=stage_comparison(before,after,(),(),(),True)
+        for row in rows:
+            if row['status']=='not-selected' and details['evidence']!='candidate-only':row['status']='removed'
+        rows=[{key:row[key] for key in ('package','before_version','before_build','after_version','after_build','status')} for row in rows]
+    manifest=dict(details,generated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  counts={status:sum(row['status']==status for row in rows) for status in sorted({row['status'] for row in rows})},
+                  scope='Conda-managed packages only; native PEM filtering and user-operation verification are separate records.')
+    destination.mkdir(mode=0o755,parents=True,exist_ok=False)
+    fields=['package','before_version','before_build','after_version','after_build','status']
+    (destination/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+    (destination/'packages.json').write_text(json.dumps(rows,indent=2)+'\n')
+    with (destination/'packages.csv').open('w',newline='') as stream:
+        writer=csv.DictWriter(stream,fieldnames=fields);writer.writeheader();writer.writerows(rows)
+    escape=lambda value:str(value).replace('|','\\|').replace('`','\\`').replace('\n',' ')
+    heading='NOT INSTALLED: candidate package comparison' if manifest['evidence']=='candidate-only' else 'Miniforge base package changes'
+    lines=['# '+heading,'','Evidence: **'+escape(manifest['evidence'])+'**',
+           '','Coverage: '+escape(manifest.get('coverage','full inventory')),
+           '','Recorded rollout status: '+escape(manifest.get('rollout_status','not recorded')),
+           '','Installation: `'+escape(manifest.get('prefix','not recorded'))+'`',
+           '','Report generated: '+manifest['generated_at']+' (this is not the installation time).',
+           '','Counts: '+(', '.join('%s=%d'%item for item in manifest['counts'].items()) or 'no recorded changes'),
+           '','Version changes are not necessarily upgrades. A build change can keep the same version.',
+           'This list is package evidence, not a sign-off for permissions, certificates or all user applications.',
+           'Pip-installed applications and manual PEM edits are outside this package inventory.']
+    if manifest.get('note'):lines+=['',escape(manifest['note'])]
+    for changed in (True,False):
+        subset=[row for row in rows if (row['status']!='unchanged')==changed]
+        lines+=['','## '+('Changes' if changed else 'Unchanged packages'),'']
+        if not subset:lines+=['None recorded.' if changed else 'No unchanged package records available in this report.'];continue
+        lines+=['| Package | Before version | Before build | After version | After build | Result |',
+                '| --- | --- | --- | --- | --- | --- |']
+        lines+=['| '+' | '.join(escape(row[key]) or '—' for key in fields)+' |' for row in subset]
+    (destination/'README.md').write_text('\n'.join(lines)+'\n')
+    for name in ('README.md','packages.csv','packages.json','manifest.json'):(destination/name).chmod(0o644)
+    destination.chmod(0o755)
+    return manifest
+
+
+def export_package_changes(source, destination=None):
+    source=report_directory(source)
+    destination=destination or source/'user-changes'
+    if (source/'stage-summary.json').is_file():
+        stage=json.loads((source/'stage-summary.json').read_text())
+        if stage.get('status')!='ready-for-review':raise RuntimeError('Candidate is incomplete; insufficient evidence for a complete comparison')
+        before=json.loads((source/'source-packages.json').read_text());after=json.loads((source/'candidate-packages.json').read_text())
+        details={'evidence':'candidate-only','coverage':'full candidate comparison','prefix':stage['source_base'],
+                 'rollout_status':stage['status'],'note':'NOT INSTALLED: this stage report does not establish a completed shared-base update.'}
+        manifest=write_package_changes(destination,before,after,details)
+    else:
+        rows=json.loads((source/'summary.json').read_text())
+        if len(rows)!=1:raise RuntimeError('Export requires a report for one installation; mixed-prefix historical reports need separate review')
+        row=rows[0];mode=(source/'run.log').read_text() if (source/'run.log').is_file() else ''
+        if 'Mode: APPLY' not in mode:raise RuntimeError('No verified installed transaction is recorded; this may be a preview')
+        before_file=source/'000-before-packages.json';after_file=source/'000-after-packages.json'
+        details={'prefix':row['prefix'],'rollout_status':row['status']}
+        if row.get('package_inventory_verified') and before_file.is_file() and after_file.is_file():
+            before=json.loads(before_file.read_text());after=json.loads(after_file.read_text())
+            details.update(evidence='verified-installed',coverage='full inventory',note='Compared recorded before/after inventories after installed-package verification. Overall rollout status is recorded separately.')
+            manifest=write_package_changes(destination,before,after,details)
+        elif row.get('changes_started') and row.get('promotion',{}).get('status') in ('packages-verified','completed'):
+            guard=json.loads((source/'approved-promotion-plan.json').read_text())
+            identity=guard['packages'];digest=hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest()
+            if guard['prefix']!=row['prefix'] or digest!=row['promotion']['manifest_sha256']:
+                raise RuntimeError('Saved promotion identity does not match the verified run')
+            before={name:{'version':values[0],'build':values[1]} for name,values in guard['before'].items()}
+            details.update(evidence='verified-installed',coverage='full inventory',note='Reconstructed from the saved approved manifest and recorded successful package verification; no current live installation was inspected.')
+            manifest=write_package_changes(destination,before,identity,details)
+        elif row.get('status','').startswith('updated'):
+            changes=[]
+            for item in row.get('package_changes',()):
+                added=item['before']=='absent'
+                changes.append({'package':item['name'],'before_version':'' if added else item['before'],'before_build':'',
+                    'after_version':item['after'],'after_build':'','status':'added' if added else 'changed-version' if item['before']!=item['after'] else 'changed-build'})
+            for item in row.get('package_removals',()):
+                if item.get('status')=='verified':changes.append({'package':item['name'],'before_version':item.get('before',''),
+                    'before_build':'','after_version':'','after_build':'','status':'removed'})
+            details.update(evidence='limited-installed-summary',coverage='partial recorded changes; unchanged inventory unavailable',
+                           note='Older successful run summary only. Build identifiers and unrecorded changes are unavailable; blank fields mean unknown, not a missing package.')
+            manifest=write_package_changes(destination,{}, {},details,rows=changes)
+        else:raise RuntimeError('No verified installed inventory; insufficient evidence to publish completed changes')
+    print('Package change list: '+str(Path(destination).expanduser().resolve()/'README.md'))
+    print('Evidence: '+manifest['evidence']+' | coverage: '+manifest['coverage'])
+    print('Share only the generated files after review, from a location users can read. No packages or current base files were inspected or changed.')
+    return 0
+
+
 def write_stage_report(root, summary, before, after):
     rows=stage_comparison(before,after,summary.get('original_roots',()),summary.get('requested_roots',()),
                           summary.get('omitted_requests',()),summary['status']=='ready-for-review')
@@ -2783,6 +2955,9 @@ def verify_user_install(args, base, env):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--version',action='version',version='patch_miniforge_trust.py revision %d'%SCRIPT_REVISION)
+    ap.add_argument('--base-guide',action='version',version=BASE_ROLLOUT_GUIDE,help='Print the ordered base-only team rollout guide and exit; no access or network checks')
+    ap.add_argument('--export-changes',type=Path,metavar='SAVED_RUN_DIR',help='Export user-facing package changes from saved run/stage records only; no installed software or network access')
+    ap.add_argument('--changes-output',type=Path,metavar='NEW_DIR',help='New destination for --export-changes; default SAVED_RUN_DIR/user-changes')
     ap.add_argument('miniforge', nargs='?', type=Path)
     ap.add_argument('--apply', action='store_true')
     ap.add_argument('--verify-user',type=Path,metavar='NEW_HOME_DIR',help='Post-install online user checks in a new private home directory; no base updates or cse membership needed')
@@ -2811,6 +2986,11 @@ def main():
     ap.add_argument('--chains-dir',type=Path,help='Approved local incident chain directory; no downloads')
     ap.add_argument('--log-dir',type=Path)
     args = ap.parse_args()
+    if args.changes_output and not args.export_changes:ap.error('--changes-output requires --export-changes')
+    if args.export_changes:
+        if args.miniforge or args.apply or args.verify_user or args.stage or args.stage_skip or args.promote or args.check_permissions or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.base_only or args.all_envs or args.only or args.include or args.exclude or args.scan_root or args.log_dir or args.upgrade_conda or args.offline or args.ca_bundle or args.extra_ca or args.channel or args.chains_dir or args.diagnostic_timeout is not None:
+            ap.error('--export-changes reads saved records only; combine with --changes-output or --verbose')
+        return export_package_changes(args.export_changes,args.changes_output)
     if args.verify_user:
         if args.apply or args.stage or args.stage_skip or args.promote or args.check_permissions or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.all_envs or args.only or args.include or args.exclude or args.scan_root or args.log_dir or args.upgrade_conda or args.offline or args.ca_bundle or args.extra_ca or args.diagnostic_timeout is not None:
             ap.error('--verify-user is an online private user check; combine only with source prefix, --channel, --chains-dir or --verbose')
@@ -3114,6 +3294,7 @@ def main():
                 for relative in ('.condarc','conda-meta/state','conda-meta/history','conda-meta/pinned'):
                     p=prefix/relative
                     if p.is_file(): (logdir/('%03d-before-'%i+relative.replace('/','_'))).write_bytes(p.read_bytes())
+                (logdir/('%03d-before-packages.json'%i)).write_text(json.dumps(initial_meta,indent=2))
                 (logdir/('%03d-before-explicit.txt'%i)).write_text(run([conda,'list','-p',prefix,'--explicit']).stdout)
                 row['phase']='load installed libmamba solver'
                 probe=runjson([conda,'__cse_solver_probe__'])
@@ -3213,6 +3394,8 @@ def main():
                     if runjson([conda,'__cse_solver_probe__']).get('solver')!='libmamba':raise RuntimeError('Promoted Conda/solver startup failed')
                     row['promotion']['status']='packages-verified'
                 if row.get('xkb_migration'):verify_xkb_tree(prefix,row['xkb_migration'])
+                (logdir/('%03d-after-packages.json'%i)).write_text(json.dumps(after_meta,indent=2))
+                row['package_inventory_verified']=True
                 for removal in row.get('package_removals',[]):removal['status']='verified'
                 if broad:row['conda_update'].update(status='updated',after=after_meta.get('conda',{}).get('version'))
                 row['phase'] = 'configure prefix trust'
@@ -3270,6 +3453,15 @@ def main():
             row['issues'].append(str(exc));log.write(traceback.format_exc())
         if args.apply and row['issues'] and row.get('conda_update',{}).get('status')!='updated' and 'conda_update' in row:
             row['conda_update']['status']='incomplete'
+        if row.get('package_inventory_verified'):
+            try:
+                change_dir=logdir/('%03d-user-changes'%i)
+                manifest=write_package_changes(change_dir,initial_meta,after_meta,{
+                    'evidence':'verified-installed','coverage':'full inventory','prefix':str(prefix),'rollout_status':row['status'],
+                    'note':'Recorded before/after installed Conda inventories. Review the separate rollout, certificate and user-operation results before declaring the installation ready.'})
+                row['package_change_list']={'path':str(change_dir/'README.md'),'evidence':manifest['evidence'],'counts':manifest['counts']}
+            except Exception as exc:
+                row['status']='incomplete';row['issues'].append('User change-list generation failed: '+str(exc))
         for issue in row['issues']:say('ATTENTION: '+issue)
         say('Status: '+row['status'])
     (logdir/'summary.json').write_text(json.dumps(results,indent=2))

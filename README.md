@@ -1,5 +1,12 @@
 # Compiler hardening trial
 
+Maintaining the shared Miniforge base installations? Use the
+[base-only team rollout guide](docs/miniforge-base-rollout.md). It covers private
+staging, review, promotion, permissions, native PEM filtering and user checks;
+the standalone script also prints the sequence with `--base-guide`.
+User-facing package change lists are collected in the
+[Miniforge update index](docs/miniforge-updates/README.md).
+
 Standalone procedures for measuring the correctness and runtime effects of
 compiler hardening on FFTW, HDF5 and LAPACK, including parallel FFTW/HDF5 with
 Open MPI and UCX.
