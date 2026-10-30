@@ -6,6 +6,19 @@ Load the usual site/compiler and Miniforge modules, then run from this folder
 with Python 3.8+. Use the maintenance account (`cse` group), not root.
 Only **base** is updated; other environments stay unchanged.
 
+**Already updated, but missing the curl command?** With revision 30, use this
+focused repair; you do not need to repeat staging/promotion:
+
+```bash
+python3 patch_miniforge_trust.py --repair-curl
+python3 patch_miniforge_trust.py --repair-curl --apply
+```
+
+It installs matched Conda curl/libcurl and needed dependencies, refreshes native
+PEMs/permissions, and checks the selected command and HTTPS. Unrelated application
+changes are rejected. Users should reload the module or use `hash -r` to clear a
+cached system curl. New stages now include curl and test its startup explicitly.
+
 **1. Stage privately.** Build a candidate under your home. Use a new directory
 name for each installation or retry.
 

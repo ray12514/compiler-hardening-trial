@@ -38,7 +38,7 @@ class UserVerificationTests(unittest.TestCase):
    for name,r in installed.items():(base/'conda-meta'/(name+'.json')).write_text(json.dumps(r))
    before={str(p.relative_to(base)):p.read_bytes() for p in base.rglob('*') if p.is_file()}
    calls=[];prefix=work/'env'
-   selected={n:{'name':n,'version':v,'build':'0','channel':'conda-forge'} for n,v in [('python','3.12.9'),('pip',m.MINIMUM['pip']),('certifi',m.MINIMUM['certifi']),('ca-certificates',m.MINIMUM['ca-certificates']),('click','8.3.0')]}
+   selected={n:{'name':n,'version':v,'build':'0','channel':'conda-forge'} for n,v in [('python','3.12.9'),('pip',m.MINIMUM['pip']),('certifi',m.MINIMUM['certifi']),('ca-certificates',m.MINIMUM['ca-certificates']),('click','8.3.0'),('curl','8.23.0'),('libcurl','8.23.0')]}
    def fake(argv,**kwargs):
     argv=list(map(str,argv));calls.append((argv,dict(kwargs['env'])))
     if fail and fail in ' '.join(argv):return subprocess.CompletedProcess(argv,1,'','simulated download or build failure')
@@ -73,7 +73,7 @@ class UserVerificationTests(unittest.TestCase):
  def test_download_install_activation_and_build_checks_are_all_required(self):
   result,report,calls=self.run_verification()
   self.assertEqual(result,0,report['issues']);self.assertEqual(report['status'],'passed')
-  for name in ('conda-create','conda-install','pip-download-install','pip-local-build','activation-imports','private-permissions','base-unchanged'):
+  for name in ('base-curl','base-curl-https','conda-create','conda-install','pip-download-install','pip-local-build','activation-imports','private-permissions','base-unchanged'):
    self.assertEqual(report['checks'][name]['status'],'passed')
   self.assertEqual(report['checks']['offline-chain-rejection']['status'],'not-tested')
   self.assertTrue(any('--no-cache-dir' in argv and '--report' in argv for argv,env in calls))

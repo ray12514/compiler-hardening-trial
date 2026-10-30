@@ -653,7 +653,7 @@ class BaseUpdatePolicyTests(unittest.TestCase):
  def test_base_plan_unpins_applications_and_updates_conda(self):
   meta={n:{'version':v,'build':'0'} for n,v in [('conda','24.11.2'),('python','3.12.8'),('numpy','1.0'),('pip','24.3.1')]}
   targets,allowed,specs=m.plan_specs(meta,False,broad=True)
-  self.assertIsNone(allowed);self.assertEqual(targets,set(meta));self.assertIn('numpy',specs);self.assertIn('python',specs);self.assertIn('conda>=26.9.4',specs);self.assertIn('pip>='+m.MINIMUM['pip'],specs)
+  self.assertIsNone(allowed);self.assertEqual(targets,set(meta)|{'curl'});self.assertIn('numpy',specs);self.assertIn('python',specs);self.assertIn('conda>=26.9.4',specs);self.assertIn('pip>='+m.MINIMUM['pip'],specs)
  def test_other_prefix_retains_pins(self):
   meta={n:{'version':v,'build':'0'} for n,v in [('conda','24.11.2'),('python','3.12.8'),('numpy','1.0'),('pip','24.3.1')]}
   targets,allowed,specs=m.plan_specs(meta,False)

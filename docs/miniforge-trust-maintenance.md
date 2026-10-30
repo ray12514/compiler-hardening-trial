@@ -12,6 +12,69 @@ It offers local maintenance of existing Miniforge PEM files and a separate workf
 for updating shared Conda packages with a managed site CA bundle. It leaves the OS and the inspection proxy unchanged.
 No external incident test endpoint is contacted.
 
+## Already updated: add the matching curl executable without a full rollout
+
+Revision 30 fixes a gap in the earlier request set: `libcurl` alone does not
+install `bin/curl`. The [conda-forge split recipe](https://github.com/conda-forge/curl-feedstock/blob/main/recipe/meta.yaml)
+ships the executable in `curl` and pins it to a matching `libcurl` build. When a
+loaded module exposes Conda libraries while command lookup falls through to
+system curl, that system executable can encounter an incompatible library.
+
+For a base that has already completed its update and checks, load its usual
+modules and preview the focused repair:
+
+```bash
+python3 patch_miniforge_trust.py --version  # revision 30
+python3 patch_miniforge_trust.py --repair-curl
+python3 patch_miniforge_trust.py --repair-curl --apply
+```
+
+No full restage or promotion is required for this path. It uses the loaded base,
+the maintenance account and normal `cse` access. The preview performs a genuine
+dependency dry run and may refresh package metadata in its private log/cache
+directory; it makes no base changes. The apply run resolves and validates its own
+current plan before executing that exact package set. No Miniforge installer is
+replaced, and other environments/admin trust files are unchanged.
+
+The request is the newest stable curl advertised by conda-forge or its configured
+mirror, paired with libcurl at the same version, without downgrading either
+installed package. Required dependency libraries may move with it. Unrelated
+applications, Python and package-manager updates/removals are rejected. If the
+newest pair cannot be installed within that scope, the command stops for review;
+it does not silently upgrade the entire base or pick an older curl to claim success.
+An offline repair uses a fresh private cache and therefore requires `--offline`
+plus an approved `--channel file:///mirror` containing the metadata/packages;
+the existing base cache is not reused. Its HTTPS check is explicitly not tested.
+
+Apply also filters the installed native PEMs, normalizes eligible shared base
+permissions, writes the package change list, and runs the Conda curl executable.
+It checks the executable and loaded libcurl versions against installed records,
+requires command lookup in the current module environment to select that curl,
+and performs a verified HTTPS HEAD request to the approved channel's noarch
+repodata. This controlled request ignores `.curlrc` and does not disable TLS
+verification or inject a replacement CA for the runtime check. No incident test
+hosts are probed. Existing module library settings are retained for runtime tests
+so a conflict is reported rather than hidden.
+
+Read the final status and printed private log directory. `incomplete` after an
+install can mean the packages were updated but a runtime, PATH, certificate or
+permission step needs attention; read `--report LOG_DIR` before retrying. A shell
+can cache the old `/usr/bin/curl` selection: users should reload the intended
+module or run `hash -r` in Bash. If PATH itself selects another curl, correct the
+module/load order or activate the intended base; the script does not rewrite an
+unknown site modulefile or the parent shell. A full rollout is not the remedy for
+a remaining PATH issue.
+
+Future private stages and full base updates explicitly request curl even if it
+was absent before. Candidate startup and `--verify-user` now check curl as well
+as the package-manager/Python checks. User verification checks both the loaded
+base curl/HTTPS path and curl selected after activating the private environment.
+An unpromoted old candidate without the pair must be staged again; an already
+updated installation uses this repair. Passing these checks covers curl and the
+tested workflows, not every system executable that could load module libraries.
+Inspect any other reported command/library conflicts directly before adding more
+packages; this repair does not install a blanket replacement system toolset.
+
 ## Packages already installed: update the existing PEM files only
 
 Revision 27 (2026-10-28) makes `--trust-only` maintain Miniforge's existing

@@ -15,6 +15,11 @@ Different installations get their own stage, review, promotion and reports. If
 multiple machines mount the same shared installation, update that installation
 once rather than running competing updates against it.
 
+If an installation has already completed this sequence and only needs the
+matching curl command added, use revision 30's
+[targeted curl repair](miniforge-trust-maintenance.md#already-updated-add-the-matching-curl-executable-without-a-full-rollout)
+instead of repeating staging and promotion.
+
 ## 1. Retrieve the script and short README, then load the intended setup
 
 Use your usual GitHub SSH access. Run this from the intended handoff directory.

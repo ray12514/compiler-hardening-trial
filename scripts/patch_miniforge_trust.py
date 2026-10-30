@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 29 (2026-10-29).
+"""CSE Miniforge certificate maintenance, revision 30 (2026-10-30).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --base-guide          # ordered team rollout guide
+  python3 patch_miniforge_trust.py --repair-curl          # targeted curl/libcurl plan
+  python3 patch_miniforge_trust.py --repair-curl --apply  # install pair and verify
   python3 patch_miniforge_trust.py --export-changes /path/to/run --changes-output /new/user-notes
   python3 patch_miniforge_trust.py                       # preview loaded install
   python3 patch_miniforge_trust.py --check-permissions   # read-only, all known blockers
@@ -207,8 +209,19 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 29
-BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TEAM BASE-ONLY ROLLOUT (revision 29)
+SCRIPT_REVISION = 30
+BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TEAM BASE-ONLY ROLLOUT (revision 30)
+
+Already updated and validated, but curl is missing while libcurl is installed?
+Use the focused repair instead of repeating the rollout:
+   python3 patch_miniforge_trust.py --repair-curl
+   python3 patch_miniforge_trust.py --repair-curl --apply
+It selects the newest stable curl advertised by approved conda-forge sources,
+installs a matched curl/libcurl pair and necessary dependencies, keeps unrelated
+applications/managers unchanged, filters native PEMs, normalizes permissions and
+checks PATH, loaded libcurl and HTTPS. Preview first; conflicts stop for review.
+Use the normal module setup; clear a cached system curl with hash -r or reload
+the module. No Miniforge installer replacement or full restage is required.
 
 Repeat separately for each distinct installation, including GCC and Intel.
 Load that site's usual environment/compiler and Miniforge modules first.
@@ -978,7 +991,7 @@ def verify_permission_holds(plan, holds):
 
 def plan_specs(meta, upgrade_conda, broad=False, conda_minimum=CONDA_MINIMUM, roots=None):
     if broad:
-        targets=set(base_package_intent(meta)['roots'] if roots is None else roots)
+        targets=set(base_package_intent(meta)['roots'] if roots is None else roots)|{'curl'}
         specs=[n+'>='+MINIMUM[n] if n in MINIMUM else ('conda>='+conda_minimum if n=='conda' else n) for n in sorted(targets)]
         return targets,None,specs
     targets = set(meta) & (set(MINIMUM) | MANAGERS)
@@ -2288,6 +2301,8 @@ def load_promotion(directory, base, holds=None):
     if stage_source_state(base)!=summary['source_state_after']:
         raise RuntimeError('Base package/control metadata changed since staging; stage and review this system again')
     packages=json.loads((root/'candidate-packages.json').read_text())
+    if not {'curl','libcurl'}<=set(packages):
+        raise RuntimeError('Reviewed candidate lacks the required curl/libcurl pair. Restage an unpromoted candidate with revision 30; for an already-updated base use --repair-curl instead.')
     if not packages or not {'conda','python','conda-libmamba-solver'}<=set(packages):raise RuntimeError('Reviewed candidate lacks its required Conda/Python/solver packages')
     for name,record in packages.items():
         if record.get('name')!=name or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*',name):raise RuntimeError('Invalid reviewed package name: '+str(name))
@@ -2334,14 +2349,14 @@ def stage_source_state(base, meta=None):
 
 
 def stage_requests(meta, intent, skipped, conda_minimum):
-    protected=set(MINIMUM)|{'conda','python','conda-libmamba-solver'}
+    protected=set(MINIMUM)|{'conda','python','conda-libmamba-solver','curl'}
     unknown=set(skipped)-set(meta)-set(intent['roots'])
-    if unknown:raise RuntimeError('Unknown --stage-skip package(s): '+', '.join(sorted(unknown)))
+    if unknown-protected:raise RuntimeError('Unknown --stage-skip package(s): '+', '.join(sorted(unknown-protected)))
     if set(skipped)&protected:raise RuntimeError('Cannot omit required Conda/Python/security packages: '+', '.join(sorted(set(skipped)&protected)))
     omitted=set(skipped)
     for migration in intent['replacements']:
         if migration['name'] in omitted:omitted.update(migration['replacements'])
-    roots=(set(intent['roots'])|{'conda','python','conda-libmamba-solver'})-omitted
+    roots=(set(intent['roots'])|{'conda','python','conda-libmamba-solver','curl'})-omitted
     specs=[n+'>='+MINIMUM[n] if n in MINIMUM else ('conda>='+conda_minimum if n=='conda' else n) for n in sorted(roots)]
     return roots,specs,omitted
 
@@ -2652,6 +2667,7 @@ def stage_base(args, base, env):
         (root/'candidate-packages.json').write_text(json.dumps(after,indent=2))
         verify_installed_plan(final,after)
         summary['security_verification']=verify_minimums(before,after,True,target)
+        summary['curl_runtime']=run(['<local curl probe>'],'verify candidate curl executable and loaded libcurl',runtime=candidate,program=CURL_PROBE)
         if run(['__cse_solver_probe__'],'verify candidate Conda and solver',runtime=candidate).get('solver')!='libmamba':
             raise RuntimeError('Candidate Conda/solver startup did not pass')
         audit=run(['<local Python audit>'],'verify candidate runtime packages and bundles',runtime=candidate,program=AUDIT)
@@ -2703,13 +2719,49 @@ d['default_ca_fingerprints'] = [hashlib.sha256(c).hexdigest().upper()
 print(json.dumps(d))
 ''')
 
-USER_IMPORT_PROBE = r'''
+CURL_PROBE_SETUP = r'''
+import json, os, pathlib, re, shutil, subprocess, sys
+def curl_probe(prefix, require_selected=False):
+    prefix=pathlib.Path(prefix).resolve();binary=prefix/'bin/curl'
+    if not binary.is_file():raise RuntimeError('Missing Conda curl executable; libcurl alone does not supply bin/curl: '+str(binary))
+    meta={}
+    for path in (prefix/'conda-meta').glob('*.json'):
+        record=json.loads(path.read_text())
+        if record.get('name') in ('curl','libcurl'):meta[record['name']]=record
+    if set(meta)!={'curl','libcurl'}:raise RuntimeError('Both Conda curl and libcurl records are required')
+    result=subprocess.run([str(binary),'-q','--version'],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=30)
+    if result.returncode:raise RuntimeError('Conda curl cannot start: '+result.stderr.strip())
+    first=result.stdout.splitlines()[0] if result.stdout else ''
+    match=re.search(r'^curl (\S+).*\blibcurl/(\S+)',first)
+    if not match or match.group(1)!=meta['curl']['version'] or match.group(2)!=meta['libcurl']['version']:
+        raise RuntimeError('curl executable/loaded libcurl does not match installed records: '+first)
+    if meta['curl']['version']!=meta['libcurl']['version']:raise RuntimeError('curl/libcurl package versions do not match')
+    selected=shutil.which('curl')
+    if require_selected and (not selected or pathlib.Path(selected).resolve()!=binary.resolve()):
+        raise RuntimeError('PATH selects '+str(selected)+' instead of '+str(binary)+'. Reload the intended module or activate its base, then clear the shell command cache (hash -r).')
+    return {'executable':str(binary),'selected_on_path':selected,'version':match.group(1),'loaded_libcurl':match.group(2),'startup':first}
+'''
+CURL_PROBE = CURL_PROBE_SETUP+"\nprint(json.dumps(curl_probe(pathlib.Path(sys.prefix), 'selected' in sys.argv[1:])))\n"
+CURL_HTTPS_PROBE = CURL_PROBE_SETUP+r'''
+from urllib.parse import urlsplit
+url=sys.argv[1]
+if urlsplit(url).scheme!='https':raise RuntimeError('curl HTTPS probe requires an HTTPS package source')
+info=curl_probe(pathlib.Path(sys.prefix),True)
+result=subprocess.run([info['executable'],'-q','--no-insecure','--fail','--head','--location',
+    '--proto','=https','--proto-redir','=https','--connect-timeout','15','--max-time','30',
+    '--output',os.devnull,'--write-out','%{http_code}',url],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=40)
+if result.returncode:raise RuntimeError('Conda curl HTTPS request failed: '+result.stderr.strip())
+print(json.dumps({'url':url,'http_status':result.stdout.strip(),'curl':info}))
+'''
+
+USER_IMPORT_PROBE = CURL_PROBE_SETUP+r'''
 import sys, json, pathlib, zlib, click, packaging, cse_user_probe
 assert pathlib.Path(sys.prefix).resolve() == pathlib.Path(sys.argv[1]).resolve()
 assert cse_user_probe.answer() == 42
 assert zlib.decompress(zlib.compress(b'CSE')) == b'CSE'
 print(json.dumps({'prefix':sys.prefix,'python':sys.version,'click':click.__file__,
-                 'packaging':packaging.__file__,'local_build':cse_user_probe.__file__}))
+                 'packaging':packaging.__file__,'local_build':cse_user_probe.__file__,
+                 'curl':curl_probe(pathlib.Path(sys.prefix), True)}))
 '''
 
 
@@ -2807,7 +2859,7 @@ def verify_user_install(args, base, env):
                PIP_CACHE_DIR=str(root/'pip-cache'),TMPDIR=str(root/'tmp'),XDG_CACHE_HOME=str(root/'user-cache'))
     for key in ('CSE_CONDA_PERMISSION_HOLDS','CSE_CONDA_APPROVED_PLAN'):env.pop(key,None)
     for name in ('pkgs','envs','pip-cache','tmp','user-cache'):(root/name).mkdir(mode=0o700)
-    names=('base-trust','conda-create','private-trust','conda-install','pip-download-install','pip-local-build',
+    names=('base-trust','base-curl','base-curl-https','conda-create','private-trust','conda-install','pip-download-install','pip-local-build',
            'activation-imports','private-permissions','base-unchanged','offline-chain-rejection')
     summary={'script_revision':SCRIPT_REVISION,'base':str(base),'prefix':str(prefix),'uid':os.geteuid(),
              'status':'running','checks':{name:{'status':'not-run'} for name in names},'issues':[],
@@ -2879,9 +2931,11 @@ def verify_user_install(args, base, env):
         for url in urls:verification_source_url(url)
         audit=run([base/'bin/python','-I','-B','-c',USER_TRUST_AUDIT])
         trust=check('base-trust',lambda:check_user_trust(base,config,env,audit,pip_config(base/'bin/python')))
+        check('base-curl',lambda:run([base/'bin/python','-I','-B','-c',CURL_PROBE,'selected']))
+        check('base-curl-https',lambda:run([base/'bin/python','-I','-B','-c',CURL_HTTPS_PROBE,urls[0].rstrip('/')+'/noarch/repodata.json']))
         python_version=before['python']['version'].split('.')
         specs=['python='+'.'.join(python_version[:2]),'pip>='+MINIMUM['pip'],'certifi>='+MINIMUM['certifi'],
-               'ca-certificates>='+MINIMUM['ca-certificates'],'setuptools','wheel']
+               'ca-certificates>='+MINIMUM['ca-certificates'],'setuptools','wheel','curl']
         check('conda-create',lambda:solve_install('create',specs))
         audit=run([prefix/'bin/python','-I','-B','-c',USER_TRUST_AUDIT])
         trust+=check('private-trust',lambda:check_user_trust(prefix,config,env,audit,pip_config(prefix/'bin/python')))
@@ -2952,6 +3006,141 @@ def verify_user_install(args, base, env):
     return 0 if summary['status']=='passed' else 2
 
 
+def curl_dependency_scope(meta, plan):
+    graph=dict(meta)
+    # Some Conda LINK summaries omit dependencies; FETCH records and installed
+    # records retain them. Do not erase known dependency edges with a short row.
+    for action in ('FETCH','LINK'):
+        for record in plan.get('actions',{}).get(action,[]):graph[record['name']]=dict(graph.get(record['name'],{}),**record)
+    needed=set();pending=['curl','libcurl']
+    while pending:
+        name=pending.pop()
+        if name in needed:continue
+        needed.add(name)
+        pending.extend(spec_name(dep) for dep in graph.get(name,{}).get('depends',()))
+    return needed
+
+
+def repair_curl(args, base, env):
+    """Target curl and its dependency closure; never repeat the full base update."""
+    logdir=(args.log_dir or Path.home()/'.cse-trust-logs'/('curl-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))).expanduser().resolve()
+    if logdir==base or base in logdir.parents:raise RuntimeError('Repair logs must be outside the base installation')
+    logdir.mkdir(mode=0o700,parents=True,exist_ok=False);logdir.chmod(0o700)
+    env=dict(env,CONDA_PKGS_DIRS=str(logdir/'pkgs'),CONDA_REGISTER_ENVS='false',CONDA_AUTO_UPDATE_CONDA='false',
+             CONDA_NUMBER_CHANNEL_NOTICES='0',PYTHONDONTWRITEBYTECODE='1')
+    row={'prefix':str(base),'status':'incomplete','issues':[],'changes_started':False,'phase':'prepare curl repair',
+         'curl_repair':{'policy':'curl/libcurl and required dependencies only; existing applications/managers retained'}}
+    before={};after={};number=0;lock=None
+    with (logdir/'run.log').open('w',buffering=1) as log:
+        def say(value):value=redact_verification(value);print(value,flush=True);log.write(value+'\n')
+        def runjson(values,program=LIBMAMBA_CLI,process_env=None):
+            nonlocal number
+            number+=1;command=[str(base/'bin/python'),'-I','-B','-c',program]+list(map(str,values))
+            started=time.monotonic();finished=threading.Event()
+            def heartbeat():
+                while not finished.wait(30):say('Still working: %s (%ds elapsed)'%(row['phase'],time.monotonic()-started))
+            worker=threading.Thread(target=heartbeat,daemon=True);worker.start()
+            try:result=subprocess.run(command,env=process_env or env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                                      timeout=180 if '--dry-run' in values or 'search' in values else 600)
+            finally:finished.set();worker.join()
+            (logdir/('command-%03d.json'%number)).write_text(redact_verification(json.dumps({'phase':row['phase'],'argv':list(map(str,values)),
+                'returncode':result.returncode,'stdout':result.stdout,'stderr':result.stderr},indent=2)))
+            if result.returncode:raise RuntimeError(diagnostic_text(result.stdout,result.stderr))
+            data=json.loads(result.stdout)
+            if data.get('success') is False or data.get('dry_run') and '--dry-run' not in values:
+                raise RuntimeError('Conda did not perform the requested curl repair transaction')
+            return data
+        try:
+            say('Mode: '+('APPLY' if args.apply else 'CURL REPAIR DRY RUN; package metadata may be refreshed, no base changes'))
+            say('Base: '+str(base));say('Private logs: '+str(logdir))
+            if args.apply:
+                lock=(base/'.cse-curl-maintenance.lock').open('a');fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+                if os.fstat(lock.fileno()).st_uid==os.geteuid():
+                    os.fchown(lock.fileno(),-1,maintenance_gid());os.fchmod(lock.fileno(),0o664)
+            before=records(base);baseline=stage_source_state(base,before)
+            config=runjson(['config','--show','--json'])
+            package_config={key:value for key,value in config.items() if key!='pinned_packages'}
+            # This repair deliberately uses conda-forge (or its configured mirror)
+            # for BOTH outputs of the split curl recipe, not a historical system binary.
+            _,urls,channel_args=requested_channels(args.channel,package_config)
+            if args.offline and not any(url.startswith('file://') for url in urls):
+                raise RuntimeError('Offline curl repair uses a fresh private cache; supply --channel file:///approved/mirror with curl and its dependencies')
+            source=choose_source(args,config,base);text,_=filtered_bundle([source]+args.extra_ca)
+            bundle=logdir/'repair-ca-bundle.pem';bundle.write_text(text)
+            empty=logdir/'empty-ca-dir';empty.mkdir()
+            env.update({key:str(bundle) for key in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','CURL_CA_BUNDLE','PIP_CERT')})
+            env.update(SSL_CERT_DIR=str(empty),CONDA_OFFLINE='true' if args.offline else 'false')
+            flags=channel_args+(['--offline'] if args.offline else [])
+            row['phase']='find newest stable curl available to this installation'
+            # search accepts channel selection, not the solver's priority flag.
+            available=runjson(['search','--json']+[flag for flag in flags if flag!='--strict-channel-priority']+['curl'])
+            versions=[record['version'] for record in available.get('curl',()) if re.fullmatch(r'\d+(?:\.\d+)*',str(record.get('version','')))]
+            if not versions:raise RuntimeError('No stable curl release is available in the approved conda-forge sources')
+            target=max(versions+[record['version'] for name,record in before.items() if name in ('curl','libcurl')],key=version)
+            row['curl_repair'].update(target=target,channels=urls)
+            row['phase']='solve targeted curl/libcurl repair'
+            common=['install','-p',str(base),'--solver','libmamba','--json','--no-pin']+flags
+            plan=runjson(common+['--update-deps','curl>='+target,'libcurl>='+target,'--dry-run'])
+            (logdir/'000-plan.json').write_text(json.dumps(plan,indent=2))
+            allowed=curl_dependency_scope(before,plan)-{'python','python_abi','conda','conda-libmamba-solver','mamba','libmamba','libmambapy'}
+            check_plan(plan,allowed);holds=permission_holds(base,before);verify_permission_holds(plan,holds)
+            final,exact=exact_plan_specs(before,plan,{},args.channel,package_config)
+            if not all(name in final and version(final[name][0])>=version(target) for name in ('curl','libcurl')):
+                raise RuntimeError('The plan does not provide both curl and libcurl at the requested version')
+            if final['curl'][0]!=final['libcurl'][0]:raise RuntimeError('The plan mixes curl/libcurl versions')
+            if before.get('curl') and not (base/'bin/curl').is_file() and not any(record['name']=='curl' for record in plan.get('actions',{}).get('LINK',())):
+                raise RuntimeError('curl metadata exists but its executable is missing; a reviewed curl reinstall is required')
+            row['package_plan']=[{'name':record['name'],'before':before.get(record['name'],{}).get('version','absent'),
+                'after':record['version'],'build':record.get('build_string') or record.get('build')} for record in plan.get('actions',{}).get('LINK',())]
+            say('Target curl/libcurl: '+target+'; planned changes: '+(', '.join(record['name'] for record in row['package_plan']) or 'none'))
+            if args.apply:
+                if stage_source_state(base)!=baseline:raise RuntimeError('Base changed during repair planning; no transaction attempted')
+                (logdir/'000-before-packages.json').write_text(json.dumps(before,indent=2))
+                # Guard ALL non-dependency packages against implicit relinks too.
+                env['CSE_CONDA_PERMISSION_HOLDS']=json.dumps({'prefix':str(base),'packages':sorted((set(before)-allowed)|set(holds))})
+                row['phase']='install validated curl repair';row['changes_started']=True
+                runjson(common+exact+['--yes'])
+                after=records(base);verify_installed_plan(final,after)
+                (logdir/'000-after-packages.json').write_text(json.dumps(after,indent=2));row['package_inventory_verified']=True
+                row['package_changes']=[{'name':name,'before':before.get(name,{}).get('version','absent'),'after':record['version']} for name,record in after.items()
+                    if name not in before or (record['version'],record['build'])!=(before[name]['version'],before[name]['build'])]
+                row['phase']='filter installed native PEM files'
+                trust_args=argparse.Namespace(**vars(args));trust_args.log_dir=logdir/'native-trust'
+                maintain_native_trust(base,trust_args)
+                row['phase']='normalize shared base permissions';row['permissions']={};row['skipped_paths']=[]
+                warnings=public_permissions(base,base,True,say,row['skipped_paths'],[base/PATH_BACKUPS],row['permissions'])
+                row['phase']='check Conda curl and loaded library in the current module environment'
+                # Do not hide the user's loaded libraries or PATH for this check.
+                runtime_env=os.environ.copy();runtime_env['PYTHONDONTWRITEBYTECODE']='1'
+                row['curl_repair']['runtime']=runjson(['selected'],program=CURL_PROBE,process_env=runtime_env)
+                runtime=row['curl_repair']['runtime']
+                say('Selected curl: '+str(runtime.get('selected_on_path'))+' | version='+str(runtime.get('version'))+' | loaded libcurl='+str(runtime.get('loaded_libcurl')))
+                if not args.offline:
+                    source_url=next((url for url in urls if url.startswith('https://')),None)
+                    if not source_url:raise RuntimeError('No HTTPS package source available for the curl connectivity check')
+                    verification_source_url(source_url)
+                    row['phase']='check Conda curl HTTPS access'
+                    row['curl_repair']['https']=runjson([source_url.rstrip('/')+'/noarch/repodata.json'],program=CURL_HTTPS_PROBE,process_env=runtime_env)
+                else:row['curl_repair']['https']={'status':'not-tested','reason':'offline repair'}
+                row['status']='updated-with-skips' if warnings else 'updated'
+            else:row['status']='previewed'
+        except (Exception,KeyboardInterrupt) as exc:
+            row['issues'].append(redact_verification(str(exc)));say('ATTENTION: '+str(exc))
+        finally:
+            try:
+                if row.get('package_inventory_verified'):
+                    directory=logdir/'000-user-changes'
+                    manifest=write_package_changes(directory,before,after,{'evidence':'verified-installed','coverage':'full inventory',
+                        'prefix':str(base),'rollout_status':row['status'],'note':'Targeted curl repair. Review remaining permission, native trust and PATH/runtime checks separately.'})
+                    row['package_change_list']={'path':str(directory/'README.md'),'counts':manifest['counts'],'evidence':manifest['evidence']}
+                (logdir/'summary.json').write_text(json.dumps([row],indent=2))
+                say('Curl repair: '+row['status']+' | logs: '+str(logdir))
+                if row['issues']:say('Installed packages may have changed; read this run before retrying or repeating a full rollout.')
+            finally:
+                if lock:lock.close()
+    return 0 if row['status'] in ('previewed','updated','updated-with-skips') else 2
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--version',action='version',version='patch_miniforge_trust.py revision %d'%SCRIPT_REVISION)
@@ -2960,6 +3149,7 @@ def main():
     ap.add_argument('--changes-output',type=Path,metavar='NEW_DIR',help='New destination for --export-changes; default SAVED_RUN_DIR/user-changes')
     ap.add_argument('miniforge', nargs='?', type=Path)
     ap.add_argument('--apply', action='store_true')
+    ap.add_argument('--repair-curl',action='store_true',help='Target only the base curl executable, matched libcurl and necessary dependencies; default dry-run, add --apply to repair')
     ap.add_argument('--verify-user',type=Path,metavar='NEW_HOME_DIR',help='Post-install online user checks in a new private home directory; no base updates or cse membership needed')
     ap.add_argument('--stage',type=Path,metavar='NEW_PRIVATE_DIR',help='Solve and install a fresh private base candidate with comparison reports; source base stays read only; no --apply needed')
     ap.add_argument('--stage-skip',action='append',default=[],metavar='PACKAGE',help='Omit this application request from --stage; repeatable; dependencies may still require it')
@@ -2986,6 +3176,13 @@ def main():
     ap.add_argument('--chains-dir',type=Path,help='Approved local incident chain directory; no downloads')
     ap.add_argument('--log-dir',type=Path)
     args = ap.parse_args()
+    if args.repair_curl:
+        if args.export_changes or args.changes_output or args.verify_user or args.stage or args.stage_skip or args.promote or args.check_permissions or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.only or args.all_envs or args.include or args.exclude or args.scan_root or args.upgrade_conda or args.chains_dir or args.diagnostic_timeout is not None:
+            ap.error('--repair-curl is base scoped; combine with --apply, --channel, --offline, source options or --log-dir')
+        if os.geteuid()==0:ap.error('Run as the maintenance account, not root')
+        maintenance_gid();env=safe_environment();base=find_base(args.miniforge,env)
+        if not maintainable(base):raise RuntimeError('No maintenance access to the loaded base')
+        return repair_curl(args,base,env)
     if args.changes_output and not args.export_changes:ap.error('--changes-output requires --export-changes')
     if args.export_changes:
         if args.miniforge or args.apply or args.verify_user or args.stage or args.stage_skip or args.promote or args.check_permissions or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.base_only or args.all_envs or args.only or args.include or args.exclude or args.scan_root or args.log_dir or args.upgrade_conda or args.offline or args.ca_bundle or args.extra_ca or args.channel or args.chains_dir or args.diagnostic_timeout is not None:
@@ -3394,6 +3591,7 @@ def main():
                     if runjson([conda,'__cse_solver_probe__']).get('solver')!='libmamba':raise RuntimeError('Promoted Conda/solver startup failed')
                     row['promotion']['status']='packages-verified'
                 if row.get('xkb_migration'):verify_xkb_tree(prefix,row['xkb_migration'])
+                if broad:row['curl_runtime']=runjson([py,'-I','-B','-c',CURL_PROBE])
                 (logdir/('%03d-after-packages.json'%i)).write_text(json.dumps(after_meta,indent=2))
                 row['package_inventory_verified']=True
                 for removal in row.get('package_removals',[]):removal['status']='verified'

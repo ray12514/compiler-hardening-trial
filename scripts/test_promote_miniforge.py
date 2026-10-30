@@ -16,6 +16,7 @@ class PromotionTests(unittest.TestCase):
   after={n:dict(r,version={'conda':'26.9.4','python':'3.14.10','conda-libmamba-solver':'26.10.0','certifi':'2026.10.23',
                          'ca-certificates':'2026.10.23','pip':'26.2.2','app':'2'}[n],sha256='c'*64,md5='d'*32)
          for n,r in before.items() if n!='old-runtime'}
+  for name in ('curl','libcurl'):after[name]={'name':name,'version':'8.23.0','build':'0','subdir':'noarch','channel':'conda-forge','sha256':'c'*64,'md5':'d'*32}
   def save(prefix,packages):
    (prefix/'conda-meta').mkdir(parents=True,exist_ok=True)
    for p in (prefix/'conda-meta').glob('*.json'):p.unlink()

@@ -79,9 +79,13 @@ class StageTests(unittest.TestCase):
    versions={'conda':'26.9.4','python':'3.14.0','conda-libmamba-solver':'26.10.0','ca-certificates':'2026.10.23',
              'certifi':'2026.10.23','pip':'26.2.2','pyside6':'6.12.0','qt6-main':'6.12.0','krb5':'1.22.2'}
    chosen={n:dict(meta[n],version=v,build='new') for n,v in versions.items() if not (skip and n in ('pyside6','qt6-main','krb5'))}
+   for name in ('curl','libcurl'):chosen[name]={'name':name,'version':'8.23.0','build':'0','channel':'conda-forge'}
    def fake(argv,**kwargs):
     argv=list(map(str,argv));values=argv[5:];calls.append((argv,dict(kwargs['env'])))
-    if argv[4]==m.AUDIT:data={'packages':{},'bundles':{}}
+    if argv[4]==m.CURL_PROBE:
+     if fail=='curl-probe':return subprocess.CompletedProcess(argv,1,'','Missing Conda curl executable')
+     data={'version':'8.23.0','loaded_libcurl':'8.23.0'}
+    elif argv[4]==m.AUDIT:data={'packages':{},'bundles':{}}
     elif values==['__cse_solver_probe__']:
      if fail=='probe' and argv[0]==str(candidate/'bin/python'):return subprocess.CompletedProcess(argv,1,'','Candidate cannot import solver')
      data={'success':True,'solver':'libmamba'}
@@ -165,7 +169,7 @@ class StageTests(unittest.TestCase):
   self.assertTrue(all('--offline' in argv and env['CONDA_OFFLINE']=='true' for argv,env in calls if argv[5:6] in (['create'],['search'])))
 
  def test_partial_install_and_runtime_failures_cannot_report_ready(self):
-  for failure,status in (('install','install-failed'),('probe','verification-failed')):
+  for failure,status in (('install','install-failed'),('probe','verification-failed'),('curl-probe','verification-failed')):
    with self.subTest(failure=failure):
     result,summary,comparison,review,calls=self.run_stage(fail=failure)
     self.assertEqual(result,2);self.assertEqual(summary['status'],status)
