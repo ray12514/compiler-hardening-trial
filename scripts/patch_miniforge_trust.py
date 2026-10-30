@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 31 (2026-10-30).
+"""CSE Miniforge certificate maintenance, revision 32 (2026-10-30).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --base-guide          # ordered team rollout guide
   python3 patch_miniforge_trust.py --repair-curl          # targeted curl/libcurl plan
   python3 patch_miniforge_trust.py --repair-curl --apply  # install pair and verify
+  python3 patch_miniforge_trust.py --check-curl --curl-url https://your-service.example/
+  python3 patch_miniforge_trust.py --permissions-only --apply # groups/modes only
+  python3 patch_miniforge_trust.py --trust-only --merge-system-ca --apply # filtered OS CA merge
   python3 patch_miniforge_trust.py --export-changes /path/to/run --changes-output /new/user-notes
   python3 patch_miniforge_trust.py                       # preview loaded install
   python3 patch_miniforge_trust.py --check-permissions   # read-only, all known blockers
@@ -120,8 +123,9 @@ an offline `python -I -m sigstore --help` smoke check reports startup failures.
 A fixed package version does not establish that an unrelated crash is resolved.
 
 A CSE-owned bundle at BASE/etc/cse-trust/ca-bundle.pem is built locally from the
-selected existing site bundle, preserving all certificates except four exact
-incident-root SHA256 fingerprints. This is an INTERIM incident mitigation, not a
+selected existing site bundle, excluding the incident-denied certificates/keys.
+The policy covers four selected roots, the known affected intermediate variants,
+and their public-key identities. This is an INTERIM incident mitigation, not a
 complete refresh of Mozilla/public roots. Removing broad roots (especially AAA)
 can break legitimate certificates chaining to them. It is confined to CSE files.
 The source is --ca-bundle, otherwise configured ssl_verify when it is a filename,
@@ -138,6 +142,10 @@ native ssl PEM; unrelated settings are preserved. Already clean files are not
 rewritten. Package updates can replace these PEM files; rerun this local check
 afterward. Explicit --ca-bundle/--extra-ca sources add organizational certificates
 to the existing bundles without writing to those source paths.
+--trust-only --merge-system-ca explicitly adds the discovered OS PEM through the
+same incident certificate/public-key filter. OS trust files remain read only;
+the merged result is validated before any native PEM write. No automatic re-merge
+is performed by curl check or permissions-only modes.
 --inspect-trust reads actual bundles, versions and local configuration separately
 from past run status. A stored filtered file is not proof that every app uses it.
 Replacing the source later with a corrected vendor/site bundle rebuilds this copy.
@@ -158,7 +166,8 @@ directories become cse:2775, ordinary files cse:0664, existing executables
 cse:0775. UID ownership is preserved. Membership in other groups is still used
 to discover maintainable prefixes, but never selects the output group. This
 policy applies to eligible selected prefixes, not arbitrary parent directories.
-Symlinks are not followed. Hardlinks are broken before group/mode changes so
+Owned symlinks receive the cse link group without following their targets.
+Hardlinks are broken before group/mode changes so
 other environments and caches keep their metadata. Known private/secret paths
 and privileged files are excluded; foreign-owned files needing changes and
 extended ACLs are reported for owner/admin review. Group membership does not
@@ -209,8 +218,8 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 31
-BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TEAM BASE-ONLY ROLLOUT (revision 31)
+SCRIPT_REVISION = 32
+BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TEAM BASE-ONLY ROLLOUT (revision 32)
 
 Already updated and validated, but curl is missing while libcurl is installed?
 Use the focused repair instead of repeating the rollout:
@@ -222,6 +231,16 @@ applications/managers unchanged, filters native PEMs, normalizes permissions and
 checks PATH, loaded libcurl and HTTPS. Preview first; conflicts stop for review.
 Use the normal module setup; clear a cached system curl with hash -r or reload
 the module. No Miniforge installer replacement or full restage is required.
+For a URL check only, with normal curl settings and no package/PEM changes:
+   python3 patch_miniforge_trust.py --check-curl --curl-url https://your-service.example/
+To normalize owned base/link groups without reinstalling or changing PEM content:
+   python3 patch_miniforge_trust.py --permissions-only
+   python3 patch_miniforge_trust.py --permissions-only --apply
+If OS CAs need adding, explicitly merge them THROUGH the incident filter:
+   python3 patch_miniforge_trust.py --trust-only --merge-system-ca
+   python3 patch_miniforge_trust.py --trust-only --merge-system-ca --apply
+   python3 patch_miniforge_trust.py --inspect-trust
+Never append an unfiltered OS bundle after this step. The OS source is read only.
 
 Repeat separately for each distinct installation, including GCC and Intel.
 Load that site's usual environment/compiler and Miniforge modules first.
@@ -256,7 +275,7 @@ user verification require no cse membership; promotion/native PEM edits do.
    python3 patch_miniforge_trust.py --trust-only
    python3 patch_miniforge_trust.py --trust-only --apply
    python3 patch_miniforge_trust.py --inspect-trust
-   This removes four known incident-root fingerprints and redirects earlier
+   This filters known incident certificates/keys and redirects earlier
    script-created base CSE-path settings to the native PEM. No use-ca.sh step
    is needed for this sequence. Other site CAs/settings are preserved.
 
@@ -294,6 +313,38 @@ ROOTS = {
  'D7A7A0FB5D7E2731D771E9484EBCDEF71D5F0C3E0A2948782BC83EE0EA699EF4': 'AAA Certificate Services',
  '86A1ECBA089C4A8D3BBE2734C612BA341D813E043CF9E8A862CD5C57A36BBE6B': 'emSign ECC Root CA - G3',
 }
+# Incident disclosure fingerprints checked 2026-10-30. These public-key hashes
+# also block cross-signed/re-encoded copies of the selected roots/intermediates.
+# https://emudhra.we-have-a-problem.com/{roots,impacted-intermediates}.json
+INCIDENT_INTERMEDIATES = {'0164D7CEAE5BB909C272AF151FF44B1177AE9B47D9424B94F1D9558C30934D19': 'EM DV TLS CA - G3C',
+ '42C4ACCD12C4F59597925E1A08A7A90102608543809308D50EC427E118BA1493': 'EM DV TLS CA - G3B',
+ '432EC25F0D28DE9006D97BF752F17BBB2CD41F669933FCB072D9A1148D0261F3': 'EM EV TLS CA - G3C',
+ '45A883F349AEDFD5F3A649B5498FFB121712BA8B448F3F2A91DBC5A766FCDDBE': 'EM DV TLS CA - G3B',
+ '4B2460A466F95FD40113BCDCCA2CEB29B3B093921DE45474DA7DF48874C630B1': 'EM OV CS CA - G3C',
+ '579480AEA166290BD3C643589E795FC0D0E54E86505D180F1DFF99EFD3199512': 'EM EV TLS CA - G3B',
+ '5F1DED4DD590AF74631290CF073B122A2AAC6A1FA479778A0BD43579BD832699': 'EM OV TLS CA - G3B',
+ '62B7F9868263F72F6911FC78CEAF72C1979158B7368BF648683BB2AA39B02E72': 'EM DV TLS CA - G3C',
+ '7485B51C0ED192878FA1D2F948FB529AE1842CC5086C4B67F7BE5B2039DE9489': 'EM OV TLS CA - G3C',
+ '84112972B8E59D14560AE7E7119654474AAD119990CF3722BFC1E3B91615E1FD': 'EM OV CS CA - G3C',
+ '98B896625C0C230ADEEC3EB2CF6AAD5001ECF9156A68644E82374CE5833BC25B': 'EM OV TLS CA - G3B',
+ '9E39DE2881273ACC225A149C72BA3E0F51424963669AB633EE1DC7DF5DB067B4': 'EM OV CS CA - G3B',
+ 'A496E23AC0CAB8155FC9B117B97EAE368EFCBB9041AEC8804D5A308D2D01C2D8': 'EM OV CS CA - G3B',
+ 'CB6E15165AC802E9B3F993F16C25D41F4E81C21EBDE71AE1B012AC00BF9C7C3F': 'EM OV TLS CA - G3C',
+ 'E7568FE6E12331F4FD7DE61DA4C7559D0F8EB192A218D4741A3BA75184333838': 'EM EV TLS CA - G3B',
+ 'FD9D5C2DBBD4995AB69B8D50C439D9527B00529199C2FD01B2174EB58F07021F': 'EM EV TLS CA - G3C'}
+INCIDENT_PUBLIC_KEYS = {'0A6C2B2CA5B364207954171987AC9D2178561569D8205457E77CA90C32EDE282': 'emSign Root CS CA - G3',
+ '43BFFA19D6EF651451F6841E019931E96F6F2EAEFF28AB4B6F1CE4576DE2717B': 'EM OV TLS CA - G3B',
+ '49DD353DC2B919A3770645117D0E60C16115E7D1BC259EEFE734B00EA434FE5F': 'EM DV TLS CA - G3C',
+ '5C0660A2B164910D8FF589C18E14552E9E0EC237DCEFE2CB736D41A4811F81A0': 'EM EV TLS CA - G3C',
+ '63ECEFEE431D49523BC1136C4E72D0206A477086CAF606CD5CF025686C109CF8': 'EM OV TLS CA - G3C',
+ '8D417DB2DD8BF5E3084D1E3F196D583849D81BDD4C00C70B9D39369E96B8C782': 'emSign ECC Root CA - G3',
+ '92C063D67E8F14DB71D288E11266FFDAF69CBF115F7BAB14F3BC2F68D25E0E30': 'EM OV CS CA - G3C',
+ 'BD153ED7B0434F6886B17BCE8BBE84ED340C7132D702A8F4FA318F756ECBD6F3': 'AAA Certificate Services',
+ 'C619E4780ED8E0ABEDA24AD732567DE4383A7EA941338F6D1A7D1B49AC792FE9': 'emSign Root TLS CA - G3',
+ 'E0254C7FCDC265E2F0F8A428DABB75AB4AE039B4872D62F5EE57F0877D5A8A41': 'EM EV TLS CA - G3B',
+ 'EBED6475C2C2D80FCB199F3FE8DD6E6B3CE60B77EB15D4E42C3DEC0C6F5B5105': 'EM DV TLS CA - G3B',
+ 'EC4FFA1AD0AC88081314B7AAFFEF6A91F97CD57291BB5BA686C5415F5EB4F6B6': 'EM OV CS CA - G3B'}
+
 MANAGERS = {'mamba','libmamba','libmambapy','conda-libmamba-solver','conda-pypi'}
 # Only this management/runtime dependency set may move without a separate review.
 MANAGEMENT_DEPS = MANAGERS | {'conda','conda-self','conda-package-handling',
@@ -384,7 +435,15 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
     def visit(p):
         nonlocal changed
         st = p.lstat()
-        if stat.S_ISLNK(st.st_mode): return
+        if stat.S_ISLNK(st.st_mode):
+            if st.st_gid==shared_gid:return
+            if st.st_uid!=os.geteuid():
+                note(p,'Symlink owner UID %s must set link group cse; target ownership/access is separate'%st.st_uid,'link-group');return
+            stats['planned']+=1;stats['group_changes']+=1
+            say('LINK GROUP: %s | group %s -> cse; target unchanged'%(p,st.st_gid))
+            if apply:
+                os.lchown(str(p),-1,shared_gid);changed+=1;stats['changed']=changed
+            return
         if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)): return
         if stat.S_ISDIR(st.st_mode) and not os.access(str(p),os.R_OK|os.X_OK):
             note(p,'Directory is not readable/traversable; left unchanged');return
@@ -396,7 +455,7 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
         new=public_mode(old,stat.S_ISDIR(st.st_mode))
         if old == new and shared_gid == st.st_gid:return
         if st.st_uid != os.geteuid():
-            note(p,'Owner must set group cse and required permissions');return
+            note(p,'File/directory owner UID %s must set group cse and required permissions (current UID %s)'%(st.st_uid,os.geteuid()));return
         stats['planned'] += 1
         stats['group_changes'] += int(shared_gid != st.st_gid)
         stats['mode_changes'] += int(old != new)
@@ -432,7 +491,7 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
                     say('EXCLUDED: '+str(p));continue
                 if secret(p):
                     say('Preserving private-path permissions: '+str(p));continue
-                if p.is_symlink():continue
+                if p.is_symlink():safe_visit(p);continue
                 if not os.access(str(p),os.R_OK|os.X_OK):
                     note(p,'Directory is not readable/traversable; left unchanged');continue
                 if prefix == base and name in ('pkgs','envs') and root == base:
@@ -491,16 +550,63 @@ def pem_entries(data):
     return result
 
 
+def certificate_spki_sha256(pem):
+    """Hash the exact RFC 5280 SubjectPublicKeyInfo DER, not the signature/issuer.
+
+    This is only bounded field extraction for a denylist, not chain validation.
+    OpenSSL still parses the resulting allowed CA bundle before any write.
+    """
+    der=ssl.PEM_cert_to_DER_cert(pem)
+    def tlv(position,limit):
+        if position+2>limit:raise RuntimeError('Truncated certificate DER')
+        tag=der[position];length=der[position+1];content=position+2
+        if length & 0x80:
+            count=length & 0x7f
+            if not count or count>4 or content+count>limit:raise RuntimeError('Unsupported certificate DER length')
+            if der[content]==0:raise RuntimeError('Noncanonical certificate DER length')
+            length=int.from_bytes(der[content:content+count],'big');content+=count
+            if length<128:raise RuntimeError('Noncanonical certificate DER length')
+        end=content+length
+        if end>limit:raise RuntimeError('Certificate DER field exceeds its container')
+        return tag,content,end
+    tag,body,end=tlv(0,len(der))
+    if tag!=0x30 or end!=len(der):raise RuntimeError('Expected X.509 Certificate sequence')
+    tag,position,tbs_end=tlv(body,end)
+    if tag!=0x30:raise RuntimeError('Expected TBSCertificate sequence')
+    if position>=tbs_end:raise RuntimeError('Empty TBSCertificate sequence')
+    if der[position]==0xa0:_,_,position=tlv(position,tbs_end)  # Optional version.
+    for expected in (0x02,0x30,0x30,0x30,0x30):  # serial, signature, issuer, validity, subject
+        tag,_,position=tlv(position,tbs_end)
+        if tag!=expected:raise RuntimeError('Unexpected TBSCertificate field before public key')
+    start=position;tag,_,position=tlv(position,tbs_end)
+    if tag!=0x30:raise RuntimeError('Expected SubjectPublicKeyInfo sequence')
+    return hashlib.sha256(der[start:position]).hexdigest().upper()
+
+
+def known_blocked_certificates():
+    return {**ROOTS,**INCIDENT_INTERMEDIATES}
+
+
+def blocked_pem_entries(data):
+    known=known_blocked_certificates();blocked={}
+    for fingerprint,pem in pem_entries(data):
+        reason=known.get(fingerprint)
+        if reason is None:reason=INCIDENT_PUBLIC_KEYS.get(certificate_spki_sha256(pem))
+        if reason is not None:blocked[fingerprint]=reason
+    return blocked
+
+
 def filtered_bundle(paths):
     kept, removed = {}, set()
     for p in paths:
-        for fingerprint, pem in pem_entries(Path(p).read_text()):
-            if fingerprint in ROOTS:
-                removed.add(ROOTS[fingerprint])
+        data=Path(p).read_text();blocked=blocked_pem_entries(data)
+        for fingerprint, pem in pem_entries(data):
+            if fingerprint in blocked:
+                removed.add(blocked[fingerprint])
             else:
                 kept[fingerprint] = pem
     if not kept:
-        raise RuntimeError('No certificates would remain in the CSE bundle')
+        raise RuntimeError('No allowed certificates would remain in the output bundle')
     output = ''.join(kept.values())
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.load_verify_locations(cadata=output)  # parse only; no connection
@@ -658,13 +764,15 @@ def maintain_native_trust(base, args):
                 fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
             paths=native_bundle_paths(base)
             extras=([args.ca_bundle] if args.ca_bundle else [])+args.extra_ca
+            if getattr(args,'merge_system_ca',False):extras.append(system_bundle())
+            source_hashes={str(Path(path).expanduser().resolve(strict=True)):hashlib.sha256(Path(path).expanduser().read_bytes()).hexdigest() for path in extras}
             staged=[];details=[]
             for path in paths:
                 before=path.read_bytes()
                 text,removed=filtered_bundle([path]+extras)
                 after=text.encode() if removed or extras else before
                 changed=after!=before
-                details.append({'path':str(path),'changed':changed,'roots_removed':removed,
+                details.append({'path':str(path),'changed':changed,'roots_removed':removed,'blocked_certificates_removed':removed,
                                 'sha256':hashlib.sha256(after).hexdigest()})
                 if changed: staged.append((path,after))
                 say(('Would filter: ' if changed and not args.apply else 'Filter: ' if changed else 'Already clean: ')+str(path))
@@ -678,6 +786,8 @@ def maintain_native_trust(base, args):
             # Validate all contents before changing any file. Private backups include
             # metadata; replacements never modify a shared package-cache inode.
             if args.apply:
+                if any(hashlib.sha256(Path(path).read_bytes()).hexdigest()!=digest for path,digest in source_hashes.items()):
+                    raise RuntimeError('An approved CA source changed during planning; no files written')
                 for index,(path,data) in enumerate(staged+edits):
                     backup=logdir/('%03d-before-'%index+path.name)
                     backup.write_bytes(path.read_bytes())
@@ -685,10 +795,10 @@ def maintain_native_trust(base, args):
                     (logdir/('%03d-file.json'%index)).write_text(json.dumps({'path':str(path),'backup':str(backup),'uid':st.st_uid,'gid':st.st_gid,'mode':stat.S_IMODE(st.st_mode)},indent=2))
                     replace_preserving_metadata(path,data)
                 for path in paths:
-                    if set(dict(pem_entries(path.read_text()))) & set(ROOTS):
-                        raise RuntimeError('Known incident roots remain in '+str(path))
+                    if blocked_pem_entries(path.read_text()):
+                        raise RuntimeError('Known incident certificate/key remains in '+str(path))
             status={'status':('written' if staged or edits else 'unchanged') if args.apply else 'planned',
-                    'bundle':str(paths[0]),'mode':'native-pem','bundles':details,
+                    'bundle':str(paths[0]),'mode':'native-pem','bundles':details,'additional_sources_sha256':source_hashes,
                     'configuration_migrations':[str(p) for p,d in edits],
                     'sha256':hashlib.sha256(paths[0].read_bytes()).hexdigest() if args.apply else None}
             (logdir/'certificate-status.json').write_text(json.dumps(status,indent=2))
@@ -2090,8 +2200,8 @@ def inspect_trust(base, prefixes=()):
     for path in dict.fromkeys(paths):
         try:
             data=path.read_bytes();entries=pem_entries(data.decode())
-            present=[ROOTS[h] for h,pem in entries if h in ROOTS]
-            print('Bundle: %s\n  SHA256=%s\n  Certificates=%d; known incident roots=%s' % (path,hashlib.sha256(data).hexdigest(),len(entries),', '.join(present) or 'NONE OF THE FOUR MATCHED'))
+            present=list(blocked_pem_entries(data.decode()).values())
+            print('Bundle: %s\n  SHA256=%s\n  Certificates=%d; known incident certificates/keys=%s' % (path,hashlib.sha256(data).hexdigest(),len(entries),', '.join(present) or 'NONE MATCHED'))
             if path in native and present: good=False
         except FileNotFoundError:
             if path in native: good=False;print('Native bundle: ABSENT at '+str(path))
@@ -2105,7 +2215,7 @@ def inspect_trust(base, prefixes=()):
     print('Current shell CA variables: '+json.dumps({k:os.environ[k] for k in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','CURL_CA_BUNDLE','PIP_CERT','SSL_CERT_DIR') if k in os.environ},sort_keys=True))
     selected=[k for k in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','CURL_CA_BUNDLE','PIP_CERT') if os.environ.get(k)==str(bundle)]
     print('Current shell variables selecting native PEM: '+(', '.join(selected) or 'NONE; native defaults or application-specific configuration may apply'))
-    print('Native Miniforge bundle screening: '+('PRESENT, PARSEABLE, FOUR KNOWN ROOTS ABSENT' if good else 'NOT CONFIRMED'))
+    print('Native Miniforge bundle screening: '+('PRESENT, PARSEABLE, KNOWN INCIDENT CERTIFICATES/KEYS ABSENT' if good else 'NOT CONFIRMED'))
     print('Stored bundle, package versions and active application trust are separate. This does not prove full chain rejection or proxy remediation.')
     print('No changes, package updates or external TLS connections were made.')
     return 0 if good else 2
@@ -2449,6 +2559,8 @@ def export_package_changes(source, destination=None):
         rows=json.loads((source/'summary.json').read_text())
         if len(rows)!=1:raise RuntimeError('Export requires a report for one installation; mixed-prefix historical reports need separate review')
         row=rows[0];mode=(source/'run.log').read_text() if (source/'run.log').is_file() else ''
+        if row.get('mode')=='permissions-only' or row.get('certificate_status',{}).get('mode')=='native-pem':
+            raise RuntimeError('This is a permission/certificate-only run; select the original package-update log for a change list')
         if 'Mode: APPLY' not in mode:raise RuntimeError('No verified installed transaction is recorded; this may be a preview')
         before_file=source/'000-before-packages.json';after_file=source/'000-after-packages.json'
         details={'prefix':row['prefix'],'rollout_status':row['status']}
@@ -2675,8 +2787,8 @@ def stage_base(args, base, env):
         for name,current in audit.get('packages',{}).items():
             if name in MINIMUM and version(current)<version(MINIMUM[name]):raise RuntimeError('Candidate runtime package below minimum: '+name)
         for label,path in audit.get('bundles',{}).items():
-            if path and Path(path).is_file() and {h for h,pem in pem_entries(Path(path).read_text())}&set(ROOTS):
-                raise RuntimeError('Known incident roots remain in candidate '+label+': '+path)
+            if path and Path(path).is_file() and blocked_pem_entries(Path(path).read_text()):
+                raise RuntimeError('Known incident certificates/keys remain in candidate '+label+': '+path)
         run(['config','--file',str(candidate/'.condarc'),'--set','ssl_verify',str(bundle)],'configure private candidate trust',raw=True)
         run(['env','config','vars','set','-p',str(candidate)]+[k+'='+v for k,v in values.items()],'configure private candidate activation',raw=True)
         (root/'candidate-explicit.txt').write_text(run(['list','-p',str(candidate),'--explicit'],'record verified candidate package URLs',runtime=candidate,raw=True))
@@ -2746,12 +2858,16 @@ CURL_HTTPS_PROBE = CURL_PROBE_SETUP+r'''
 from urllib.parse import urlsplit
 url=sys.argv[1]
 if urlsplit(url).scheme!='https':raise RuntimeError('curl HTTPS probe requires an HTTPS package source')
-info=curl_probe(pathlib.Path(sys.prefix),True)
-result=subprocess.run([info['executable'],'-q','--no-insecure','--fail','--head','--location',
+info=curl_probe(pathlib.Path(sys.prefix),'direct' not in sys.argv[2:])
+# Use the user's normal curl configuration, including approved cacert/proxy
+# settings. Explicit verification flags override insecure settings in curlrc.
+result=subprocess.run([info['executable'],'--no-insecure','--no-proxy-insecure','--fail','--head','--location','--verbose',
     '--proto','=https','--proto-redir','=https','--connect-timeout','15','--max-time','30',
     '--output',os.devnull,'--write-out','%{http_code}',url],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=40)
-if result.returncode:raise RuntimeError('Conda curl HTTPS request failed: '+result.stderr.strip())
-print(json.dumps({'url':url,'http_status':result.stdout.strip(),'curl':info}))
+ca_details=[line.strip() for line in result.stderr.splitlines() if re.search(r'CAfile:|CApath:|issuer:|subject:|certificate verify|SSL certificate|curl: \(',line,re.I)]
+if result.returncode:raise RuntimeError('Conda curl HTTPS HEAD failed for '+url+' (exit '+str(result.returncode)+'): '+' | '.join(ca_details or ['See the endpoint and its normal CA/proxy configuration']))
+print(json.dumps({'url':url,'method':'HEAD','config':'normal curl configuration; TLS verification required',
+    'ca_details':ca_details,'http_status':result.stdout.strip(),'curl':info}))
 '''
 
 USER_IMPORT_PROBE = CURL_PROBE_SETUP+r'''
@@ -2821,13 +2937,13 @@ def check_user_trust(prefix, config, env, audit, pip_config):
             if not folder.is_dir():raise RuntimeError('Configured CA directory is unavailable: '+str(folder))
             for path in folder.iterdir():
                 if path.is_file() and '-----BEGIN CERTIFICATE-----' in path.read_text(errors='replace'):paths.add(path)
-    matched=set(audit.get('default_ca_fingerprints',())) & set(ROOTS)
+    known=known_blocked_certificates();matched={h:known[h] for h in audit.get('default_ca_fingerprints',()) if h in known}
     evidence=[]
     for path in sorted(paths):
-        data=path.read_bytes();present=set(dict(pem_entries(data.decode()))) & set(ROOTS)
+        data=path.read_bytes();present=blocked_pem_entries(data.decode())
         matched.update(present)
         evidence.append({'path':str(path),'sha256':hashlib.sha256(data).hexdigest(),'incident_roots':sorted(present)})
-    if matched:raise RuntimeError('Known incident roots remain in selected trust: '+', '.join(ROOTS[h] for h in sorted(matched)))
+    if matched:raise RuntimeError('Known incident certificates/keys remain in selected trust: '+', '.join(matched[h] for h in sorted(matched)))
     return evidence
 
 
@@ -2932,7 +3048,8 @@ def verify_user_install(args, base, env):
         audit=run([base/'bin/python','-I','-B','-c',USER_TRUST_AUDIT])
         trust=check('base-trust',lambda:check_user_trust(base,config,env,audit,pip_config(base/'bin/python')))
         check('base-curl',lambda:run([base/'bin/python','-I','-B','-c',CURL_PROBE,'selected']))
-        check('base-curl-https',lambda:run([base/'bin/python','-I','-B','-c',CURL_HTTPS_PROBE,urls[0].rstrip('/')+'/noarch/repodata.json']))
+        curl_url=getattr(args,'curl_url',None) or urls[0].rstrip('/')+'/noarch/repodata.json'
+        check('base-curl-https',lambda:run([base/'bin/python','-I','-B','-c',CURL_HTTPS_PROBE,curl_url]))
         python_version=before['python']['version'].split('.')
         specs=['python='+'.'.join(python_version[:2]),'pip>='+MINIMUM['pip'],'certifi>='+MINIMUM['certifi'],
                'ca-certificates>='+MINIMUM['ca-certificates'],'setuptools','wheel','curl']
@@ -3021,6 +3138,61 @@ def curl_dependency_scope(meta, plan):
     return needed
 
 
+def permissions_only(args, base):
+    root=(args.log_dir or Path.home()/'.cse-trust-logs'/('permission-fix-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))).expanduser().resolve()
+    if root==base or base in root.parents:raise RuntimeError('Permission reports must be outside the base')
+    root.mkdir(mode=0o700,parents=True,exist_ok=False);root.chmod(0o700)
+    stats={};skipped=[]
+    with (root/'run.log').open('w') as log:
+        log.write('Mode: '+('APPLY' if args.apply else 'LOCAL PREVIEW')+'; permissions only\n')
+        def detail(message):
+            log.write(message+'\n')
+            if args.verbose:print(message,flush=True)
+        warnings=public_permissions(base,base,args.apply,detail,skipped,[base/PATH_BACKUPS],stats)
+    write_skip_reports(root,skipped)
+    row={'prefix':str(base),'status':('updated' if args.apply else 'previewed')+('-with-skips' if warnings else ''),
+         'issues':[],'permissions':stats,'skipped_paths':skipped,'package_changes':[],
+         'permission_warnings':warnings,'mode':'permissions-only'}
+    (root/'summary.json').write_text(json.dumps([row],indent=2))
+    print('Base permissions: %d %s; %d access/owner review notes'%(stats['changed'] if args.apply else stats['planned'],'changed' if args.apply else 'planned',len(warnings)))
+    print('Details: '+str(root/'skipped-paths.txt'))
+    print('No package transactions or certificate-content changes were performed. Symlink targets outside base were not modified.')
+    return 0
+
+
+def check_curl(args, base, env):
+    """Recheck the installed command/endpoint only; no maintenance access needed."""
+    root=(args.log_dir or Path.home()/'.cse-trust-logs'/('curl-check-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))).expanduser().resolve()
+    if root==base or base in root.parents:raise RuntimeError('Curl check reports must be outside the base')
+    root.mkdir(mode=0o700,parents=True,exist_ok=False);root.chmod(0o700)
+    summary={'base':str(base),'status':'failed','checks':{},'issues':[]}
+    def run(program,values):
+        result=subprocess.run([str(base/'bin/python'),'-I','-B','-c',program]+values,env=env,text=True,
+                              stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=90)
+        if result.returncode:raise RuntimeError(diagnostic_text(result.stdout,result.stderr))
+        return json.loads(result.stdout)
+    try:
+        url=getattr(args,'curl_url',None)
+        if not url:
+            config=run(LIBMAMBA_CLI,['config','--show','--json'])
+            _,urls,_=requested_channels(args.channel,config)
+            url=next(value for value in urls if value.startswith('https://')).rstrip('/')+'/noarch/repodata.json'
+        verification_source_url(url);summary['url']=url
+        startup=run(CURL_PROBE,[]);summary['checks']['startup']=startup
+        selected=startup.get('selected_on_path')
+        summary['path_selects_base_curl']=bool(selected and Path(selected).resolve()==(base/'bin/curl').resolve())
+        summary['checks']['https']=run(CURL_HTTPS_PROBE,[url,'direct']);summary['status']='passed'
+    except (Exception,KeyboardInterrupt) as exc:summary['issues'].append(str(exc))
+    (root/'curl-check.json').write_text(redact_verification(json.dumps(summary,indent=2)))
+    print('Installed curl startup: '+('PASSED' if 'startup' in summary['checks'] else 'FAILED'))
+    if summary.get('checks',{}).get('startup') and not summary.get('path_selects_base_curl'):
+        print('PATH NOTE: bare curl selects '+str(summary['checks']['startup'].get('selected_on_path'))+'; this check tested '+str(base/'bin/curl')+' directly.')
+    print('HTTPS HEAD check: '+summary['status'].upper()+' | '+redact_verification(summary.get('url','URL discovery failed')))
+    for issue in summary['issues']:print('ATTENTION: '+redact_verification(issue))
+    print('Report: '+str(root/'curl-check.json')+' | no packages, PEMs or permissions changed')
+    return 0 if summary['status']=='passed' else 2
+
+
 def repair_curl(args, base, env):
     """Target curl and its dependency closure; never repeat the full base update."""
     logdir=(args.log_dir or Path.home()/'.cse-trust-logs'/('curl-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))).expanduser().resolve()
@@ -3033,6 +3205,9 @@ def repair_curl(args, base, env):
     before={};after={};number=0;lock=None
     with (logdir/'run.log').open('w',buffering=1) as log:
         def say(value):value=redact_verification(value);print(value,flush=True);log.write(value+'\n')
+        def detail(value):
+            if getattr(args,'verbose',False):say(value)
+            else:log.write(redact_verification(value)+'\n')
         def runjson(values,program=LIBMAMBA_CLI,process_env=None):
             nonlocal number
             number+=1;command=[str(base/'bin/python'),'-I','-B','-c',program]+list(map(str,values))
@@ -3102,13 +3277,17 @@ def repair_curl(args, base, env):
                 runjson(common+exact+['--yes'])
                 after=records(base);verify_installed_plan(final,after)
                 (logdir/'000-after-packages.json').write_text(json.dumps(after,indent=2));row['package_inventory_verified']=True
+                row['curl_repair']['packages']='installed-and-verified'
                 row['package_changes']=[{'name':name,'before':before.get(name,{}).get('version','absent'),'after':record['version']} for name,record in after.items()
                     if name not in before or (record['version'],record['build'])!=(before[name]['version'],before[name]['build'])]
                 row['phase']='filter installed native PEM files'
                 trust_args=argparse.Namespace(**vars(args));trust_args.log_dir=logdir/'native-trust'
                 maintain_native_trust(base,trust_args)
                 row['phase']='normalize shared base permissions';row['permissions']={};row['skipped_paths']=[]
-                warnings=public_permissions(base,base,True,say,row['skipped_paths'],[base/PATH_BACKUPS],row['permissions'])
+                warnings=public_permissions(base,base,True,detail,row['skipped_paths'],[base/PATH_BACKUPS],row['permissions'])
+                write_skip_reports(logdir,row['skipped_paths'])
+                row['curl_repair']['permissions']={'changed':row['permissions'].get('changed',0),'review_count':len(warnings)}
+                say('Permissions: %d changed; %d access/owner review notes. Details: %s'%(row['permissions'].get('changed',0),len(warnings),logdir/'skipped-paths.txt'))
                 row['phase']='check Conda curl and loaded library in the current module environment'
                 # Do not hide the user's loaded libraries or PATH for this check.
                 runtime_env=os.environ.copy();runtime_env['PYTHONDONTWRITEBYTECODE']='1'
@@ -3116,16 +3295,22 @@ def repair_curl(args, base, env):
                 runtime=row['curl_repair']['runtime']
                 say('Selected curl: '+str(runtime.get('selected_on_path'))+' | version='+str(runtime.get('version'))+' | loaded libcurl='+str(runtime.get('loaded_libcurl')))
                 if not args.offline:
-                    source_url=next((url for url in urls if url.startswith('https://')),None)
-                    if not source_url:raise RuntimeError('No HTTPS package source available for the curl connectivity check')
-                    verification_source_url(source_url)
+                    check_url=getattr(args,'curl_url',None)
+                    if not check_url:
+                        source_url=next((url for url in urls if url.startswith('https://')),None)
+                        if not source_url:raise RuntimeError('No HTTPS package source available for the curl connectivity check')
+                        check_url=source_url.rstrip('/')+'/noarch/repodata.json'
+                    verification_source_url(check_url)
+                    row['curl_repair']['https']={'status':'running','url':check_url,'method':'HEAD'}
+                    say('HTTPS HEAD test URL: '+check_url+' | normal curl configuration; verification required')
                     row['phase']='check Conda curl HTTPS access'
-                    row['curl_repair']['https']=runjson([source_url.rstrip('/')+'/noarch/repodata.json'],program=CURL_HTTPS_PROBE,process_env=runtime_env)
+                    row['curl_repair']['https']=dict(runjson([check_url],program=CURL_HTTPS_PROBE,process_env=runtime_env),status='passed')
                 else:row['curl_repair']['https']={'status':'not-tested','reason':'offline repair'}
                 row['status']='updated-with-skips' if warnings else 'updated'
             else:row['status']='previewed'
         except (Exception,KeyboardInterrupt) as exc:
             row['issues'].append(redact_verification(str(exc)));say('ATTENTION: '+str(exc))
+            if row['phase']=='check Conda curl HTTPS access':row['curl_repair']['https']['status']='failed'
         finally:
             try:
                 if row.get('package_inventory_verified'):
@@ -3135,7 +3320,8 @@ def repair_curl(args, base, env):
                     row['package_change_list']={'path':str(directory/'README.md'),'counts':manifest['counts'],'evidence':manifest['evidence']}
                 (logdir/'summary.json').write_text(json.dumps([row],indent=2))
                 say('Curl repair: '+row['status']+' | logs: '+str(logdir))
-                if row['issues']:say('Installed packages may have changed; read this run before retrying or repeating a full rollout.')
+                if row.get('package_inventory_verified'):say('Package installation: VERIFIED. Remaining runtime/HTTPS/permission results are separate.')
+                if row['issues']:say('Read this run before retrying; one endpoint failure does not establish that curl fails for every site.')
             finally:
                 if lock:lock.close()
     return 0 if row['status'] in ('previewed','updated','updated-with-skips') else 2
@@ -3150,6 +3336,9 @@ def main():
     ap.add_argument('miniforge', nargs='?', type=Path)
     ap.add_argument('--apply', action='store_true')
     ap.add_argument('--repair-curl',action='store_true',help='Target only the base curl executable, matched libcurl and necessary dependencies; default dry-run, add --apply to repair')
+    ap.add_argument('--check-curl',action='store_true',help='Read-only startup and HTTPS check of the installed curl; no package or permission changes')
+    ap.add_argument('--curl-url',metavar='HTTPS_URL',help='HTTPS endpoint for --check-curl, --repair-curl or --verify-user; default approved channel noarch repodata')
+    ap.add_argument('--permissions-only',action='store_true',help='Preview base group/mode normalization only; add --apply to fix owned files/links, without packages or PEM-content changes')
     ap.add_argument('--verify-user',type=Path,metavar='NEW_HOME_DIR',help='Post-install online user checks in a new private home directory; no base updates or cse membership needed')
     ap.add_argument('--stage',type=Path,metavar='NEW_PRIVATE_DIR',help='Solve and install a fresh private base candidate with comparison reports; source base stays read only; no --apply needed')
     ap.add_argument('--stage-skip',action='append',default=[],metavar='PACKAGE',help='Omit this application request from --stage; repeatable; dependencies may still require it')
@@ -3157,6 +3346,7 @@ def main():
     ap.add_argument('--check-permissions',action='store_true',help='Read-only complete known-path permission preflight with private owner-grouped reports; may combine with --promote to inspect candidate paths')
     ap.add_argument('--inspect-trust',action='store_true',help='Read actual CSE/base CA files and configuration; no updates')
     ap.add_argument('--trust-only',action='store_true',help='Filter existing base Miniforge PEM files in place; no packages, new CA path, or shell snippet')
+    ap.add_argument('--merge-system-ca',action='store_true',help='With --trust-only, merge the discovered OS PEM into existing native bundles AFTER incident certificate/key filtering; system files are read only')
     scope=ap.add_mutually_exclusive_group()
     scope.add_argument('--base-only',action='store_true',help='Select only the loaded base; update Conda and compatible base packages together')
     scope.add_argument('--only',type=Path,action='append',default=[],help='Select only this exact environment; repeatable; still uses the base conda/CSE bundle')
@@ -3176,6 +3366,23 @@ def main():
     ap.add_argument('--chains-dir',type=Path,help='Approved local incident chain directory; no downloads')
     ap.add_argument('--log-dir',type=Path)
     args = ap.parse_args()
+    if args.merge_system_ca and not args.trust_only:ap.error('--merge-system-ca requires --trust-only; no implicit CA merge is performed in other modes')
+    if args.permissions_only:
+        if args.check_curl or args.curl_url or args.repair_curl or args.export_changes or args.changes_output or args.verify_user or args.stage or args.stage_skip or args.promote or args.check_permissions or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.only or args.all_envs or args.include or args.exclude or args.scan_root or args.upgrade_conda or args.chains_dir or args.offline or args.ca_bundle or args.extra_ca or args.channel or args.diagnostic_timeout is not None:
+            ap.error('--permissions-only targets base ownership/modes only; combine with --apply, --log-dir or --verbose')
+        if os.geteuid()==0:ap.error('Run as the maintenance account, not root')
+        maintenance_gid();base=find_base(args.miniforge,safe_environment())
+        if not maintainable(base):raise RuntimeError('No maintenance access to the loaded base')
+        return permissions_only(args,base)
+    if args.curl_url:
+        if not (args.check_curl or args.repair_curl or args.verify_user):ap.error('--curl-url requires --check-curl, --repair-curl or --verify-user')
+        verification_source_url(args.curl_url)
+        if args.offline:ap.error('--curl-url cannot be checked with --offline')
+    if args.check_curl:
+        if args.repair_curl or args.apply or args.export_changes or args.changes_output or args.verify_user or args.stage or args.stage_skip or args.promote or args.check_permissions or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.only or args.all_envs or args.include or args.exclude or args.scan_root or args.upgrade_conda or args.chains_dir or args.offline or args.ca_bundle or args.extra_ca or args.diagnostic_timeout is not None:
+            ap.error('--check-curl only checks the installed command; combine with --curl-url, --channel, --log-dir or --verbose')
+        env=os.environ.copy();env['PYTHONDONTWRITEBYTECODE']='1'
+        return check_curl(args,find_base(args.miniforge,env),env)
     if args.repair_curl:
         if args.export_changes or args.changes_output or args.verify_user or args.stage or args.stage_skip or args.promote or args.check_permissions or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.only or args.all_envs or args.include or args.exclude or args.scan_root or args.upgrade_conda or args.chains_dir or args.diagnostic_timeout is not None:
             ap.error('--repair-curl is base scoped; combine with --apply, --channel, --offline, source options or --log-dir')
@@ -3278,7 +3485,7 @@ def main():
     say('Base: '+str(base)); say('Source CA: '+str(source));say('Private logs: '+str(logdir))
     say('Current UID/groups: %s / %s' % (os.geteuid(),','.join(map(str,sorted(groups())))))
     say('Shared permissions target: cse (GID %d); directories 2775, files 0664, executables 0775' % cse_gid)
-    say('Source roots selected for removal from CSE copy: '+(', '.join(removed) or 'none of the four matched'))
+    say('Known incident certificates selected for removal from CSE copy: '+(', '.join(removed) or 'none matched'))
     say('This is local mitigation, not evidence of proxy remediation or a full trust-store refresh.')
     command_number = 0
     def record_failure(cmd, stdout, stderr, code, reason=None):
@@ -3615,15 +3822,15 @@ def main():
                     # Check actual embedded bundles in addition to selected CSE bundle.
                     for label,path in after['bundles'].items():
                         if path and Path(path).is_file():
-                            present={h for h,pem in pem_entries(Path(path).read_text())}&set(ROOTS)
-                            if present:row['issues'].append('Known incident roots remain in '+label+': '+path)
+                            present=blocked_pem_entries(Path(path).read_text())
+                            if present:row['issues'].append('Known incident certificates/keys remain in '+label+': '+path)
                 if 'sigstore' in after_meta and 'python' in meta:
                     failure = sigstore_startup(py,env,log)
                     if failure: row['issues'].append(failure)
                 for rel in ('ssl/cacert.pem','ssl/cert.pem'):
                     candidate=prefix/rel
-                    if candidate.is_file() and {h for h,pem in pem_entries(candidate.read_text())}&set(ROOTS):
-                        row['issues'].append('Known incident roots remain in '+str(candidate))
+                    if candidate.is_file() and blocked_pem_entries(candidate.read_text()):
+                        row['issues'].append('Known incident certificates/keys remain in '+str(candidate))
                 if args.chains_dir:
                     verify_chains(prefix/'bin/openssl' if (prefix/'bin/openssl').is_file() else Path('/usr/bin/openssl'),bundle,args.chains_dir.resolve(),env,run)
             else:

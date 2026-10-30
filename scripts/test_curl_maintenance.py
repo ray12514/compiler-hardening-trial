@@ -47,7 +47,7 @@ class CurlRuntimeTests(unittest.TestCase):
 
 
 class CurlRepairTests(unittest.TestCase):
- def exercise(self,apply=True,unrelated=False,fail_runtime=False,real_trust=False):
+ def exercise(self,apply=True,unrelated=False,fail_runtime=False,real_trust=False,fail_https=False,curl_url=None,permission_notes=False):
   with tempfile.TemporaryDirectory() as directory:
    root=Path(directory).resolve();base=root/'base';(base/'bin').mkdir(parents=True);(base/'conda-meta').mkdir()
    (base/'bin/python').touch();(base/'bin/conda').touch()
@@ -65,7 +65,9 @@ class CurlRepairTests(unittest.TestCase):
    if unrelated:links.append({'name':'numpy','version':'3.0','build':'0','channel':'conda-forge'})
    def fake(argv,**kwargs):
     values=argv[5:];calls.append((values,dict(kwargs['env'])))
-    if argv[4]==m.CURL_HTTPS_PROBE:result={'http_status':'200'}
+    if argv[4]==m.CURL_HTTPS_PROBE:
+     if fail_https:return subprocess.CompletedProcess(argv,1,'','curl: (60) SSL certificate problem at requested endpoint')
+     result={'http_status':'200'}
     elif argv[4]==m.CURL_PROBE:
      if fail_runtime:return subprocess.CompletedProcess(argv,1,'','PATH selects /usr/bin/curl instead of Conda curl')
      result={'version':'8.23.0','loaded_libcurl':'8.23.0','selected_on_path':str(base/'bin/curl')}
@@ -76,11 +78,17 @@ class CurlRepairTests(unittest.TestCase):
      for record in links:installed[record['name']]=record
      save();(base/'bin/curl').touch();result={'success':True}
     return subprocess.CompletedProcess(argv,0,json.dumps(result),'')
-   args=SimpleNamespace(apply=apply,log_dir=root/'logs',channel=[],offline=False,ca_bundle=None,extra_ca=[])
+   args=SimpleNamespace(apply=apply,log_dir=root/'logs',channel=[],offline=False,ca_bundle=None,extra_ca=[],verbose=False,curl_url=curl_url)
+   def permissions(*values):
+    if not permission_notes:return []
+    values[3]('SKIP PATH: foreign-owned directory requires owner review')
+    values[4].append({'path':str(base/'bin/python'),'stage':'permissions','reason':'owner review','prefix':str(base)})
+    return ['owner review']
    trust_patch=patch.object(m,'maintain_native_trust',wraps=m.maintain_native_trust) if real_trust else patch.object(m,'maintain_native_trust',return_value=0)
-   with patch.object(m.subprocess,'run',side_effect=fake),patch.object(m,'maintenance_gid',return_value=os.getegid()),patch.object(m,'choose_source',return_value=root/'ca.pem'),patch.object(m,'filtered_bundle',return_value=('PEM',[])),patch.object(m,'permission_holds',return_value={}),patch.object(m,'public_permissions',return_value=[]) as perms,trust_patch as trust,contextlib.redirect_stdout(io.StringIO()):
+   with patch.object(m.subprocess,'run',side_effect=fake),patch.object(m,'maintenance_gid',return_value=os.getegid()),patch.object(m,'choose_source',return_value=root/'ca.pem'),patch.object(m,'filtered_bundle',return_value=('PEM',[])),patch.object(m,'permission_holds',return_value={}),patch.object(m,'public_permissions',side_effect=permissions) as perms,trust_patch as trust,contextlib.redirect_stdout(io.StringIO()) as output:
     result=m.repair_curl(args,base,m.safe_environment())
    row=json.loads((root/'logs/summary.json').read_text())[0]
+   row['test_stdout']=output.getvalue()
    self.assertEqual(installed['python']['version'],'3.12.9');self.assertEqual(installed['numpy']['version'],'2.0')
    if not apply:self.assertEqual(json.dumps(installed,sort_keys=True),before)
    return result,row,calls,trust.call_count,perms.call_count
@@ -114,6 +122,16 @@ class CurlRepairTests(unittest.TestCase):
   meta={'libcurl':{'depends':['openssl >=3.5']},'openssl':{'depends':['libgcc >=14']}}
   plan={'actions':{'LINK':[{'name':'libcurl','version':'8.23.0'}]}}
   self.assertTrue({'curl','libcurl','openssl','libgcc'}<=m.curl_dependency_scope(meta,plan))
+ def test_one_endpoint_failure_is_separate_from_verified_package_installation(self):
+  url='https://user-service.example/download'
+  result,row,calls,trust,perms=self.exercise(fail_https=True,curl_url=url)
+  self.assertEqual(result,2);self.assertEqual(row['curl_repair']['packages'],'installed-and-verified')
+  self.assertEqual(row['curl_repair']['https']['url'],url);self.assertEqual(row['curl_repair']['https']['status'],'failed')
+  self.assertIn('Package installation: VERIFIED',row['test_stdout'])
+ def test_permission_notes_are_logged_without_printing_each_skipped_path(self):
+  result,row,calls,trust,perms=self.exercise(permission_notes=True)
+  self.assertEqual(result,0);self.assertEqual(row['status'],'updated-with-skips')
+  self.assertNotIn('SKIP PATH:',row['test_stdout']);self.assertIn('1 access/owner review notes',row['test_stdout'])
 
 
 if __name__=='__main__':unittest.main()

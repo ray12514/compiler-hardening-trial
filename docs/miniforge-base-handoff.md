@@ -19,6 +19,18 @@ PEMs/permissions, and checks the selected command and HTTPS. Unrelated applicati
 changes are rejected. Users should reload the module or use `hash -r` to clear a
 cached system curl. New stages now include curl and test its startup explicitly.
 
+With revision 32, a working installed curl can be checked against the actual user
+site without another repair: `--check-curl --curl-url https://your-service.example/`.
+Use `--permissions-only --apply` for remaining owned file/link group corrections.
+Both preserve the existing merged PEM contents; another OS-certificate merge is
+not part of these checks. Full option details are in `--help` / `--base-guide`.
+
+If the OS CAs need merging, do it explicitly through the incident filter:
+`--trust-only --merge-system-ca --apply`, followed by `--inspect-trust`.
+This reads the OS source without changing it and blocks the known incident
+certificates/keys before writing Miniforge's PEMs. Never append unfiltered OS CAs
+after that step.
+
 **1. Stage privately.** Build a candidate under your home. Use a new directory
 name for each installation or retry.
 

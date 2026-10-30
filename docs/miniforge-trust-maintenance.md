@@ -51,10 +51,52 @@ permissions, writes the package change list, and runs the Conda curl executable.
 It checks the executable and loaded libcurl versions against installed records,
 requires command lookup in the current module environment to select that curl,
 and performs a verified HTTPS HEAD request to the approved channel's noarch
-repodata. This controlled request ignores `.curlrc` and does not disable TLS
-verification or inject a replacement CA for the runtime check. No incident test
+repodata by default. Revision 32 honors normal `.curlrc` CA/proxy settings and
+forces server and HTTPS-proxy verification on. It does not inject a replacement
+CA or re-merge/reset your existing OS-to-Miniforge PEM contents. No incident test
 hosts are probed. Existing module library settings are retained for runtime tests
 so a conflict is reported rather than hidden.
+
+A repository HEAD request can differ from a user's request to another site.
+Its failure is specific to the tested URL/settings; it does not establish that
+all curl requests fail or that OpenSSL needs replacing. Revision 32 prints the
+URL and reports verified package installation separately from HTTPS results.
+The HTTPS result includes method, CA/issuer diagnostic lines and response status,
+without logging HTTP authorization or cookie headers.
+
+To recheck the exact service using the installed base curl, without reinstalling
+packages, filtering PEMs or changing permissions:
+
+```bash
+python3 patch_miniforge_trust.py --check-curl --curl-url https://your-service.example/path
+```
+
+This invokes the base's curl directly and reports bare `curl` PATH selection
+separately, so a working directly invoked binary can be distinguished from an
+incorrect module PATH. `--repair-curl` and `--verify-user` also accept `--curl-url`;
+their standard user-workflow checks still require PATH to select the right curl.
+The request remains an HTTPS HEAD, follows HTTPS-only redirects, and requires
+certificate verification even if `.curlrc` contains an insecure option. A
+server-specific HEAD/authentication policy can still differ from a manual GET.
+Keep the existing merged trust file; any later merge must use an approved updated
+source and retain incident-root filtering.
+
+For only the outstanding base group/mode corrections:
+
+```bash
+python3 patch_miniforge_trust.py --permissions-only
+python3 patch_miniforge_trust.py --permissions-only --apply
+```
+
+Owned symlinks receive group `cse` through link-only metadata changes, including
+links whose targets live outside base. Their targets are not followed or altered.
+An internal regular target is handled separately during the normal base walk.
+Foreign-owned entries still require their actual owner/admin to change metadata;
+group membership alone does not grant that operation. The report distinguishes
+link ownership from regular-file/directory ownership and records owner UIDs.
+This mode performs no package transaction, CA merge, or certificate-content edit.
+Curl repair's permission details are now private by default (`--verbose` shows
+them); normal output gives changed/review counts and the skip-report location.
 
 Read the final status and printed private log directory. `incomplete` after an
 install can mean the packages were updated but a runtime, PATH, certificate or
@@ -77,6 +119,48 @@ packages; this repair does not install a blanket replacement system toolset.
 
 ## Packages already installed: update the existing PEM files only
 
+### Optional OS CA merge: filter before writing
+
+If the OS certificates were never merged, or an approved updated OS bundle needs
+incorporating, revision 32 provides an explicit certificate-only path:
+
+```bash
+python3 patch_miniforge_trust.py --trust-only --merge-system-ca
+python3 patch_miniforge_trust.py --trust-only --merge-system-ca --apply
+python3 patch_miniforge_trust.py --inspect-trust
+```
+
+This discovers the standard system PEM source and combines its allowed CAs with
+each existing native Miniforge bundle. **Both inputs are incident-filtered before
+any write.** It preserves unrelated/site CAs, de-duplicates certificates, and
+never appends an unfiltered OS bundle as a later step. The OS file is read only.
+The output is parsed/validated, replaced atomically per native file, and screened
+again afterward. A malformed/policy-bearing source or a source changed during
+planning stops the operation. No package transaction or installer replacement
+is performed. Already equivalent output is left untouched on repeat runs.
+
+The existing policy's four selected roots remain excluded. The offline filter
+also covers the disclosure's 16 affected intermediate certificate variants and
+public-key identities: eight compromised intermediate keys plus the four selected
+root keys. A cross-signed/re-encoded certificate sharing one of those keys is
+excluded even if its full certificate fingerprint differs. This is targeted
+incident filtering, not a claim to detect every future CA compromise or all
+certificates with an eMudhra-related name. The source fingerprints were checked
+against the disclosure's [roots](https://emudhra.we-have-a-problem.com/roots.json)
+and [affected intermediates](https://emudhra.we-have-a-problem.com/impacted-intermediates.json)
+on 2026-10-30. The script carries them locally and makes no incident-site request
+during merge or inspection. Regression fixtures contain public certificates only.
+
+`certificate-status.json` records the additional source hashes and per-native-file
+output hashes/removed entries. Keep it with the maintenance record. OS trust
+maintenance remains the administrator's responsibility; merging does not patch
+the system source. Normal curl configuration can select a different CA source,
+so use `--check-curl --curl-url` and its CA-file details to confirm the effective
+settings before assuming a successful request proves the incident remediation.
+Full chain rejection remains the separate offline `--chains-dir` check.
+
+### Filter the current native files without importing another source
+
 Revision 27 (2026-10-28) makes `--trust-only` maintain Miniforge's existing
 certificate files in place. Load your usual Miniforge module and preview:
 
@@ -97,8 +181,8 @@ or environment-permission normalization is performed.
 
 This mode filters existing `ssl/cacert.pem`, `ssl/cert.pem`, certifi, and pip's
 vendored certifi PEM files found inside the base prefix. Each existing bundle
-keeps its other roots, including organizational CAs. It removes only the four
-incident-root fingerprints already used by this script. Symlink aliases within
+keeps its other roots, including organizational CAs. Revision 32 filters the known
+incident certificates and public keys described above. Symlink aliases within
 the prefix remain links; external targets (including admin trust files) are
 refused. Replacing a hardlinked file does not change the package-cache copy.
 File ownership and permissions are retained. Already clean files are reported
@@ -1257,7 +1341,8 @@ The target group is always `cse`, regardless of your primary group or the prefix
 previous group. Setgid enables group inheritance in newly created subdirectories.
 Package installation permissions are normalized after a successful update.
 
-Symlinks are not followed. Hardlinks are broken before mode/group changes to avoid
+Owned symlinks get link group `cse` without following/changing their targets.
+Foreign-owned links are reported separately for owner review. Hardlinks are broken before mode/group changes to avoid
 changing caches or other prefixes. Known secret paths, private configuration, privileged
 files, extended ACLs and files owned by other accounts are preserved or reported for
 review. Another owner's files can only be left unchanged if already compliant; group

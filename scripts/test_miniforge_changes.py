@@ -70,6 +70,9 @@ class ChangeListTests(unittest.TestCase):
   self.save_summary({'prefix':'/shared/base','status':'updated','changes_started':True,'promotion':{'status':'completed','manifest_sha256':'incorrect'}})
   (self.run/'approved-promotion-plan.json').write_text(json.dumps({'prefix':'/shared/base','before':{},'packages':self.after}))
   with self.assertRaisesRegex(RuntimeError,'does not match'):m.export_package_changes(self.run,self.root/'public')
+ def test_permission_only_run_cannot_be_published_as_installed_package_changes(self):
+  self.save_summary({'prefix':'/shared/base','status':'updated','mode':'permissions-only','package_changes':[]})
+  with self.assertRaisesRegex(RuntimeError,'permission/certificate-only'):m.export_package_changes(self.run,self.root/'public')
 
 
 if __name__=='__main__':unittest.main()

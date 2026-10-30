@@ -85,7 +85,7 @@ class DiagnosticTests(unittest.TestCase):
     return value
    with patch.object(pathlib.Path,'lstat',foreign),patch.object(m,'maintenance_gid',return_value=m.os.getegid()),patch.object(m.os,'chmod') as chmod,patch.object(m.os,'chown') as chown:
     issues=m.public_permissions(prefix,prefix,True,lambda message:None)
-    self.assertTrue(any('Owner must set group' in issue for issue in issues));chmod.assert_not_called();chown.assert_not_called()
+   self.assertTrue(any('owner UID' in issue for issue in issues));chmod.assert_not_called();chown.assert_not_called()
  def test_timeout_keeps_partial_warning_and_reports_incomplete_analysis(self):
   with tempfile.TemporaryDirectory() as directory:
    root=pathlib.Path(directory);base=root/'base';(base/'bin').mkdir(parents=True)

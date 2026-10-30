@@ -107,7 +107,7 @@ class UserVerificationTests(unittest.TestCase):
 
  def test_incident_root_fails_before_any_package_download(self):
   result,report,calls=self.run_verification(blocked_root=True)
-  self.assertEqual(result,2);self.assertIn('incident roots remain',' '.join(report['issues']))
+  self.assertEqual(result,2);self.assertIn('incident certificates/keys remain',' '.join(report['issues']))
   self.assertFalse(any('create' in argv for argv,env in calls))
 
  def test_permission_or_activation_failure_cannot_pass(self):
