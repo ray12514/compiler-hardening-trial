@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 30 (2026-10-30).
+"""CSE Miniforge certificate maintenance, revision 31 (2026-10-30).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --base-guide          # ordered team rollout guide
@@ -209,8 +209,8 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 30
-BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TEAM BASE-ONLY ROLLOUT (revision 30)
+SCRIPT_REVISION = 31
+BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TEAM BASE-ONLY ROLLOUT (revision 31)
 
 Already updated and validated, but curl is missing while libcurl is installed?
 Use the focused repair instead of repeating the rollout:
@@ -2042,7 +2042,7 @@ def environment_channels(meta, extras, config):
 def qualify_specs(specs,origins):
     output=[]
     for spec in specs:
-        name=re.split(r'[<>=!~ ]',spec,1)[0]
+        name=re.split(r'[<>=!~ ]',spec,maxsplit=1)[0]
         output.append(origins[name]+'::'+spec if name in origins else spec)
     return output
 
