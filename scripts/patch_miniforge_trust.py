@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 35 (2026-11-02).
+"""CSE Miniforge certificate maintenance, revision 36 (2026-11-02).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --base-guide          # ordered team rollout guide
@@ -228,8 +228,8 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 35
-BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TWO-STEP BASE ROLLOUT (revision 35)
+SCRIPT_REVISION = 36
+BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TWO-STEP BASE ROLLOUT (revision 36)
 
 Use the updated standalone script. Load the intended site/compiler and Miniforge
 module. Run as the maintenance account (cse group), never root. No old stage path,
@@ -262,11 +262,27 @@ Use the usual maintenance window/recovery arrangements; stop concurrent base
 jobs/updates before apply. Repeat for each distinct GCC/Intel installation.
 --approve aliases --promote; older explicit --stage DIR / --promote DIR commands
 remain supported. The two commands above are the required rollout sequence.
---report PRINTED_DIR, --inspect-trust, --check-curl, --verify-user and focused
-repairs are optional diagnostics/validation. No live incident sites are probed.
-Keep review/run logs and the 000-user-changes/README.md plus CSV/JSON package list.
-If a step fails, bring Ravon its command and printed directory. Private logs are
-not for publication; other baseline environments stay unchanged.
+USER CHECK AFTER APPLY (separate from the two maintenance commands):
+Open a fresh shell and load the normal SCSC/site/compiler and Miniforge modules.
+Run from this script's folder, preferably as a representative ordinary user:
+   cse_check="$HOME/cse-user-check-$(date +%Y%m%d-%H%M%S)-$$"
+   python3 patch_miniforge_trust.py --verify-user "$cse_check"
+   python3 patch_miniforge_trust.py --report "$cse_check"
+The new private directory holds test environments, packages, caches and reports.
+Checks cover curl HTTPS, Conda create/install, pip HTTPS download/install and a
+small wheel build, activation/imports, and private write/rename/delete access.
+No base package, certificate or shared-permission changes are made by this test.
+It also checks that base metadata/configuration and native PEMs stayed unchanged.
+Require User verification: PASSED in the output and a passed base-unchanged row
+in verification.md.
+Downloads/environment creation may take a few minutes. Keep failure reports and
+repeat as an ordinary user to check their access. No live incident sites probed.
+Other inspection/repair modes remain optional for troubleshooting.
+
+For the detailed base guide, contact Ravon directly. If a step fails, give Ravon
+its command and printed review/test/log directory. Keep review/run records and
+the 000-user-changes/README.md plus CSV/JSON package list. Private logs are not for
+publication; other baseline environments stay unchanged.
 """
 BASE_REPLACEMENTS = {'boost':('libboost-python-devel',),'boost-cpp':('libboost-devel',)}
 ROOTS = {

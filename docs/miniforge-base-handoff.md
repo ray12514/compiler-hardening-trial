@@ -1,6 +1,6 @@
 # Update the loaded Miniforge base
 
-Use this folder's updated `patch_miniforge_trust.py` and `README.md` (revision 35+).
+Use this folder's updated `patch_miniforge_trust.py` and `README.md` (revision 36+).
 Load the intended site/compiler and Miniforge module. Run with Python 3.8+ as the
 maintenance account (`cse` group), not root. The existing Miniforge installation
 and other environments are kept; no preliminary package update is required.
@@ -38,11 +38,35 @@ If the base or CA sources changed after review, rerun step 1, then step 2.
 Use the normal maintenance window/recovery arrangements and stop concurrent base
 updates/jobs before applying. Repeat for each distinct GCC/Intel installation.
 
-`--approve` is an alias for `--promote`. Older explicit stage paths still work.
-The only required rollout commands are the two above. Checks such as `--report
-PRINTED_REVIEW_OR_RUN_DIR`, `--inspect-trust`, `--check-curl`, `--verify-user`, and
-focused repair modes remain optional. `--base-guide` prints this procedure.
+**User check in the SCSC environment (after apply).**
 
-If a step fails, give Ravon the failing command and printed review/log directory.
+Open a fresh shell, load the same normal site/compiler and Miniforge modules
+that users load, and run from this script's folder. Prefer a representative
+ordinary user account; the maintenance account can also run this check. It does
+not need shared write access or change base permissions.
+
+```bash
+cse_check="$HOME/cse-user-check-$(date +%Y%m%d-%H%M%S)-$$"
+python3 patch_miniforge_trust.py --verify-user "$cse_check"
+python3 patch_miniforge_trust.py --report "$cse_check"
+```
+
+The test directory must be new; keep it and its reports if anything fails. This
+checks curl HTTPS access, Conda creation/install in a private environment, pip
+HTTPS download/install and a small wheel build, activation/imports, and private
+write/rename/delete access. Test packages and caches stay under that private
+directory. It does not update base packages, rewrite base certificates or change
+shared permissions. It also checks that base metadata/configuration/PEMs stayed
+unchanged. Package downloads/environment creation can take a few minutes.
+
+Require **User verification: PASSED** in the output. In `verification.md`,
+require the `base-unchanged` row to show `passed`. The report covers the account and operations tested; repeat
+with an ordinary user to check their actual access. No live incident sites are
+contacted. Other checks/repairs remain optional when troubleshooting.
+
+`--approve` is an alias for `--promote`. The two maintenance commands above stay
+the same; the user check is a separate validation after applying.
+For the detailed base guide, **contact Ravon directly**. If a step fails, give
+Ravon the failing command and printed review/test/log directory.
 Keep those records. The promotion log's `000-user-changes/README.md` and CSV/JSON
 files provide the user-facing package change list; private logs are not for publication.

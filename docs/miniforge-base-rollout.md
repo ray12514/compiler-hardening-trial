@@ -113,6 +113,28 @@ chain. Optional `--chains-dir PATH` verifies supplied incident chains offline;
 no live incident test sites are probed. If a step fails, give Ravon the failing
 command and printed directory; do not repeatedly apply a failed/changed review.
 
+### User check after apply
+
+In a fresh shell, load the normal SCSC/site/compiler and Miniforge modules and
+run from the script's folder, preferably as a representative ordinary user:
+
+```bash
+cse_check="$HOME/cse-user-check-$(date +%Y%m%d-%H%M%S)-$$"
+python3 patch_miniforge_trust.py --verify-user "$cse_check"
+python3 patch_miniforge_trust.py --report "$cse_check"
+```
+
+This checks curl HTTPS, private Conda creation/install, pip download/install and
+wheel build, activation/imports and private write/rename/delete permissions.
+It keeps packages/caches/test environments under that new home directory and
+checks that base metadata/configuration/PEMs stayed unchanged. It does not update
+base packages/certificates or normalize shared permissions. Require overall
+`passed` status and a `passed` result for the `base-unchanged` row in
+`verification.md`; preserve failure logs.
+Downloads/environment creation may take a few minutes. These checks cover the
+account exercised, so use an ordinary account to assess normal user access.
+For the detailed base guide or help with a failure, contact Ravon directly.
+
 Older explicit `--stage NEW_DIR`, `--report STAGE_DIR`, `--promote STAGE_DIR`,
 `--promote STAGE_DIR --apply` workflows still work for existing operators. They
 are an advanced/manual interface, not prerequisites for the two-step sequence.
