@@ -15,10 +15,31 @@ Different installations get their own stage, review, promotion and reports. If
 multiple machines mount the same shared installation, update that installation
 once rather than running competing updates against it.
 
-If an installation has already completed this sequence and only needs the
-matching curl command added, use revision 30's
-[targeted curl repair](miniforge-trust-maintenance.md#already-updated-add-the-matching-curl-executable-without-a-full-rollout)
-instead of repeating staging and promotion.
+Revision 33 includes curl, filtered native trust and permissions in the normal
+stage/review/promote/apply sequence. For an already installed reviewed stage,
+load the same installation and rerun the same commands:
+
+```bash
+cse_stage="$HOME/cse-base-review-1"
+python3 patch_miniforge_trust.py --promote "$cse_stage"
+python3 patch_miniforge_trust.py --promote "$cse_stage" --apply
+```
+
+The first command previews the remaining work. A completed stage retains current
+Conda, Python, applications and other installed dependency versions/builds. Missing
+curl is matched to installed libcurl, with missing dependencies added as needed.
+An already installed matched pair skips the solve/transaction. No latest-version
+search or blanket update is performed. Every apply also merges/filters native
+certificates and normalizes eligible base/link permissions. A saved stage with
+unrelated application/build/checksum drift is rejected; it is never used to roll
+those packages back. The focused repair/inspection commands remain optional.
+
+If the stage is unavailable, make a new private stage below. The script recognizes
+previous maintenance from its CSE marker/rollout record and installed security
+minimums; such a candidate preserves the installed versions/builds. First rollouts
+or bases below the script's security minimums use a fresh compatible solve whose
+additional changes must be reviewed. Different machines need not have identical
+versions. No separate certificate/permission apply command is required.
 
 ## 1. Retrieve the script and short README, then load the intended setup
 
@@ -52,7 +73,7 @@ Start with a fresh shell when switching between GCC and Intel setups so old
 activation/export settings do not select the previous installation or CA file.
 
 ```bash
-python3 patch_miniforge_trust.py --version  # revision 29 or newer
+python3 patch_miniforge_trust.py --version  # revision 33 or newer
 python3 patch_miniforge_trust.py --base-guide
 ```
 
@@ -78,8 +99,10 @@ python3 patch_miniforge_trust.py --stage "$cse_stage"
 
 This installs the candidate at `$cse_stage/env`, with private caches, temporary
 trust files and comparison reports beside it. The shared base is read only in
-this step. Its installed application requests seed a fresh compatible solve;
-old version/build pins are not carried into the candidate. Required security
+this step. For a first rollout, installed application requests seed a fresh compatible
+solve; old version/build pins are not carried into that initial candidate.
+A previously maintained base meeting security minimums instead requests the
+existing versions/builds plus a missing matched curl/libcurl pair. Required security
 minimums still apply. Conda selects compatible available packages from approved
 channels; it does not compile every package from source or guarantee every
 package's individually newest version.
@@ -150,39 +173,33 @@ exit code alone does not mean every path's permissions were changed. A failed
 transaction can leave partial work: inspect its reports/recovery instructions
 before retrying. Keep the promotion logs, accepted manifest and package records.
 
-The stage is tied to its original source state. If base package/control metadata
-changed after staging, create a new stage and review it. After a successful
-promotion, do not reapply the old stage to repair a later certificate or user
-test failure. Use that step's diagnostics instead.
+The unpromoted stage is tied to its original source state. If base changes before
+that first promotion, make and review a new stage. A completed installed stage
+can be reused for the bounded follow-up described above. Its reviewed applications,
+platforms and checksums are still checked; missing reviewed packages or unrelated
+drift stop reuse. Each repeat preview/apply records a separate log directory;
+`--report` on the stage still describes the original saved candidate, while the
+promotion preview describes the remaining work against today's base.
 
-## 6. Filter the installed native PEM files
+## 6. Native trust is included in apply
 
-Run this **after** package installation, because package updates can replace
-their PEM files:
+After package verification, revision 33 promotion merges the OS CAs and preserved
+site CAs into the installed base's native `ssl`, certifi and pip-vendored PEM files.
+Both inputs pass through the known incident certificate/public-key filter before
+writing. It validates the output and screens it afterward, preserves unrelated
+CAs, retains internal symlink aliases, and refuses external PEM targets. OS trust
+files remain unchanged. Eligible file/link permissions are normalized afterward.
 
-```bash
-python3 patch_miniforge_trust.py --trust-only
-python3 patch_miniforge_trust.py --trust-only --apply
-python3 patch_miniforge_trust.py --inspect-trust
-```
+Earlier script-created base CSE-path settings are redirected to the native PEM.
+No `--trust-only`, `--merge-system-ca`, `--permissions-only` or `use-ca.sh` step is
+needed for this sequence. Those focused modes remain for independent diagnostics.
+The optional `--inspect-trust` command is still available. If an existing shell
+has old CSE exports, start a fresh shell/reload the same modules before user tests;
+a child process cannot change its parent's exports. Other custom trust settings
+are preserved and may select a different CA source.
 
-This filters the existing base `ssl`, certifi and pip-vendored certificate bundles
-for the four known incident-root fingerprints. Already-clean files are not
-rewritten. Unrelated/organizational CAs are retained. Administrator/OS trust
-files are not modified; out-of-prefix PEM symlink targets are refused.
-
-Promotion currently writes the earlier shared CSE trust configuration. This
-native-PEM step redirects only those script-created base settings to the native
-PEM and removes its saved empty-directory override. **Do not source `use-ca.sh`
-for this sequence**, even if the promotion output prints that older instruction.
-The native files are the intended final trust location. If a previous shell
-still has old CSE exports, clear them or start a fresh shell; a child process
-cannot change its parent's exports. Other custom trust settings are preserved
-and must be reviewed if inspection reports them.
-
-Require native bundle inspection to succeed. This is fingerprint screening;
-full chain rejection is a separate optional offline test below. Broad-root
-filtering can affect legitimate chains, so keep normal package-access tests.
+Known-certificate/key screening does not prove rejection of every possible chain.
+Broad-root filtering can affect legitimate chains; retain the user-operation tests.
 
 ## 7. Verify normal user operations
 

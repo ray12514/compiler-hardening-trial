@@ -1,3 +1,4 @@
+import ssl
 import contextlib,hashlib,importlib.util,io,json,os,subprocess,tarfile,tempfile,unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -67,7 +68,8 @@ class PromotionTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as directory:
    root=Path(directory);base,stage,before,after,summary,save=self.fixture(root);installed=dict(before)
    other=base/'envs/untouched';(other/'conda-meta').mkdir(parents=True);(other/'conda-meta/history').write_text('untouched')
-   source=root/'site.pem';source.write_text('original PEM');calls=[]
+   source=root/'site.pem';source.write_text(ssl.DER_cert_to_PEM_cert(ssl.create_default_context().get_ca_certs(binary_form=True)[0]));source_bytes=source.read_bytes();calls=[]
+   (base/'ssl').mkdir();(base/'ssl/cacert.pem').write_bytes(source_bytes)
    original={str(p.relative_to(base)):p.read_bytes() for p in base.rglob('*') if p.is_file()}
    def fake(argv,**kwargs):
     argv=list(map(str,argv));calls.append((argv,kwargs.get('env',{})))
@@ -85,11 +87,11 @@ class PromotionTests(unittest.TestCase):
      else:data={'success':True}
     return subprocess.CompletedProcess(argv,0,json.dumps(data),'')
    args=['script',str(base),'--promote',str(stage),'--ca-bundle',str(source),'--log-dir',str(root/'logs')]+(['--apply'] if apply else [])
-   with patch.object(m.sys,'argv',args),patch.object(m.os,'geteuid',return_value=123),patch.object(m,'maintenance_gid',return_value=0),patch.object(m,'maintainable',return_value=True),patch.object(m,'filtered_bundle',return_value=('private PEM',[])),patch.object(m,'atomic_write',side_effect=lambda p,data:Path(p).write_text(data)),patch.object(m,'public_permissions',return_value=[]),patch.object(m.subprocess,'run',side_effect=fake),contextlib.redirect_stdout(io.StringIO()):
+   with patch.object(m.sys,'argv',args),patch.object(m,'maintenance_gid',return_value=0),patch.object(m,'maintainable',return_value=True),patch.object(m,'system_bundle',return_value=source),patch.object(m,'atomic_write',side_effect=lambda p,data:Path(p).write_text(data)),patch.object(m,'public_permissions',return_value=[]),patch.object(m.subprocess,'run',side_effect=fake),contextlib.redirect_stdout(io.StringIO()):
     result=m.main()
    row=json.loads((root/'logs/summary.json').read_text())[0]
    if not apply:self.assertEqual(original,{str(p.relative_to(base)):p.read_bytes() for p in base.rglob('*') if p.is_file()})
-   self.assertEqual((other/'conda-meta/history').read_text(),'untouched');self.assertEqual(source.read_text(),'original PEM')
+   self.assertEqual((other/'conda-meta/history').read_text(),'untouched');self.assertEqual(source.read_bytes(),source_bytes)
    self.assertFalse(any('search' in argv for argv,env in calls))
    return result,row,calls,installed
 
@@ -102,6 +104,9 @@ class PromotionTests(unittest.TestCase):
   result,row,calls,installed=self.run_promotion(True)
   self.assertEqual(result,0,row['issues']);self.assertEqual(row['promotion']['status'],'completed')
   self.assertNotIn('old-runtime',installed);self.assertEqual(installed['conda']['version'],'26.9.4')
+  self.assertEqual(row['certificate_status']['mode'],'native-pem')
+  self.assertIn('filtered OS merge included',row['trust_configuration'])
+  self.assertFalse(any('vars' in argv and 'set' in argv for argv,env in calls))
   self.assertTrue(all('CSE_CONDA_APPROVED_PLAN' in env for argv,env in calls if 'install' in argv))
 
 

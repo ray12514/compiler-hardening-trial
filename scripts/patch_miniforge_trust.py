@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 32 (2026-10-30).
+"""CSE Miniforge certificate maintenance, revision 33 (2026-11-02).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --base-guide          # ordered team rollout guide
-  python3 patch_miniforge_trust.py --repair-curl          # targeted curl/libcurl plan
+  python3 patch_miniforge_trust.py --promote ~/cse-candidate # review remaining work
+  python3 patch_miniforge_trust.py --promote ~/cse-candidate --apply # packages, native trust, permissions
+  python3 patch_miniforge_trust.py --repair-curl          # optional focused repair
   python3 patch_miniforge_trust.py --repair-curl --apply  # install pair and verify
   python3 patch_miniforge_trust.py --check-curl --curl-url https://your-service.example/
   python3 patch_miniforge_trust.py --permissions-only --apply # groups/modes only
@@ -38,7 +40,8 @@ insecure settings or known incident roots fail before package downloads. Optiona
 and these exercises, not every user, application, compiler or proxy trust policy.
 Default preview is local-only: inventory, CA inspection, ownership and permissions.
 --promote previews are dependency dry runs of a reviewed set; --apply installs it
-at its original base prefix after freshness/access checks. Stage each system
+at its original base prefix after freshness/access checks. A completed stage can
+be reused for a bounded curl follow-up with native trust/permissions included. Stage each system
 separately after loading that site's environment and Miniforge.
 Apply reuses non-default channels recorded in each environment's installed conda
 packages. Non-base requests preserve per-package sources; base uses channel priority. conda-forge remains a
@@ -67,11 +70,13 @@ and skipped-paths.json list full paths, owners, groups, stages and reasons.
 Default output is concise; --verbose shows path details. Full details are logged.
 Final summaries repeat retained package requests, removals, permission counts and failure reasons.
 Per-owner skip reports are private review aids. A skip is not protection.
---stage NEW_PRIVATE_DIR is a separate workflow: it solves and installs a fresh
-candidate with its own cache/trust files and writes version/build comparisons.
+--stage NEW_PRIVATE_DIR builds a private review candidate. Previously maintained
+bases meeting security minimums keep installed versions/builds and add matched
+curl/missing dependencies; first rollouts solve a fresh compatible candidate.
+Each uses its own cache/trust files and writes version/build comparisons.
 The source base stays read only, including its caches and permissions. No shared
 maintenance access or cse membership is required for staging. --stage-skip NAME
-explicitly omits an application request; dependencies may still require it.
+on a first refresh explicitly omits an application request; dependencies may still require it.
 Failed solves/installations retain honest failure reports. Staging performs no
 promotion to base; review the candidate before deciding on any live update.
 --report LOG_DIR (or latest) reads prior summaries/logs without updates or network.
@@ -86,8 +91,9 @@ The existing Miniforge distribution/prefix is kept. No installer is downloaded,
 replaced or rerun. Apply uses the installed libmamba solver with entry-point
 plugin discovery disabled and only its solver hook explicitly enabled. PyPI
 integration plugins are not enabled. A missing/broken solver fails before updates.
-Base Conda, Python, solver packages, NumPy, Jupyter, Boost and other installed base
-applications update compatibly in ONE transaction. Retained requests come from
+For an initial refresh, base Conda, Python, solver packages, NumPy, Jupyter, Boost
+and other installed base applications update compatibly in ONE transaction.
+Retained requests come from
 explicit history and the installed dependency graph, not a mandatory request for
 every old dependency. The solve uses --update-all --prune, security minimums and
 approved channel priority, without historical per-package source locks. All base
@@ -122,7 +128,8 @@ without automatically overwriting pip-owned files. If sigstore is installed,
 an offline `python -I -m sigstore --help` smoke check reports startup failures.
 A fixed package version does not establish that an unrelated crash is resolved.
 
-A CSE-owned bundle at BASE/etc/cse-trust/ca-bundle.pem is built locally from the
+The older direct --apply workflow builds a CSE-owned bundle at
+BASE/etc/cse-trust/ca-bundle.pem locally from the
 selected existing site bundle, excluding the incident-denied certificates/keys.
 The policy covers four selected roots, the known affected intermediate variants,
 and their public-key identities. This is an INTERIM incident mitigation, not a
@@ -144,13 +151,15 @@ afterward. Explicit --ca-bundle/--extra-ca sources add organizational certificat
 to the existing bundles without writing to those source paths.
 --trust-only --merge-system-ca explicitly adds the discovered OS PEM through the
 same incident certificate/public-key filter. OS trust files remain read only;
-the merged result is validated before any native PEM write. No automatic re-merge
-is performed by curl check or permissions-only modes.
+the merged result is validated before any native PEM write. Curl check and permissions-only modes perform no merge. Revision 33 stage/promote
+always includes this filtered OS merge in native PEMs, followed by permission
+normalization during promotion. No separate trust/permission command is needed.
 --inspect-trust reads actual bundles, versions and local configuration separately
 from past run status. A stored filtered file is not proof that every app uses it.
 Replacing the source later with a corrected vendor/site bundle rebuilds this copy.
 
-Conda SSL configuration and conda activation variables are set for updated prefixes
+In the older direct --apply workflow, Conda SSL configuration and activation
+variables are set for updated prefixes
 so the CSE bundle is used, including SSL_CERT_DIR pointing to a dedicated empty
 CA directory. Existing configuration/state is saved privately before modification.
 A shell snippet BASE/etc/cse-trust/use-ca.sh is emitted for the current shell or
@@ -218,93 +227,62 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 32
-BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TEAM BASE-ONLY ROLLOUT (revision 32)
+SCRIPT_REVISION = 33
+BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TEAM BASE-ONLY ROLLOUT (revision 33)
 
-Already updated and validated, but curl is missing while libcurl is installed?
-Use the focused repair instead of repeating the rollout:
-   python3 patch_miniforge_trust.py --repair-curl
-   python3 patch_miniforge_trust.py --repair-curl --apply
-It selects the newest stable curl advertised by approved conda-forge sources,
-installs a matched curl/libcurl pair and necessary dependencies, keeps unrelated
-applications/managers unchanged, filters native PEMs, normalizes permissions and
-checks PATH, loaded libcurl and HTTPS. Preview first; conflicts stop for review.
-Use the normal module setup; clear a cached system curl with hash -r or reload
-the module. No Miniforge installer replacement or full restage is required.
-For a URL check only, with normal curl settings and no package/PEM changes:
-   python3 patch_miniforge_trust.py --check-curl --curl-url https://your-service.example/
-To normalize owned base/link groups without reinstalling or changing PEM content:
-   python3 patch_miniforge_trust.py --permissions-only
-   python3 patch_miniforge_trust.py --permissions-only --apply
-If OS CAs need adding, explicitly merge them THROUGH the incident filter:
-   python3 patch_miniforge_trust.py --trust-only --merge-system-ca
-   python3 patch_miniforge_trust.py --trust-only --merge-system-ca --apply
-   python3 patch_miniforge_trust.py --inspect-trust
-Never append an unfiltered OS bundle after this step. The OS source is read only.
+Load the intended site/compiler and Miniforge modules. Run as the maintenance
+account (cse group), never root. Repeat separately for each GCC/Intel installation.
+The loaded module selects the base; no system name is required.
 
-Repeat separately for each distinct installation, including GCC and Intel.
-Load that site's usual environment/compiler and Miniforge modules first.
-The loaded module supplies the base path; no system name is required.
-Use the maintenance account for shared changes, never root. Private staging and
-user verification require no cse membership; promotion/native PEM edits do.
-
-1. Choose a NEW private stage name under your home for this installation:
+ALREADY INSTALLED: use that installation's completed stage and the SAME commands:
    cse_stage="$HOME/cse-base-review-1"
-   python3 patch_miniforge_trust.py --stage "$cse_stage"
-
-2. Review before changing base:
-   python3 patch_miniforge_trust.py --report "$cse_stage"
-   Read review.md and comparison.csv there; require ready-for-review, review
-   changed/added/not-selected packages, and run the needed application checks
-   in "$cse_stage/env". A successful solve is not full application validation.
-
-3. Check all known installed/candidate permission blockers as the maintainer:
-   python3 patch_miniforge_trust.py --check-permissions --promote "$cse_stage"
-   Resolve reported owner/admin repairs and inspection gaps; rerun the check.
-   This check reports access; it does not repair permissions automatically.
-
-4. In the normal maintenance window, with snapshot/recovery arrangements and
-   concurrent base updates/jobs stopped, validate and apply the reviewed set:
    python3 patch_miniforge_trust.py --promote "$cse_stage"
    python3 patch_miniforge_trust.py --promote "$cse_stage" --apply
-   Stop on failure. Promotion uses the existing base path, verifies the accepted
-   package set, and normalizes eligible base permissions to cse. Read its exact
-   printed log directory with --report; review skips/updated-with-skips.
+Review planned changes before apply. Installed Conda/Python/application versions
+stay fixed. Missing curl matches installed libcurl; only missing dependencies
+may be added. A matched installed pair needs no package solve or reinstall.
+Unrelated package/build/checksum drift stops reuse of a completed stage.
 
-5. Filter the EXISTING base PEM files after package installation:
-   python3 patch_miniforge_trust.py --trust-only
-   python3 patch_miniforge_trust.py --trust-only --apply
-   python3 patch_miniforge_trust.py --inspect-trust
-   This filters known incident certificates/keys and redirects earlier
-   script-created base CSE-path settings to the native PEM. No use-ca.sh step
-   is needed for this sequence. Other site CAs/settings are preserved.
+NO SAVED STAGE / FIRST ROLLOUT: follow the normal sequence:
+1. Use a NEW private stage directory under home:
+   cse_stage="$HOME/cse-base-review-2"
+   python3 patch_miniforge_trust.py --stage "$cse_stage"
+   A previously maintained base meeting security minimums keeps installed
+   versions/builds. A first rollout or unmet minimum needs a fresh compatible
+   solve. Review any additional changes; versions need not match across machines.
 
-6. Verify user operations in a fresh shell with the same usual modules loaded,
-   ideally as an ordinary user (choose a NEW private test name):
-   python3 patch_miniforge_trust.py --verify-user "$HOME/cse-user-check-1"
-   python3 patch_miniforge_trust.py --report "$HOME/cse-user-check-1"
-   Require the requested checks to pass; read verification.md and its limits.
+2. Review ready-for-review, review.md and comparison.csv; test needed apps in
+   "$cse_stage/env". A successful solve is not full application validation.
+   python3 patch_miniforge_trust.py --report "$cse_stage"
+
+3. Check access and preview as the maintenance account:
+   python3 patch_miniforge_trust.py --check-permissions --promote "$cse_stage"
+   python3 patch_miniforge_trust.py --promote "$cse_stage"
+   Resolve required owner/admin blockers and inspection gaps before applying.
+
+4. Use the usual maintenance window/recovery arrangements; stop concurrent base
+   jobs/updates. Apply the reviewed package set at its existing base path:
+   python3 patch_miniforge_trust.py --promote "$cse_stage" --apply
+   Apply ALSO merges the OS CAs through the incident certificate/public-key
+   filter into native PEMs, verifies them and normalizes base/link permissions.
+   OS files remain read only. No extra --trust-only/merge/permissions command or
+   use-ca.sh step is needed. Review skips/updated-with-skips and the printed logs.
+
+5. In a fresh shell, reload the same modules and verify normal user operations,
+   ideally as an ordinary user with a NEW private test directory:
+   python3 patch_miniforge_trust.py --verify-user "$HOME/cse-user-check-2"
+   python3 patch_miniforge_trust.py --report "$HOME/cse-user-check-2"
+   Require requested checks to pass; read verification.md and coverage limits.
    Optional --chains-dir PATH checks supplied incident chains offline; without
    it, chain rejection is explicitly not-tested. No live incident sites are probed.
 
-Keep the stage/reports, source commit, promoted-base logs and certificate/user
-results per installation. Verified updates write NNN-user-changes/README.md,
-packages.csv, packages.json and manifest.json beside the private logs. To export
-an older run without accessing installed software:
-   python3 patch_miniforge_trust.py --export-changes /path/to/promotion-log \\
-     --changes-output "$HOME/miniforge-release-notes/base-update-1"
-Review the evidence/coverage label, then copy only the generated files to the
-approved user-readable docs location and link them from the updates index:
-https://github.com/ray12514/compiler-hardening-trial/blob/main/docs/miniforge-updates/README.md
-Candidate-only comparisons must not be published as completed changes.
-Use a new stage if the source package/control state
-changes; do not rerun a stale promotion to repair a later certificate/user check.
-Old CSE exports in an existing shell need clearing or a fresh shell.
-Do not use --all-envs/--only, delete old environments, replace Miniforge, or edit
-admin trust files in this rollout. Other baseline environments are a later sweep.
-
-Full handoff guide (script retrieval, review gates and recovery pointers):
-https://github.com/ray12514/compiler-hardening-trial/blob/main/docs/miniforge-base-rollout.md
+Keep the stage, source commit, promotion logs and certificate/user results per
+installation. Verified updates write 000-user-changes/README.md plus CSV/JSON
+package lists for reviewed publication. Logs remain private. Bring the failing
+command/log directory to Ravon if a step fails. Other environments and the
+Miniforge installer are unchanged. Focused --repair-curl, --trust-only,
+--check-curl, --inspect-trust and --permissions-only modes remain available for
+later diagnostics; they are not additional rollout steps.
 """
 BASE_REPLACEMENTS = {'boost':('libboost-python-devel',),'boost-cpp':('libboost-devel',)}
 ROOTS = {
@@ -2408,11 +2386,7 @@ def load_promotion(directory, base, holds=None):
         raise RuntimeError('Promotion requires a ready-for-review stage with unchanged source metadata and CA')
     if Path(summary['source_base']).resolve()!=base:
         raise RuntimeError('This stage belongs to '+summary['source_base']+', not '+str(base)+'. Load the correct site environment/Miniforge, or stage this system separately.')
-    if stage_source_state(base)!=summary['source_state_after']:
-        raise RuntimeError('Base package/control metadata changed since staging; stage and review this system again')
     packages=json.loads((root/'candidate-packages.json').read_text())
-    if not {'curl','libcurl'}<=set(packages):
-        raise RuntimeError('Reviewed candidate lacks the required curl/libcurl pair. Restage an unpromoted candidate with revision 30; for an already-updated base use --repair-curl instead.')
     if not packages or not {'conda','python','conda-libmamba-solver'}<=set(packages):raise RuntimeError('Reviewed candidate lacks its required Conda/Python/solver packages')
     for name,record in packages.items():
         if record.get('name')!=name or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*',name):raise RuntimeError('Invalid reviewed package name: '+str(name))
@@ -2434,8 +2408,14 @@ def load_promotion(directory, base, holds=None):
         differences=promotion_differences(records(root/'env'),packages)
         if differences:raise RuntimeError('Staged candidate changed after review: '+', '.join(differences))
     before=records(base)
+    repeat=installed_promotion(before,packages)
+    if not repeat and stage_source_state(base)!=summary['source_state_after']:
+        raise RuntimeError('Base package/control metadata changed since staging; stage and review this system again')
+    if not repeat and not {'curl','libcurl'}<=set(packages):
+        raise RuntimeError('Unpromoted candidate lacks the required curl/libcurl pair; stage and review with revision 33')
+    if repeat:verify_minimums(before,before,True,target)
     if holds is None:holds=permission_holds(base,before)
-    blocked=[h for n,h in holds.items() if n not in packages or
+    blocked=[] if repeat else [h for n,h in holds.items() if n not in packages or
              (before[n]['version'],before[n]['build'])!=(packages[n]['version'],packages[n]['build'])]
     if blocked:
         raise RuntimeError('Reviewed promotion requires owner/admin access repair before any base changes: '+
@@ -2443,7 +2423,46 @@ def load_promotion(directory, base, holds=None):
     identity={n:{key:r.get(key) for key in ('version','build','subdir','sha256','md5')} for n,r in sorted(packages.items())}
     digest=hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest()
     return {'root':root,'summary':summary,'packages':packages,'identity':identity,'manifest_sha256':digest,
-            'security_verification':verification,'target':target}
+            'security_verification':verification,'target':target,'repeat':repeat}
+
+
+def installed_promotion(current, reviewed):
+    """Recognize the installed reviewed applications, allowing only curl follow-ups.
+
+    Never treat a missing reviewed package or application/hash/platform drift as
+    a completed rollout. Curl dependency changes from earlier repairs may remain.
+    """
+    if not set(reviewed)<=set(current):return False
+    allowed=curl_dependency_scope(current,{})-set(MINIMUM)-MANAGERS-{'conda','conda-self','python','python_abi'}
+    return not (set(promotion_differences(current,reviewed))-allowed)
+
+
+def completed_base(base, packages):
+    markers=('etc/cse-trust/managed-by-patch-miniforge-trust','etc/cse-trust/base-rollout.json')
+    if not any((base/name).is_file() for name in markers):return False
+    if not {'conda','python','conda-libmamba-solver','pip','certifi','ca-certificates'}<=set(packages):return False
+    try:verify_minimums(packages,packages,True)
+    except RuntimeError:return False
+    return True
+
+
+def record_rollout(base, packages, stage):
+    directory=base/'etc/cse-trust';directory.mkdir(parents=True,exist_ok=True)
+    identity={n:{key:r.get(key) for key in ('version','build','subdir','sha256','md5')} for n,r in sorted(packages.items())}
+    data=json.dumps({'script_revision':SCRIPT_REVISION,'stage':str(stage),
+        'installed_manifest_sha256':hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest()},indent=2)+'\n'
+    destination=directory/'base-rollout.json'
+    if destination.is_file() and destination.read_text()==data:return
+    atomic_write(destination,data)
+
+
+def rollout_trust(args, prefix, directory, source=None):
+    """Finish a rollout in native PEMs: merge and filter before permission repair."""
+    trust_args=argparse.Namespace(**vars(args))
+    trust_args.apply=True;trust_args.merge_system_ca=True;trust_args.log_dir=directory
+    if source is not None:trust_args.ca_bundle=source
+    maintain_native_trust(prefix,trust_args)
+    return json.loads((directory/'certificate-status.json').read_text())
 
 
 def stage_source_state(base, meta=None):
@@ -2451,7 +2470,7 @@ def stage_source_state(base, meta=None):
     if meta is None:meta=records(base)
     controls={}
     for name in ('.condarc','conda-meta/history','conda-meta/pinned','conda-meta/state',
-                 'etc/cse-trust/ca-bundle.pem','etc/cse-trust/use-ca.sh'):
+                 'etc/cse-trust/ca-bundle.pem','etc/cse-trust/use-ca.sh','etc/cse-trust/base-rollout.json'):
         try:controls[name]=hashlib.sha256((base/name).read_bytes()).hexdigest()
         except FileNotFoundError:controls[name]=None
         except OSError as exc:controls[name]={'unreadable':str(exc)}
@@ -2559,7 +2578,7 @@ def export_package_changes(source, destination=None):
         rows=json.loads((source/'summary.json').read_text())
         if len(rows)!=1:raise RuntimeError('Export requires a report for one installation; mixed-prefix historical reports need separate review')
         row=rows[0];mode=(source/'run.log').read_text() if (source/'run.log').is_file() else ''
-        if row.get('mode')=='permissions-only' or row.get('certificate_status',{}).get('mode')=='native-pem':
+        if row.get('mode')=='permissions-only' or (row.get('certificate_status',{}).get('mode')=='native-pem' and not row.get('package_inventory_verified')):
             raise RuntimeError('This is a permission/certificate-only run; select the original package-update log for a change list')
         if 'Mode: APPLY' not in mode:raise RuntimeError('No verified installed transaction is recorded; this may be a preview')
         before_file=source/'000-before-packages.json';after_file=source/'000-after-packages.json'
@@ -2612,6 +2631,7 @@ def write_stage_report(root, summary, before, after):
            'No promotion to the shared base was performed. The candidate must remain at its current prefix; it is not a relocatable replacement.',
            'This comparison covers Conda-managed packages. Pip-installed applications are not automatically recreated.',
            'Source package/control metadata unchanged: '+str(summary.get('source_metadata_unchanged','not checked'))+'.','',
+           'Package policy: '+summary.get('package_policy','fresh compatible application solve')+'.','',
            'Counts: '+', '.join('%s=%d'%item for item in summary['comparison_counts'].items()),'',
            'Version changes show the actual before/after values; they do not assert that every change is an upgrade.',
            'Not-selected dependencies are not findings of deprecation or unavailability.','']
@@ -2644,6 +2664,7 @@ def report_stage_existing(root, verbose=False):
     print('Source base: '+summary['source_base'])
     print('Candidate prefix: '+summary['candidate_prefix'])
     print('Source metadata unchanged at end of staging: '+str(summary.get('source_metadata_unchanged','not checked')))
+    print('Package policy: '+summary.get('package_policy','fresh compatible application solve'))
     print('Comparison: '+', '.join('%s=%s'%item for item in summary['comparison_counts'].items()))
     for row in rows:
         if row['status']=='unchanged' and not verbose:continue
@@ -2735,7 +2756,7 @@ def stage_base(args, base, env):
         _,urls,channel_args,origins,excluded,unknown=environment_channels(before,args.channel,package_config)
         summary.update(channels=urls,excluded_sources=excluded,unknown_origins=unknown)
         source=choose_source(args,config,base);source_digest=hashlib.sha256(source.read_bytes()).hexdigest()
-        text,removed=filtered_bundle([source]+args.extra_ca)
+        text,removed=filtered_bundle([source,system_bundle()]+args.extra_ca)
         trust=root/'trust';trust.mkdir(mode=0o700);bundle=trust/'ca-bundle.pem';bundle.write_text(text)
         empty=trust/'empty-ca-dir';empty.mkdir(mode=0o700)
         summary.update(source_ca=str(source),source_ca_sha256=source_digest,filtered_roots=removed)
@@ -2752,14 +2773,26 @@ def stage_base(args, base, env):
         (root/'source-python-audit.json').write_text(json.dumps(source_audit,indent=2))
         summary['non_conda_tools']={n:r for n,r in source_audit.get('packages',{}).items() if n not in before}
         summary['conda_update']=conda_update_status(before)
+        maintenance=completed_base(base,before)
+        summary['package_policy']='preserve installed versions/builds; add matched curl and missing dependencies' if maintenance else 'fresh compatible application solve'
         search_origins=dict(origins)
         if args.offline:
             mirrors=[url for url in urls if url.startswith('file://')]
             if not mirrors:raise RuntimeError('A fresh offline stage needs an approved --channel file:///mirror containing Conda and the requested packages; the source cache is not reused')
             search_origins['conda']=mirrors[0]
-        target=select_conda_target(base,before,search_origins,config,args.offline,
-            lambda command:run(command[1:],'find newest stable Conda'),root,summary,say,candidate_prefix=candidate)
-        requested,specs,omitted=stage_requests(before,intent,args.stage_skip,target)
+        if maintenance:
+            if args.stage_skip:raise RuntimeError('Completed base maintenance keeps all installed packages; application omissions need a separately reviewed refresh')
+            target=before['conda']['version'];requested=set(before)|{'curl','libcurl'};omitted=set()
+            specs=[name+'='+record['version']+'='+record['build'] for name,record in sorted(before.items())]
+            missing={'curl','libcurl'}-set(before)
+            for name in sorted(missing):
+                partner=before.get('libcurl' if name=='curl' else 'curl')
+                specs.append(name+'='+partner['version'] if partner else name)
+            summary['conda_update'].update(target=target,policy='Keep installed Conda; no new version search')
+        else:
+            target=select_conda_target(base,before,search_origins,config,args.offline,
+                lambda command:run(command[1:],'find newest stable Conda'),root,summary,say,candidate_prefix=candidate)
+            requested,specs,omitted=stage_requests(before,intent,args.stage_skip,target)
         summary.update(requested_roots=sorted(requested),omitted_requests=sorted(omitted))
         (root/'candidate-requests.txt').write_text('\n'.join(specs)+'\n')
         (root/'source-explicit.txt').write_text(run(['list','-p',str(base),'--explicit'],'record source package URLs',raw=True))
@@ -2778,7 +2811,11 @@ def stage_base(args, base, env):
         summary['status']='verifying';after=records(candidate)
         (root/'candidate-packages.json').write_text(json.dumps(after,indent=2))
         verify_installed_plan(final,after)
+        if maintenance:
+            differences=promotion_differences({name:after[name] for name in before if name in after},before)
+            if differences:raise RuntimeError('Maintenance candidate changed installed versions/builds/checksums: '+', '.join(differences))
         summary['security_verification']=verify_minimums(before,after,True,target)
+        summary['certificate_status']=rollout_trust(args,candidate,root/'native-trust',source)
         summary['curl_runtime']=run(['<local curl probe>'],'verify candidate curl executable and loaded libcurl',runtime=candidate,program=CURL_PROBE)
         if run(['__cse_solver_probe__'],'verify candidate Conda and solver',runtime=candidate).get('solver')!='libmamba':
             raise RuntimeError('Candidate Conda/solver startup did not pass')
@@ -2789,8 +2826,7 @@ def stage_base(args, base, env):
         for label,path in audit.get('bundles',{}).items():
             if path and Path(path).is_file() and blocked_pem_entries(Path(path).read_text()):
                 raise RuntimeError('Known incident certificates/keys remain in candidate '+label+': '+path)
-        run(['config','--file',str(candidate/'.condarc'),'--set','ssl_verify',str(bundle)],'configure private candidate trust',raw=True)
-        run(['env','config','vars','set','-p',str(candidate)]+[k+'='+v for k,v in values.items()],'configure private candidate activation',raw=True)
+        run(['config','--file',str(candidate/'.condarc'),'--set','ssl_verify',str(candidate/'ssl/cacert.pem')],'configure private candidate trust',raw=True)
         (root/'candidate-explicit.txt').write_text(run(['list','-p',str(candidate),'--explicit'],'record verified candidate package URLs',runtime=candidate,raw=True))
         summary['conda_update'].update(status='candidate-verified',candidate_version=after['conda']['version'])
         summary['status']='ready-for-review'
@@ -3193,7 +3229,7 @@ def check_curl(args, base, env):
     return 0 if summary['status']=='passed' else 2
 
 
-def repair_curl(args, base, env):
+def repair_curl(args, base, env, promotion=None):
     """Target curl and its dependency closure; never repeat the full base update."""
     logdir=(args.log_dir or Path.home()/'.cse-trust-logs'/('curl-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))).expanduser().resolve()
     if logdir==base or base in logdir.parents:raise RuntimeError('Repair logs must be outside the base installation')
@@ -3202,6 +3238,10 @@ def repair_curl(args, base, env):
              CONDA_NUMBER_CHANNEL_NOTICES='0',PYTHONDONTWRITEBYTECODE='1')
     row={'prefix':str(base),'status':'incomplete','issues':[],'changes_started':False,'phase':'prepare curl repair',
          'curl_repair':{'policy':'curl/libcurl and required dependencies only; existing applications/managers retained'}}
+    if promotion:
+        row['promotion']={'stage':str(promotion['root']),'status':'preflight','repeat':True,
+                          'manifest_sha256':promotion['manifest_sha256'],'package_count':len(promotion['packages'])}
+        row['package_policy']='completed promotion: keep installed versions/builds; add matching curl and required dependencies only'
     before={};after={};number=0;lock=None
     with (logdir/'run.log').open('w',buffering=1) as log:
         def say(value):value=redact_verification(value);print(value,flush=True);log.write(value+'\n')
@@ -3226,13 +3266,17 @@ def repair_curl(args, base, env):
                 raise RuntimeError('Conda did not perform the requested curl repair transaction')
             return data
         try:
-            say('Mode: '+('APPLY' if args.apply else 'CURL REPAIR DRY RUN; package metadata may be refreshed, no base changes'))
+            say('Mode: '+('APPLY' if args.apply else 'REPEAT PROMOTION DRY RUN; no base changes' if promotion else 'CURL REPAIR DRY RUN; package metadata may be refreshed, no base changes'))
             say('Base: '+str(base));say('Private logs: '+str(logdir))
             if args.apply:
-                lock=(base/'.cse-curl-maintenance.lock').open('a');fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+                lockpath=base/'etc/cse-trust/maintenance.lock' if promotion else base/'.cse-curl-maintenance.lock'
+                lockpath.parent.mkdir(parents=True,exist_ok=True)
+                lock=lockpath.open('a');fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
                 if os.fstat(lock.fileno()).st_uid==os.geteuid():
                     os.fchown(lock.fileno(),-1,maintenance_gid());os.fchmod(lock.fileno(),0o664)
             before=records(base);baseline=stage_source_state(base,before)
+            if promotion and not installed_promotion(before,promotion['packages']):
+                raise RuntimeError('Installed reviewed applications changed during promotion preflight')
             config=runjson(['config','--show','--json'])
             package_config={key:value for key,value in config.items() if key!='pinned_packages'}
             # This repair deliberately uses conda-forge (or its configured mirror)
@@ -3240,24 +3284,40 @@ def repair_curl(args, base, env):
             _,urls,channel_args=requested_channels(args.channel,package_config)
             if args.offline and not any(url.startswith('file://') for url in urls):
                 raise RuntimeError('Offline curl repair uses a fresh private cache; supply --channel file:///approved/mirror with curl and its dependencies')
-            source=choose_source(args,config,base);text,_=filtered_bundle([source]+args.extra_ca)
+            source=choose_source(args,config,base);text,_=filtered_bundle([source]+([system_bundle()] if promotion else [])+args.extra_ca)
             bundle=logdir/'repair-ca-bundle.pem';bundle.write_text(text)
             empty=logdir/'empty-ca-dir';empty.mkdir()
             env.update({key:str(bundle) for key in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','CURL_CA_BUNDLE','PIP_CERT')})
             env.update(SSL_CERT_DIR=str(empty),CONDA_OFFLINE='true' if args.offline else 'false')
             flags=channel_args+(['--offline'] if args.offline else [])
-            row['phase']='find newest stable curl available to this installation'
-            # search accepts channel selection, not the solver's priority flag.
-            available=runjson(['search','--json']+[flag for flag in flags if flag!='--strict-channel-priority']+['curl'])
-            versions=[record['version'] for record in available.get('curl',()) if re.fullmatch(r'\d+(?:\.\d+)*',str(record.get('version','')))]
-            if not versions:raise RuntimeError('No stable curl release is available in the approved conda-forge sources')
-            target=max(versions+[record['version'] for name,record in before.items() if name in ('curl','libcurl')],key=version)
-            row['curl_repair'].update(target=target,channels=urls)
-            row['phase']='solve targeted curl/libcurl repair'
             common=['install','-p',str(base),'--solver','libmamba','--json','--no-pin']+flags
-            plan=runjson(common+['--update-deps','curl>='+target,'libcurl>='+target,'--dry-run'])
+            if promotion:
+                installed_versions=[before[name]['version'] for name in ('curl','libcurl') if name in before]
+                target=max(installed_versions,key=version) if installed_versions else None
+                pair_ready=all(name in before for name in ('curl','libcurl')) and before['curl']['version']==before['libcurl']['version'] and (base/'bin/curl').is_file()
+                if pair_ready:
+                    # No search, solve or transaction for an already installed pair.
+                    plan={'success':True,'actions':{}}
+                elif target:
+                    row['phase']='solve missing matched curl without upgrading the installed base'
+                    pins=[name+'='+record['version']+'='+record['build'] for name,record in sorted(before.items()) if name not in ('curl','libcurl')]
+                    pair=[name+'='+target+('='+before[name]['build'] if name in before and before[name]['version']==target else '') for name in ('curl','libcurl')]
+                    plan=runjson(common+['--freeze-installed']+pins+pair+['--dry-run'])
+                else:
+                    raise RuntimeError('Completed stage has neither curl nor libcurl; build a fresh stage with revision 33')
+            else:
+                row['phase']='find newest stable curl available to this installation'
+                # search accepts channel selection, not the solver's priority flag.
+                available=runjson(['search','--json']+[flag for flag in flags if flag!='--strict-channel-priority']+['curl'])
+                versions=[record['version'] for record in available.get('curl',()) if re.fullmatch(r'\d+(?:\.\d+)*',str(record.get('version','')))]
+                if not versions:raise RuntimeError('No stable curl release is available in the approved conda-forge sources')
+                target=max(versions+[record['version'] for name,record in before.items() if name in ('curl','libcurl')],key=version)
+                row['phase']='solve targeted curl/libcurl repair'
+                plan=runjson(common+['--update-deps','curl>='+target,'libcurl>='+target,'--dry-run'])
+            row['curl_repair'].update(target=target,channels=urls)
             (logdir/'000-plan.json').write_text(json.dumps(plan,indent=2))
             allowed=curl_dependency_scope(before,plan)-{'python','python_abi','conda','conda-libmamba-solver','mamba','libmamba','libmambapy'}
+            if promotion:allowed-=set(before)-{'curl','libcurl'}
             check_plan(plan,allowed);holds=permission_holds(base,before);verify_permission_holds(plan,holds)
             final,exact=exact_plan_specs(before,plan,{},args.channel,package_config)
             if not all(name in final and version(final[name][0])>=version(target) for name in ('curl','libcurl')):
@@ -3274,7 +3334,9 @@ def repair_curl(args, base, env):
                 # Guard ALL non-dependency packages against implicit relinks too.
                 env['CSE_CONDA_PERMISSION_HOLDS']=json.dumps({'prefix':str(base),'packages':sorted((set(before)-allowed)|set(holds))})
                 row['phase']='install validated curl repair';row['changes_started']=True
-                runjson(common+exact+['--yes'])
+                if plan.get('actions',{}).get('LINK') or plan.get('actions',{}).get('UNLINK'):
+                    runjson(common+exact+['--yes'])
+                else:say('Packages already installed: no package transaction needed.')
                 after=records(base);verify_installed_plan(final,after)
                 (logdir/'000-after-packages.json').write_text(json.dumps(after,indent=2));row['package_inventory_verified']=True
                 row['curl_repair']['packages']='installed-and-verified'
@@ -3282,7 +3344,9 @@ def repair_curl(args, base, env):
                     if name not in before or (record['version'],record['build'])!=(before[name]['version'],before[name]['build'])]
                 row['phase']='filter installed native PEM files'
                 trust_args=argparse.Namespace(**vars(args));trust_args.log_dir=logdir/'native-trust'
-                maintain_native_trust(base,trust_args)
+                if promotion:row['certificate_status']=rollout_trust(args,base,trust_args.log_dir,bundle)
+                else:maintain_native_trust(base,trust_args)
+                if promotion:record_rollout(base,after,promotion['root'])
                 row['phase']='normalize shared base permissions';row['permissions']={};row['skipped_paths']=[]
                 warnings=public_permissions(base,base,True,detail,row['skipped_paths'],[base/PATH_BACKUPS],row['permissions'])
                 write_skip_reports(logdir,row['skipped_paths'])
@@ -3306,8 +3370,27 @@ def repair_curl(args, base, env):
                     row['phase']='check Conda curl HTTPS access'
                     row['curl_repair']['https']=dict(runjson([check_url],program=CURL_HTTPS_PROBE,process_env=runtime_env),status='passed')
                 else:row['curl_repair']['https']={'status':'not-tested','reason':'offline repair'}
+                if promotion and getattr(args,'chains_dir',None):
+                    row['phase']='verify supplied incident chains offline'
+                    openssl=base/'bin/openssl' if (base/'bin/openssl').is_file() else Path('/usr/bin/openssl')
+                    def chain_run(command,allow_failure=False):
+                        result=subprocess.run(list(map(str,command)),env=runtime_env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=30)
+                        log.write(redact_verification(result.stdout+result.stderr)+'\n')
+                        if result.returncode and not allow_failure:raise RuntimeError(diagnostic_text(result.stdout,result.stderr))
+                        return result
+                    verify_chains(openssl,Path(row['certificate_status']['bundle']),args.chains_dir.expanduser().resolve(),runtime_env,chain_run)
+                    row['offline-chain-rejection']={'status':'passed'}
                 row['status']='updated-with-skips' if warnings else 'updated'
-            else:row['status']='previewed'
+                if promotion:
+                    row['promotion']['status']='completed'
+            else:
+                if promotion:
+                    trust_args=argparse.Namespace(**vars(args));trust_args.log_dir=logdir/'native-trust';trust_args.merge_system_ca=True
+                    trust_args.ca_bundle=bundle
+                    maintain_native_trust(base,trust_args)
+                    row['promotion']['status']='validated'
+                    say('Apply will merge/filter native certificates and normalize base/link permissions after package verification.')
+                row['status']='previewed'
         except (Exception,KeyboardInterrupt) as exc:
             row['issues'].append(redact_verification(str(exc)));say('ATTENTION: '+str(exc))
             if row['phase']=='check Conda curl HTTPS access':row['curl_repair']['https']['status']='failed'
@@ -3316,10 +3399,10 @@ def repair_curl(args, base, env):
                 if row.get('package_inventory_verified'):
                     directory=logdir/'000-user-changes'
                     manifest=write_package_changes(directory,before,after,{'evidence':'verified-installed','coverage':'full inventory',
-                        'prefix':str(base),'rollout_status':row['status'],'note':'Targeted curl repair. Review remaining permission, native trust and PATH/runtime checks separately.'})
+                        'prefix':str(base),'rollout_status':row['status'],'note':('Completed-stage maintenance; installed versions retained except the matched curl addition. ' if promotion else 'Targeted curl repair. ')+ 'Review separate certificate, permission and runtime results.'})
                     row['package_change_list']={'path':str(directory/'README.md'),'counts':manifest['counts'],'evidence':manifest['evidence']}
                 (logdir/'summary.json').write_text(json.dumps([row],indent=2))
-                say('Curl repair: '+row['status']+' | logs: '+str(logdir))
+                say(('Repeat promotion: ' if promotion else 'Curl repair: ')+row['status']+' | logs: '+str(logdir))
                 if row.get('package_inventory_verified'):say('Package installation: VERIFIED. Remaining runtime/HTTPS/permission results are separate.')
                 if row['issues']:say('Read this run before retrying; one endpoint failure does not establish that curl fails for every site.')
             finally:
@@ -3342,7 +3425,7 @@ def main():
     ap.add_argument('--verify-user',type=Path,metavar='NEW_HOME_DIR',help='Post-install online user checks in a new private home directory; no base updates or cse membership needed')
     ap.add_argument('--stage',type=Path,metavar='NEW_PRIVATE_DIR',help='Solve and install a fresh private base candidate with comparison reports; source base stays read only; no --apply needed')
     ap.add_argument('--stage-skip',action='append',default=[],metavar='PACKAGE',help='Omit this application request from --stage; repeatable; dependencies may still require it')
-    ap.add_argument('--promote',type=Path,metavar='REVIEWED_STAGE_DIR',help='Validate the reviewed exact set against its original base; add --apply to install it in place')
+    ap.add_argument('--promote',type=Path,metavar='REVIEWED_STAGE_DIR',help='Preview/apply a reviewed stage; completed stages keep installed packages and add missing matched curl, filtered OS CAs and permissions')
     ap.add_argument('--check-permissions',action='store_true',help='Read-only complete known-path permission preflight with private owner-grouped reports; may combine with --promote to inspect candidate paths')
     ap.add_argument('--inspect-trust',action='store_true',help='Read actual CSE/base CA files and configuration; no updates')
     ap.add_argument('--trust-only',action='store_true',help='Filter existing base Miniforge PEM files in place; no packages, new CA path, or shell snippet')
@@ -3366,7 +3449,7 @@ def main():
     ap.add_argument('--chains-dir',type=Path,help='Approved local incident chain directory; no downloads')
     ap.add_argument('--log-dir',type=Path)
     args = ap.parse_args()
-    if args.merge_system_ca and not args.trust_only:ap.error('--merge-system-ca requires --trust-only; no implicit CA merge is performed in other modes')
+    if args.merge_system_ca and not args.trust_only:ap.error('--merge-system-ca requires --trust-only; stage/promote already include the filtered OS merge')
     if args.permissions_only:
         if args.check_curl or args.curl_url or args.repair_curl or args.export_changes or args.changes_output or args.verify_user or args.stage or args.stage_skip or args.promote or args.check_permissions or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.only or args.all_envs or args.include or args.exclude or args.scan_root or args.upgrade_conda or args.chains_dir or args.offline or args.ca_bundle or args.extra_ca or args.channel or args.diagnostic_timeout is not None:
             ap.error('--permissions-only targets base ownership/modes only; combine with --apply, --log-dir or --verbose')
@@ -3449,6 +3532,9 @@ def main():
     base = Path(preflight['summary']['base']) if preflight else find_base(args.miniforge,env); conda = base/'bin/conda'
     if not maintainable(base): raise RuntimeError('No user/group maintenance access to base')
     approved=load_promotion(args.promote,base,holds=preflight['holds']) if args.promote else None
+    if approved and approved['repeat']:
+        repeat_args=argparse.Namespace(**vars(args));repeat_args.log_dir=preflight['root']/'repeat-promotion'
+        return repair_curl(repeat_args,base,env,promotion=approved)
     if approved:
         env.update(CONDA_PKGS_DIRS=str(approved['root']/'pkgs'),CONDA_REGISTER_ENVS='false',CONDA_SHORTCUTS='false',
                    CONDA_NUMBER_CHANNEL_NOTICES='0',CONDA_REPORT_ERRORS='false',CONDA_SAFETY_CHECKS='enabled',
@@ -3458,7 +3544,7 @@ def main():
     config = json.loads(capture(config_cmd,env))
     channel_names,channel_urls,channel_args = requested_channels(args.channel,{k:v for k,v in config.items() if k!='pinned_packages'})
     source = choose_source(args,config,base)
-    bundle_text, removed = filtered_bundle([source] + args.extra_ca)
+    bundle_text, removed = filtered_bundle([source] + ([system_bundle()] if approved else []) + args.extra_ca)
     skipped_paths = []
     if not args.all_envs and not args.only: prefixes=[base]
     elif args.only: prefixes=list(dict.fromkeys(p.expanduser().resolve() for p in args.only))
@@ -3558,16 +3644,16 @@ def main():
         fcntl.flock(lockfile.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
         if os.fstat(lockfile.fileno()).st_uid == os.geteuid():
             os.fchown(lockfile.fileno(), -1, cse_gid); os.fchmod(lockfile.fileno(), 0o664)
-        marker = trustdir/'managed-by-patch-miniforge-trust'
-        if bundle.exists() and not marker.is_file(): raise RuntimeError('Refusing to replace an unmanaged CA bundle')
-        for p in (bundle,trustdir/'use-ca.sh'):
-            if p.exists(): (logdir/('before-'+p.name)).write_bytes(p.read_bytes())
-        if not marker.exists(): atomic_write(marker,'CSE trust maintenance v2\n')
-        empty.mkdir(mode=0o2775,exist_ok=True)
-        if empty.stat().st_uid == os.geteuid():
-            os.chown(str(empty), -1, cse_gid); os.chmod(str(empty), 0o2775)
-        if any(empty.iterdir()): raise RuntimeError('Expected dedicated empty CA directory')
         if not approved:
+            marker = trustdir/'managed-by-patch-miniforge-trust'
+            if bundle.exists() and not marker.is_file(): raise RuntimeError('Refusing to replace an unmanaged CA bundle')
+            for p in (bundle,trustdir/'use-ca.sh'):
+                if p.exists(): (logdir/('before-'+p.name)).write_bytes(p.read_bytes())
+            if not marker.exists(): atomic_write(marker,'CSE trust maintenance v2\n')
+            empty.mkdir(mode=0o2775,exist_ok=True)
+            if empty.stat().st_uid == os.geteuid():
+                os.chown(str(empty), -1, cse_gid); os.chmod(str(empty), 0o2775)
+            if any(empty.iterdir()): raise RuntimeError('Expected dedicated empty CA directory')
             atomic_write(bundle,bundle_text)
             atomic_write(trustdir/'use-ca.sh','# Source after loading your CSE module.\n'+''.join('export %s=%s\n'%(k,shlex.quote(v)) for k,v in values.items()))
             env.update(values)
@@ -3579,10 +3665,10 @@ def main():
         env['SSL_CERT_DIR']=str(preview_empty);env['CONDA_OFFLINE']='true' if args.offline else 'false'
     certificate_status={'status':'pending verified promotion' if approved and args.apply else 'written' if args.apply else 'planned','bundle':str(bundle),'source':str(source),'roots_selected_for_removal':removed,
                         'sha256':hashlib.sha256(bundle.read_bytes()).hexdigest() if args.apply and not approved else None,
-                        'activation':'shell snippet available; each application/environment must use it; OS/proxy unchanged'}
+                        'activation':'native PEM maintenance included in promotion' if approved else 'shell snippet available; each application/environment must use it; OS/proxy unchanged'}
     (logdir/'certificate-status.json').write_text(json.dumps(certificate_status,indent=2))
     say('CSE certificate stage: '+certificate_status['status'].upper()+' | '+str(bundle))
-    if approved:say('Promotion uses a private CA copy for planning/downloads; shared trust is configured only after the reviewed packages verify.')
+    if approved:say('Promotion uses a private CA copy for downloads, then merges/filters native PEMs and normalizes permissions within apply.')
     else:say('Certificate preparation reads the source into one shared CSE copy. Only selected prefixes receive package/configuration updates; their package-owned PEMs may be replaced by conda.')
     if certificate_status['sha256']: say('CSE bundle SHA256: '+certificate_status['sha256'])
     for i,prefix in enumerate(prefixes):
@@ -3806,14 +3892,16 @@ def main():
                 row['phase'] = 'configure prefix trust'
                 row['changes_started']=True
                 if approved:
-                    atomic_write(bundle,bundle_text)
-                    atomic_write(trustdir/'use-ca.sh','# Source after loading your CSE module.\n'+''.join('export %s=%s\n'%(k,shlex.quote(v)) for k,v in values.items()))
-                    env.update(values)
-                    certificate_status.update(status='written',sha256=hashlib.sha256(bundle.read_bytes()).hexdigest())
+                    certificate_status=rollout_trust(args,prefix,logdir/'native-trust',preview_bundle)
+                    bundle=Path(certificate_status['bundle'])
+                    row['certificate_status']=certificate_status
                     (logdir/'certificate-status.json').write_text(json.dumps(certificate_status,indent=2))
-                run([conda,'config','--file',prefix/'.condarc','--set','ssl_verify',bundle])
-                run([conda,'env','config','vars','set','-p',prefix]+[k+'='+v for k,v in values.items()])
-                row['trust_configuration'] = 'configured to use'
+                    env.update({key:str(bundle) for key in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','SSL_CERT_FILE','CURL_CA_BUNDLE','PIP_CERT')})
+                    row['trust_configuration']='existing native PEM files; filtered OS merge included'
+                else:
+                    run([conda,'config','--file',prefix/'.condarc','--set','ssl_verify',bundle])
+                    run([conda,'env','config','vars','set','-p',prefix]+[k+'='+v for k,v in values.items()])
+                    row['trust_configuration'] = 'configured to use'
                 row['phase'] = 'verify runtime packages and trust bundles'
                 if 'python' in meta:
                     after=runjson([py,'-I','-c',AUDIT])
@@ -3840,6 +3928,7 @@ def main():
                 detail('Would configure conda/activation to use: '+str(bundle))
             for n in ('pixi',):
                 if n in meta or n in audit['packages']:row['issues'].append(n+' needs separate embedded-tool/dependency review')
+            if approved and args.apply and not row['issues']:record_rollout(base,after_meta,approved['root'])
             row['phase'] = 'normalize shared permissions'
             row['permissions'] = {}
             permissions = public_permissions(prefix,base,args.apply,detail,row['skipped_paths'],
@@ -3847,7 +3936,8 @@ def main():
             skipped_paths.extend(row['skipped_paths'])
             row['permission_warnings'] = permissions
             row['status']='incomplete' if row['issues'] else (('updated' if args.apply else 'previewed') + ('-with-skips' if permissions or holds else ''))
-            if approved and row['status'].startswith('updated'):row['promotion']['status']='completed'
+            if approved and row['status'].startswith('updated'):
+                row['promotion']['status']='completed'
         except (PermissionError,FileNotFoundError) as exc:
             row['status']='incomplete' if row['changes_started'] else 'skipped'
             row['issues'].append(str(exc))
@@ -3880,7 +3970,7 @@ def main():
             for r in skipped_paths: say('  %s | owner=%s | %s | %s' % (r['stage'],r['owner'],r['path'],r['reason']))
     say('Full summary: '+str(logdir/'summary.json'))
     if any(r['status']=='incomplete' for r in results): say('Explain this run without retrying: python3 patch_miniforge_trust.py --report '+shlex.quote(str(logdir)))
-    if args.apply and (not approved or certificate_status['status']=='written'):
+    if args.apply and not approved:
         say('For the current shell after loading your module: . '+shlex.quote(str(trustdir/'use-ca.sh')))
     say('No external test endpoints were contacted. OS/proxy trust unchanged.')
     log.close()

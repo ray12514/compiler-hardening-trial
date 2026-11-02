@@ -2,15 +2,56 @@
 
 For the ordered base-only team procedure, start with the
 [base rollout handoff](miniforge-base-rollout.md), or run the standalone script's
-`--base-guide` (revision 29 or newer). This page is the detailed command reference.
+`--base-guide` (revision 33 or newer). This page is the detailed command reference.
 For user-facing package changes and recovering lists from older completed runs,
 see the handoff's [change-list instructions](miniforge-base-rollout.md#generate-the-user-facing-package-change-list)
 and the [update index](miniforge-updates/README.md).
 
 The maintenance script is [scripts/patch_miniforge_trust.py](../scripts/patch_miniforge_trust.py).
-It offers local maintenance of existing Miniforge PEM files and a separate workflow
-for updating shared Conda packages with a managed site CA bundle. It leaves the OS and the inspection proxy unchanged.
+The normal reviewed rollout handles shared Conda packages, native PEM trust and
+permissions together; focused modes remain available for independent maintenance. It leaves the OS and the inspection proxy unchanged.
 No external incident test endpoint is contacted.
+
+## Normal rollout and already installed systems (revision 33)
+
+Use the [short handoff guide](miniforge-base-handoff.md). The normal commands now
+include curl, the filtered OS-to-native-PEM merge and eligible base/link permission
+repairs together; the focused commands below remain for independent maintenance.
+Load the intended Miniforge module and use that installation's reviewed stage:
+
+```bash
+python3 patch_miniforge_trust.py --promote "$cse_stage"
+python3 patch_miniforge_trust.py --promote "$cse_stage" --apply
+```
+
+An unpromoted stage installs its exact reviewed set. A completed stage is
+recognized from the installed reviewed applications/checksums, permitting previous
+curl/dependency follow-ups but rejecting missing reviewed packages or unrelated
+application drift. Repeat promotion preserves installed package versions/builds;
+it adds curl matching installed libcurl and any missing dependencies. It does not
+search for a newer Conda/curl or update unrelated installed packages. Conflicting
+installed dependency requirements stop the bounded solve for review. A matched
+installed pair requires no package solve/transaction. The preview lists remaining
+package actions; inspect its printed logs before apply. `--report` on the stage
+continues to describe the saved original candidate, not today's remaining work.
+
+If the old stage is unavailable, use the same `--stage NEW_DIR`, review and
+promotion sequence. A previous CSE maintenance marker/rollout record plus current
+security minimums selects a candidate preserving installed versions/builds. A
+first rollout or unmet minimum instead needs a fresh compatible solve; review all
+additional changes. No cross-machine version alignment is imposed. Platforms and
+package checksums remain part of review verification.
+
+Every promotion apply validates packages, merges preserved site/OS CAs through
+the known incident certificate/key filter into native PEMs, validates/screens those
+files, and normalizes eligible base/link permissions. No administrator trust file
+is written. Earlier script-created CSE-path overrides migrate to native PEMs;
+new promotions do not create `use-ca.sh` or new activation overrides. Reload the
+normal modules in a fresh shell for user checks. Other custom CA settings remain
+visible and can still select a different source. Missing OS PEM sources or
+unwritable native PEMs fail explicitly. The package, trust, permission and runtime
+results remain separate in the saved logs; keep the package change list.
+
 
 ## Already updated: add the matching curl executable without a full rollout
 

@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import ssl
 from pathlib import Path
 import subprocess
 import tempfile
@@ -59,16 +60,23 @@ class StageTests(unittest.TestCase):
    with self.subTest(name=name),self.assertRaises(RuntimeError):m.stage_requests({name:{}},intent,[name],'26.9.4')
   with self.assertRaisesRegex(RuntimeError,'Unknown'):m.stage_requests(meta,intent,['typo'],'26.9.4')
 
- def run_stage(self,skip=(),fail=None,change_source=False,offline=False,mirror=False):
+ def run_stage(self,skip=(),fail=None,change_source=False,offline=False,mirror=False,maintenance=False):
   with tempfile.TemporaryDirectory() as directory:
    root=Path(directory);base=root/'base';(base/'bin').mkdir(parents=True);(base/'conda-meta').mkdir()
    (base/'bin/conda').touch();(base/'bin/python').touch();(base/'conda-meta/history').write_text('original history')
    (base/'.condarc').write_text('pinned_packages: [qt6-main==6.8.1]\n')
-   source=root/'site.pem';source.write_text('original PEM')
+   source=root/'site.pem';source.write_text(ssl.DER_cert_to_PEM_cert(ssl.create_default_context().get_ca_certs(binary_form=True)[0]))
+   source_bytes=source.read_bytes()
    meta={n:{'name':n,'version':v,'build':'old','channel':'conda-forge','depends':deps} for n,v,deps in (
     ('conda','24.11.2',['python','conda-libmamba-solver']),('python','3.12.8',[]),('conda-libmamba-solver','24.9.0',['python']),
     ('ca-certificates','2024.12.14',[]),('certifi','2024.12.14',['python']),('pip','24.3.1',['python']),
     ('pyside6','6.8.1',['qt6-main','python']),('qt6-main','6.8.1',['krb5']),('krb5','1.21.3',[]))}
+   if maintenance:
+    current={'conda':m.CONDA_MINIMUM,'python':'3.12.9','conda-libmamba-solver':'26.10.0',**m.MINIMUM}
+    for name,record in meta.items():record['version']=current.get(name,record['version'])
+    meta['libcurl']={'name':'libcurl','version':'8.23.0','build':'0','channel':'conda-forge','depends':[]}
+    for record in meta.values():record.update(subdir='noarch',sha256='a'*64,md5='b'*32)
+    (base/'etc/cse-trust').mkdir(parents=True);(base/'etc/cse-trust/managed-by-patch-miniforge-trust').write_text('CSE trust maintenance v2')
    meta['pyside6']['files']=['bin/android_deploy.py']
    (base/'bin/android_deploy.py').write_text('original Qt tool')
    cache=base/'bin/__pycache__/android_deploy.cpython-312.pyc';cache.parent.mkdir();cache.write_bytes(b'original cache');cache.parent.chmod(0o555)
@@ -79,7 +87,9 @@ class StageTests(unittest.TestCase):
    versions={'conda':'26.9.4','python':'3.14.0','conda-libmamba-solver':'26.10.0','ca-certificates':'2026.10.23',
              'certifi':'2026.10.23','pip':'26.2.2','pyside6':'6.12.0','qt6-main':'6.12.0','krb5':'1.22.2'}
    chosen={n:dict(meta[n],version=v,build='new') for n,v in versions.items() if not (skip and n in ('pyside6','qt6-main','krb5'))}
+   if maintenance:chosen=json.loads(json.dumps(meta))
    for name in ('curl','libcurl'):chosen[name]={'name':name,'version':'8.23.0','build':'0','channel':'conda-forge'}
+   if maintenance:chosen['libcurl']=dict(meta['libcurl'])
    def fake(argv,**kwargs):
     argv=list(map(str,argv));values=argv[5:];calls.append((argv,dict(kwargs['env'])))
     if argv[4]==m.CURL_PROBE:
@@ -101,6 +111,7 @@ class StageTests(unittest.TestCase):
      else:
       (candidate/'conda-meta').mkdir(parents=True);(candidate/'bin').mkdir()
       (candidate/'bin/python').touch();(candidate/'bin/conda').touch()
+      (candidate/'ssl').mkdir();(candidate/'ssl/cacert.pem').write_bytes(source_bytes)
       for name,r in chosen.items():
        if fail=='install' and name!='python':continue
        (candidate/'conda-meta'/(name+'.json')).write_text(json.dumps(r))
@@ -111,7 +122,7 @@ class StageTests(unittest.TestCase):
     else:data={'success':True}
     return subprocess.CompletedProcess(argv,0,json.dumps(data),'')
    try:
-    with patch.object(m.subprocess,'run',side_effect=fake),patch.object(m,'filtered_bundle',return_value=('private PEM',[])),patch.object(m,'maintenance_gid') as group,patch.object(m,'public_permissions') as permissions,contextlib.redirect_stdout(io.StringIO()):
+    with patch.object(m.subprocess,'run',side_effect=fake),patch.object(m,'system_bundle',return_value=source),patch.object(m,'maintenance_gid') as group,patch.object(m,'public_permissions') as permissions,contextlib.redirect_stdout(io.StringIO()):
      result=m.stage_base(args,base,m.safe_environment())
     group.assert_not_called();permissions.assert_not_called()
     summary=json.loads((args.stage/'stage-summary.json').read_text());comparison=json.loads((args.stage/'comparison.json').read_text())
@@ -120,7 +131,7 @@ class StageTests(unittest.TestCase):
     self.assertTrue(all(p.stat().st_mode&0o077==0 for p in args.stage.iterdir() if p.is_file()))
     self.assertEqual(cache.read_bytes(),b'original cache');self.assertEqual(cache.parent.stat().st_mode&0o777,0o555)
     if not change_source:self.assertEqual(original,{str(p.relative_to(base)):(p.read_bytes(),p.stat().st_ino,p.stat().st_mode) for p in base.rglob('*') if p.is_file()})
-    self.assertEqual(source.read_text(),'original PEM')
+    self.assertEqual(source.read_bytes(),source_bytes)
     for argv,env in calls:
      self.assertEqual(argv[1:4],['-I','-B','-c']);self.assertNotIn('CSE_CONDA_PERMISSION_HOLDS',env)
      self.assertEqual(env['CONDA_PKGS_DIRS'],str(args.stage/'pkgs'));self.assertEqual(env['CONDA_REGISTER_ENVS'],'false')
@@ -137,6 +148,14 @@ class StageTests(unittest.TestCase):
   self.assertNotIn('python=3.12.*',creates[0]);self.assertFalse(any('pyside6=6.8.1' in value for value in creates[0]))
   krb=next(r for r in comparison if r['package']=='krb5');self.assertEqual((krb['before_version'],krb['after_version']),('1.21.3','1.22.2'))
   self.assertIn('No promotion',review)
+
+ def test_already_updated_base_stages_only_missing_curl_without_latest_search(self):
+  result,summary,comparison,review,calls=self.run_stage(maintenance=True)
+  self.assertEqual(result,0,summary['issues'])
+  self.assertEqual([(row['package'],row['status']) for row in comparison if row['status']!='unchanged'],[('curl','added')])
+  self.assertFalse(any('search' in argv[5:] for argv,env in calls))
+  self.assertIn('preserve installed versions/builds',summary['package_policy'])
+  self.assertEqual(summary['certificate_status']['mode'],'native-pem')
 
  def test_explicitly_omitted_request_appears_in_comparison(self):
   result,summary,comparison,review,calls=self.run_stage(skip=['pyside6'])
