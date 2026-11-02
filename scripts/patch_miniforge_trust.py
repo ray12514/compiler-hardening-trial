@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 33 (2026-11-02).
+"""CSE Miniforge certificate maintenance, revision 34 (2026-11-02).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --base-guide          # ordered team rollout guide
@@ -227,12 +227,13 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 33
-BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TEAM BASE-ONLY ROLLOUT (revision 33)
+SCRIPT_REVISION = 34
+BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TEAM BASE-ONLY ROLLOUT (revision 34)
 
 Load the intended site/compiler and Miniforge modules. Run as the maintenance
 account (cse group), never root. Repeat separately for each GCC/Intel installation.
-The loaded module selects the base; no system name is required.
+The loaded module selects the base; no system name is required. System CA paths
+are discovered locally for RHEL (including its extracted PEM) and SUSE/openSUSE.
 
 ALREADY INSTALLED: use that installation's completed stage and the SAME commands:
    cse_stage="$HOME/cse-base-review-1"
@@ -367,9 +368,19 @@ def maintainable(p):
     return bool(identity and os.access(str(p), os.W_OK | os.X_OK))
 
 
+# Generated plain PEM trust bundles, never input anchor directories or AUX stores.
+# Prefer RHEL's extracted PEM: RHEL 10 changed the old compatibility-file format.
+SYSTEM_CA_BUNDLES = (
+    '/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem',  # RHEL, including 10
+    '/etc/pki/tls/certs/ca-bundle.crt',                 # Older RHEL compatibility path
+    '/etc/ssl/certs/ca-certificates.crt',               # Debian/Ubuntu and compatible aliases
+    '/etc/ssl/ca-bundle.pem',                          # SUSE/openSUSE compatibility path
+    '/var/lib/ca-certificates/ca-bundle.pem',           # SUSE/openSUSE generated bundle
+)
+
+
 def system_bundle():
-    for p in ('/etc/pki/tls/certs/ca-bundle.crt', '/etc/ssl/certs/ca-certificates.crt',
-              '/etc/ssl/ca-bundle.pem', '/var/lib/ca-certificates/ca-bundle.pem'):
+    for p in SYSTEM_CA_BUNDLES:
         if Path(p).is_file():
             return Path(p).resolve()
     raise RuntimeError('Cannot locate host PEM bundle; supply --ca-bundle PATH')
@@ -742,7 +753,9 @@ def maintain_native_trust(base, args):
                 fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
             paths=native_bundle_paths(base)
             extras=([args.ca_bundle] if args.ca_bundle else [])+args.extra_ca
-            if getattr(args,'merge_system_ca',False):extras.append(system_bundle())
+            if getattr(args,'merge_system_ca',False):
+                os_source=system_bundle();extras.append(os_source)
+                say('System CA source (read only): '+str(os_source))
             source_hashes={str(Path(path).expanduser().resolve(strict=True)):hashlib.sha256(Path(path).expanduser().read_bytes()).hexdigest() for path in extras}
             staged=[];details=[]
             for path in paths:

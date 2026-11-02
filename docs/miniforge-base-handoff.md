@@ -23,8 +23,9 @@ pair needs no package solve or reinstall.
 
 Apply also merges the OS CAs into the native Miniforge PEMs **through the incident
 certificate/key filter**, checks the result, and normalizes eligible base/file/
-symlink permissions. OS trust files stay unchanged; known incident certificates
-cannot return through the merge. No separate trust/merge/permission command or
+symlink permissions. System CA discovery covers RHEL and SUSE/openSUSE locations
+automatically, including the newer RHEL extracted PEM path. OS trust files stay
+unchanged; known incident certificates cannot return through the merge. No separate trust/merge/permission command or
 `use-ca.sh` step is needed. Read the final status, logs and any owner-review skips.
 
 The stage must belong to this installation. Unrelated package/checksum drift is

@@ -12,6 +12,33 @@ The normal reviewed rollout handles shared Conda packages, native PEM trust and
 permissions together; focused modes remain available for independent maintenance. It leaves the OS and the inspection proxy unchanged.
 No external incident test endpoint is contacted.
 
+## System certificate locations: RHEL and SUSE
+
+Revision 34 discovers the host bundle by checking these generated PEM files in
+order; it does not assume every operating system uses the same path:
+
+| System layout | Bundle location |
+| --- | --- |
+| RHEL extracted TLS bundle, including RHEL 10 | `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem` |
+| Older RHEL compatibility path | `/etc/pki/tls/certs/ca-bundle.crt` |
+| Debian/Ubuntu and compatible aliases | `/etc/ssl/certs/ca-certificates.crt` |
+| SUSE/openSUSE compatibility path | `/etc/ssl/ca-bundle.pem` |
+| SUSE/openSUSE generated bundle | `/var/lib/ca-certificates/ca-bundle.pem` |
+
+The extracted PEM is preferred on RHEL because [RHEL 10 changed the older
+truststore layout](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/10/html-single/considerations_in_adopting_rhel_10/index).
+The [SUSE certificate utility](https://github.com/openSUSE/ca-certificates)
+documents its generated store and compatibility links. Existing symlinks resolve
+to their generated target. Missing/broken links are skipped; no discovered bundle
+means the operation stops rather than selecting Miniforge's own bundle as an OS
+substitute. A selected unreadable/malformed bundle fails during source validation.
+
+The printed native-trust step identifies the resolved OS source; its hash is kept
+in `certificate-status.json`. The same incident certificate/public-key filter is
+applied on every OS before writing native Miniforge PEMs. System files are read
+only. The normal stage/promote/apply commands do not change. This is path-discovery
+and merge regression coverage, not a claim of a live rollout on every OS release.
+
 ## Normal rollout and already installed systems (revision 33)
 
 Use the [short handoff guide](miniforge-base-handoff.md). The normal commands now
