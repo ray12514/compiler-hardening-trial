@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 34 (2026-11-02).
+"""CSE Miniforge certificate maintenance, revision 35 (2026-11-02).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --base-guide          # ordered team rollout guide
-  python3 patch_miniforge_trust.py --promote ~/cse-candidate # review remaining work
-  python3 patch_miniforge_trust.py --promote ~/cse-candidate --apply # packages, native trust, permissions
+  python3 patch_miniforge_trust.py --promote               # auto-prepare/review the loaded base
+  python3 patch_miniforge_trust.py --promote --apply       # apply its saved review
   python3 patch_miniforge_trust.py --repair-curl          # optional focused repair
   python3 patch_miniforge_trust.py --repair-curl --apply  # install pair and verify
   python3 patch_miniforge_trust.py --check-curl --curl-url https://your-service.example/
@@ -39,10 +39,11 @@ insecure settings or known incident roots fail before package downloads. Optiona
 --chains-dir checks supplied incident chains offline. Reports cover this account
 and these exercises, not every user, application, compiler or proxy trust policy.
 Default preview is local-only: inventory, CA inspection, ownership and permissions.
---promote previews are dependency dry runs of a reviewed set; --apply installs it
-at its original base prefix after freshness/access checks. A completed stage can
-be reused for a bounded curl follow-up with native trust/permissions included. Stage each system
-separately after loading that site's environment and Miniforge.
+Without a path, --promote automatically prepares a new review for the loaded
+base, including staging only when needed. --promote --apply finds and applies
+that saved review after freshness/access checks. No old stage path is required. Older explicit
+stage paths remain supported for manual use. Load each installation's usual
+environment and Miniforge module before starting its review.
 Apply reuses non-default channels recorded in each environment's installed conda
 packages. Non-base requests preserve per-package sources; base uses channel priority. conda-forge remains a
 fallback; --channel adds an explicit community channel/mirror when metadata is absent. Anaconda defaults/repo.anaconda.com sources are excluded.
@@ -227,63 +228,45 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 34
-BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TEAM BASE-ONLY ROLLOUT (revision 34)
+SCRIPT_REVISION = 35
+BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TWO-STEP BASE ROLLOUT (revision 35)
 
-Load the intended site/compiler and Miniforge modules. Run as the maintenance
-account (cse group), never root. Repeat separately for each GCC/Intel installation.
-The loaded module selects the base; no system name is required. System CA paths
-are discovered locally for RHEL (including its extracted PEM) and SUSE/openSUSE.
+Use the updated standalone script. Load the intended site/compiler and Miniforge
+module. Run as the maintenance account (cse group), never root. No old stage path,
+Miniforge replacement or preliminary package update is needed.
 
-ALREADY INSTALLED: use that installation's completed stage and the SAME commands:
-   cse_stage="$HOME/cse-base-review-1"
-   python3 patch_miniforge_trust.py --promote "$cse_stage"
-   python3 patch_miniforge_trust.py --promote "$cse_stage" --apply
-Review planned changes before apply. Installed Conda/Python/application versions
-stay fixed. Missing curl matches installed libcurl; only missing dependencies
-may be added. A matched installed pair needs no package solve or reinstall.
-Unrelated package/build/checksum drift stops reuse of a completed stage.
+1. Review/approve:
+   python3 patch_miniforge_trust.py --promote
+   The script discovers the loaded base, chooses a NEW private directory and
+   automatically prepares the needed plan/checks. An already updated base keeps
+   installed versions/builds and adds missing matched curl/dependencies without
+   rebuilding base or retrieving an old stage. Initial/security refresh staging
+   runs automatically when needed. Review changes and require Review READY.
 
-NO SAVED STAGE / FIRST ROLLOUT: follow the normal sequence:
-1. Use a NEW private stage directory under home:
-   cse_stage="$HOME/cse-base-review-2"
-   python3 patch_miniforge_trust.py --stage "$cse_stage"
-   A previously maintained base meeting security minimums keeps installed
-   versions/builds. A first rollout or unmet minimum needs a fresh compatible
-   solve. Review any additional changes; versions need not match across machines.
+2. Apply that saved review:
+   python3 patch_miniforge_trust.py --promote --apply
+   The review is found automatically for this host/installation. Apply uses the
+   reviewed packages, includes the filtered OS-to-native-PEM merge and normalizes
+   eligible base/link permissions. RHEL/SUSE paths are detected; known incident
+   certificates and public keys are filtered before writing. OS files stay read
+   only. Read final status and owner/access skips. No extra trust/permission step.
 
-2. Review ready-for-review, review.md and comparison.csv; test needed apps in
-   "$cse_stage/env". A successful solve is not full application validation.
-   python3 patch_miniforge_trust.py --report "$cse_stage"
+Reviews default to ~/.cse-trust-reviews/, separated by host and base. Every new
+review/apply has a unique directory; existing records remain. Optional --log-dir
+PATH chooses a location; an existing name gets a new suffixed sibling. If base/CA
+sources change after review, repeat step 1 then step 2. A failed/new review never
+silently falls back to an older review. Apply does not redo a saved maintenance
+solve or silently select newer package versions.
 
-3. Check access and preview as the maintenance account:
-   python3 patch_miniforge_trust.py --check-permissions --promote "$cse_stage"
-   python3 patch_miniforge_trust.py --promote "$cse_stage"
-   Resolve required owner/admin blockers and inspection gaps before applying.
-
-4. Use the usual maintenance window/recovery arrangements; stop concurrent base
-   jobs/updates. Apply the reviewed package set at its existing base path:
-   python3 patch_miniforge_trust.py --promote "$cse_stage" --apply
-   Apply ALSO merges the OS CAs through the incident certificate/public-key
-   filter into native PEMs, verifies them and normalizes base/link permissions.
-   OS files remain read only. No extra --trust-only/merge/permissions command or
-   use-ca.sh step is needed. Review skips/updated-with-skips and the printed logs.
-
-5. In a fresh shell, reload the same modules and verify normal user operations,
-   ideally as an ordinary user with a NEW private test directory:
-   python3 patch_miniforge_trust.py --verify-user "$HOME/cse-user-check-2"
-   python3 patch_miniforge_trust.py --report "$HOME/cse-user-check-2"
-   Require requested checks to pass; read verification.md and coverage limits.
-   Optional --chains-dir PATH checks supplied incident chains offline; without
-   it, chain rejection is explicitly not-tested. No live incident sites are probed.
-
-Keep the stage, source commit, promotion logs and certificate/user results per
-installation. Verified updates write 000-user-changes/README.md plus CSV/JSON
-package lists for reviewed publication. Logs remain private. Bring the failing
-command/log directory to Ravon if a step fails. Other environments and the
-Miniforge installer are unchanged. Focused --repair-curl, --trust-only,
---check-curl, --inspect-trust and --permissions-only modes remain available for
-later diagnostics; they are not additional rollout steps.
+Use the usual maintenance window/recovery arrangements; stop concurrent base
+jobs/updates before apply. Repeat for each distinct GCC/Intel installation.
+--approve aliases --promote; older explicit --stage DIR / --promote DIR commands
+remain supported. The two commands above are the required rollout sequence.
+--report PRINTED_DIR, --inspect-trust, --check-curl, --verify-user and focused
+repairs are optional diagnostics/validation. No live incident sites are probed.
+Keep review/run logs and the 000-user-changes/README.md plus CSV/JSON package list.
+If a step fails, bring Ravon its command and printed directory. Private logs are
+not for publication; other baseline environments stay unchanged.
 """
 BASE_REPLACEMENTS = {'boost':('libboost-python-devel',),'boost-cpp':('libboost-devel',)}
 ROOTS = {
@@ -1695,6 +1678,7 @@ def report_directory(directory):
 
 def report_existing(directory, verbose=False):
     directory = report_directory(directory)
+    if (directory/'review.json').is_file():return report_automatic_review(directory)
     if (directory/'verification-summary.json').is_file():return report_user_verification(directory)
     if (directory/'permission-summary.json').is_file() and not (directory/'summary.json').is_file():
         print('READ-ONLY PERMISSION REPORT: '+str(directory))
@@ -2390,16 +2374,7 @@ def collect_permission_audit(base, directory=None, stage=None, ca_inputs=()):
     return {'root':root,'summary':result,'holds':holds}
 
 
-def load_promotion(directory, base, holds=None):
-    root=directory.expanduser().resolve(strict=True)
-    if base==root or base in root.parents or root in base.parents:
-        raise RuntimeError('Reviewed stage must be outside the live base')
-    summary=json.loads((root/'stage-summary.json').read_text())
-    if summary.get('status')!='ready-for-review' or summary.get('source_metadata_unchanged') is not True or summary.get('source_ca_unchanged') is not True:
-        raise RuntimeError('Promotion requires a ready-for-review stage with unchanged source metadata and CA')
-    if Path(summary['source_base']).resolve()!=base:
-        raise RuntimeError('This stage belongs to '+summary['source_base']+', not '+str(base)+'. Load the correct site environment/Miniforge, or stage this system separately.')
-    packages=json.loads((root/'candidate-packages.json').read_text())
+def validate_reviewed_packages(packages):
     if not packages or not {'conda','python','conda-libmamba-solver'}<=set(packages):raise RuntimeError('Reviewed candidate lacks its required Conda/Python/solver packages')
     for name,record in packages.items():
         if record.get('name')!=name or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*',name):raise RuntimeError('Invalid reviewed package name: '+str(name))
@@ -2410,6 +2385,19 @@ def load_promotion(directory, base, holds=None):
         if not hashes or not record.get('subdir'):raise RuntimeError('Reviewed package lacks platform/checksum metadata: '+name)
         if not recorded_origin(record) or any(forbidden_channel(record.get(key,'')) for key in ('channel','url','base_url')):
             raise RuntimeError('Reviewed package has an excluded or unidentified source: '+name)
+
+
+def load_promotion(directory, base, holds=None):
+    root=directory.expanduser().resolve(strict=True)
+    if base==root or base in root.parents or root in base.parents:
+        raise RuntimeError('Reviewed stage must be outside the live base')
+    summary=json.loads((root/'stage-summary.json').read_text())
+    if summary.get('status')!='ready-for-review' or summary.get('source_metadata_unchanged') is not True or summary.get('source_ca_unchanged') is not True:
+        raise RuntimeError('Promotion requires a ready-for-review stage with unchanged source metadata and CA')
+    if Path(summary['source_base']).resolve()!=base:
+        raise RuntimeError('This stage belongs to '+summary['source_base']+', not '+str(base)+'. Load the correct site environment/Miniforge, or stage this system separately.')
+    packages=json.loads((root/'candidate-packages.json').read_text())
+    validate_reviewed_packages(packages)
     plan=json.loads((root/'candidate-plan.json').read_text())
     check_plan(plan,None,set(packages))
     expected={r['name']:(r['version'],r.get('build_string') or r.get('build')) for r in plan.get('actions',{}).get('LINK',[])}
@@ -3242,7 +3230,7 @@ def check_curl(args, base, env):
     return 0 if summary['status']=='passed' else 2
 
 
-def repair_curl(args, base, env, promotion=None):
+def repair_curl(args, base, env, promotion=None, reviewed=None):
     """Target curl and its dependency closure; never repeat the full base update."""
     logdir=(args.log_dir or Path.home()/'.cse-trust-logs'/('curl-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))).expanduser().resolve()
     if logdir==base or base in logdir.parents:raise RuntimeError('Repair logs must be outside the base installation')
@@ -3304,7 +3292,10 @@ def repair_curl(args, base, env, promotion=None):
             env.update(SSL_CERT_DIR=str(empty),CONDA_OFFLINE='true' if args.offline else 'false')
             flags=channel_args+(['--offline'] if args.offline else [])
             common=['install','-p',str(base),'--solver','libmamba','--json','--no-pin']+flags
-            if promotion:
+            if reviewed:
+                plan=reviewed['plan'];target=reviewed['packages']['curl']['version']
+                row['phase']='validate saved package plan; no new solve'
+            elif promotion:
                 installed_versions=[before[name]['version'] for name in ('curl','libcurl') if name in before]
                 target=max(installed_versions,key=version) if installed_versions else None
                 pair_ready=all(name in before for name in ('curl','libcurl')) and before['curl']['version']==before['libcurl']['version'] and (base/'bin/curl').is_file()
@@ -3343,6 +3334,13 @@ def repair_curl(args, base, env, promotion=None):
             say('Target curl/libcurl: '+target+'; planned changes: '+(', '.join(record['name'] for record in row['package_plan']) or 'none'))
             if args.apply:
                 if stage_source_state(base)!=baseline:raise RuntimeError('Base changed during repair planning; no transaction attempted')
+                if reviewed:
+                    if approval_snapshot(base,args)!=reviewed['source_snapshot']:
+                        raise RuntimeError('Installation or CA sources changed after review; run --promote again')
+                    guard={'prefix':str(base),'packages':reviewed['packages'],
+                           'before':{name:[record['version'],record['build']] for name,record in before.items()}}
+                    guardfile=logdir/'approved-promotion-plan.json';guardfile.write_text(json.dumps(guard,indent=2));guardfile.chmod(0o600)
+                    env['CSE_CONDA_APPROVED_PLAN']=str(guardfile)
                 (logdir/'000-before-packages.json').write_text(json.dumps(before,indent=2))
                 # Guard ALL non-dependency packages against implicit relinks too.
                 env['CSE_CONDA_PERMISSION_HOLDS']=json.dumps({'prefix':str(base),'packages':sorted((set(before)-allowed)|set(holds))})
@@ -3351,6 +3349,9 @@ def repair_curl(args, base, env, promotion=None):
                     runjson(common+exact+['--yes'])
                 else:say('Packages already installed: no package transaction needed.')
                 after=records(base);verify_installed_plan(final,after)
+                if reviewed:
+                    differences=promotion_differences(after,reviewed['packages'])
+                    if differences:raise RuntimeError('Installed checksums/platforms differ from saved review: '+', '.join(differences))
                 (logdir/'000-after-packages.json').write_text(json.dumps(after,indent=2));row['package_inventory_verified']=True
                 row['curl_repair']['packages']='installed-and-verified'
                 row['package_changes']=[{'name':name,'before':before.get(name,{}).get('version','absent'),'after':record['version']} for name,record in after.items()
@@ -3423,7 +3424,193 @@ def repair_curl(args, base, env, promotion=None):
     return 0 if row['status'] in ('previewed','updated','updated-with-skips') else 2
 
 
-def main():
+def private_write(path, text):
+    fd,temporary=tempfile.mkstemp(prefix='.cse-review-',dir=str(path.parent))
+    try:
+        with os.fdopen(fd,'w') as stream:stream.write(text)
+        os.chmod(temporary,0o600);os.replace(temporary,str(path))
+    finally:
+        if os.path.exists(temporary):os.unlink(temporary)
+
+
+def report_automatic_review(directory):
+    review=json.loads((directory/'review.json').read_text())
+    print('SAVED AUTOMATIC REVIEW: '+review['status']+' | base: '+review['base'])
+    if review.get('kind')=='maintenance':
+        changes=review['plan'].get('actions',{}).get('LINK',())
+        for record in changes:print('  '+record['name']+' -> '+record['version']+'='+str(record.get('build_string') or record.get('build')))
+        if not changes:print('  No package changes; native trust and permissions remain included in apply.')
+    if review.get('kind')=='stage':print('Private candidate: '+review['stage'])
+    if review.get('issue'):print('Issue: '+review['issue'])
+    print('Saved preparation only; this does not establish that apply completed. No changes or network requests made.')
+    return 0 if review['status']=='ready' else 2
+
+
+def approval_scope(base):
+    """Keep reviews separate for distinct hosts/prefixes sharing the same home."""
+    identity=os.uname().nodename+'\0'+str(base)
+    return Path.home()/'.cse-trust-reviews'/hashlib.sha256(identity.encode()).hexdigest()[:20]
+
+
+def new_review_directory(base, parent, requested=None, prefix='review-'):
+    target=Path(os.path.abspath(str(requested.expanduser()))) if requested else None
+    candidate=(target or parent).resolve()
+    if candidate==base or base in candidate.parents or any((p/'conda-meta/history').is_file() for p in candidate.parents):
+        raise RuntimeError('Review/log directories must be outside Conda installations')
+    if target and not target.exists() and not target.is_symlink():
+        target.mkdir(mode=0o700,parents=True,exist_ok=False);return target
+    directory=(target.parent if target else parent).resolve()
+    directory.mkdir(mode=0o700,parents=True,exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=(target.name+'-' if target else prefix)+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-'),dir=str(directory)))
+
+
+def approval_options(args):
+    return {'offline':args.offline,'channel':args.channel,
+            'ca_bundle':str(args.ca_bundle.expanduser().resolve()) if args.ca_bundle else None,
+            'extra_ca':[str(p.expanduser().resolve()) for p in args.extra_ca],
+            'chains_dir':str(args.chains_dir.expanduser().resolve()) if args.chains_dir else None}
+
+
+def restore_approval_options(args, saved):
+    current=approval_options(args)
+    for key,value in current.items():
+        if value and value!=saved.get(key):raise RuntimeError('Options differ from the saved review; run --promote again')
+    args.offline=saved['offline'];args.channel=list(saved['channel'])
+    args.ca_bundle=Path(saved['ca_bundle']) if saved['ca_bundle'] else None
+    args.extra_ca=[Path(p) for p in saved['extra_ca']]
+    args.chains_dir=Path(saved['chains_dir']) if saved['chains_dir'] else None
+
+
+def approval_snapshot(base, args):
+    paths=native_bundle_paths(base)+[system_bundle()]+([args.ca_bundle] if args.ca_bundle else [])+args.extra_ca
+    for key in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','CURL_CA_BUNDLE','SSL_CERT_FILE','PIP_CERT'):
+        value=os.environ.get(key)
+        if value and Path(value).expanduser().is_file():paths.append(Path(value).expanduser())
+    paths=[p.expanduser().resolve(strict=True) for p in paths]
+    files={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
+    return {'base_state':stage_source_state(base),'ca_files':files,
+            'ca_environment':{key:os.environ[key] for key in ('CONDA_SSL_VERIFY','REQUESTS_CA_BUNDLE','CURL_CA_BUNDLE','SSL_CERT_FILE','PIP_CERT','SSL_CERT_DIR') if key in os.environ}}
+
+
+def reviewed_plan_packages(before, plan):
+    packages=dict(before)
+    fetched={r['name']:r for r in plan.get('actions',{}).get('FETCH',())}
+    for record in plan.get('actions',{}).get('UNLINK',()):packages.pop(record['name'],None)
+    for record in plan.get('actions',{}).get('LINK',()):
+        name=record['name'];record=dict(fetched.get(name,{}),**record)
+        record['build']=record.get('build_string') or record.get('build')
+        previous=packages.get(name,{})
+        if (previous.get('version'),previous.get('build'))==(record.get('version'),record.get('build')):
+            record=dict(previous,**record)
+        packages[name]=record
+    validate_reviewed_packages(packages)
+    return packages
+
+
+def automatic_promotion(args):
+    """Prepare a unique private review, or apply exactly the last saved review."""
+    maintenance_gid();env=safe_environment();env['PYTHONDONTWRITEBYTECODE']='1'
+    base=find_base(args.miniforge,env)
+    if not maintainable(base):raise RuntimeError('No maintenance access to the loaded Miniforge base')
+    parent=approval_scope(base)
+    if parent==base or base in parent.parents:raise RuntimeError('Default review location is inside the loaded base')
+    parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+    old_umask=os.umask(0o077)
+    try:
+        with (parent/'workflow.lock').open('a') as lock:
+            os.fchmod(lock.fileno(),0o600);fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+            pointer=parent/'latest.json'
+            if args.apply:
+                if not pointer.is_file():raise RuntimeError('No saved review for this loaded installation; run --promote first')
+                latest=json.loads(pointer.read_text())
+                if latest.get('status')!='ready':raise RuntimeError('Latest review is not ready (or was already applied); run --promote again')
+                root=Path(latest['directory']);file=root/'review.json'
+                if hashlib.sha256(file.read_bytes()).hexdigest()!=latest.get('sha256'):
+                    raise RuntimeError('Saved review changed after preparation; run --promote again')
+                review=json.loads(file.read_text())
+                if review['base']!=str(base) or review['script_revision']!=SCRIPT_REVISION:
+                    raise RuntimeError('Saved review belongs to a different installation/script; run --promote again')
+                restore_approval_options(args,review['options'])
+                if approval_snapshot(base,args)!=review['source_snapshot']:
+                    raise RuntimeError('Installation or CA sources changed since review; run --promote again')
+                logroot=new_review_directory(base,root,args.log_dir,prefix='apply-')
+                print('Applying saved review: '+str(root),flush=True)
+                if review['kind']=='stage':
+                    stage=Path(review['stage'])
+                    if any(hashlib.sha256((stage/name).read_bytes()).hexdigest()!=digest for name,digest in review['stage_files_sha256'].items()):
+                        raise RuntimeError('Saved staged plan changed after review; run --promote again')
+                    result=main(promotion_arguments(base,Path(review['stage']),logroot/'promotion',args,apply=True))
+                else:
+                    audit=permission_audit(base,logroot/'preflight')
+                    if audit['summary']['promotion_blocking_path_count']:return 2
+                    promotion=review['promotion'];promotion=dict(promotion,root=root)
+                    run_args=argparse.Namespace(**vars(args));run_args.log_dir=logroot/'promotion'
+                    result=repair_curl(run_args,base,env,promotion=promotion,reviewed=review)
+                private_write(logroot/'result.json',json.dumps({'review':str(root),'exit_code':result},indent=2))
+                # A failed/partial apply is never silently reused against changed state.
+                private_write(pointer,json.dumps({'directory':str(root),'status':'applied' if result==0 else 'apply-failed'},indent=2))
+                print('Apply logs: '+str(logroot),flush=True)
+                return result
+            root=new_review_directory(base,parent,args.log_dir)
+            private_write(pointer,json.dumps({'directory':str(root),'status':'preparing'},indent=2))
+            review={'script_revision':SCRIPT_REVISION,'base':str(base),'options':approval_options(args),'status':'preparing'}
+            result=2
+            try:
+                before=records(base);snapshot=approval_snapshot(base,args)
+                required={'conda','python','conda-libmamba-solver','pip','certifi','ca-certificates'}
+                current=required<=set(before)
+                try:verify_minimums(before,before,True)
+                except RuntimeError:current=False
+                print('Loaded Miniforge: '+str(base)+'\nNew private review: '+str(root),flush=True)
+                if current:
+                    print('Already updated base: preserve installed packages; no old stage needed.',flush=True)
+                    validate_reviewed_packages(before)
+                    audit=permission_audit(base,root/'preflight')
+                    if audit['summary']['promotion_blocking_path_count']:raise RuntimeError('Required permission blockers found; see this review\'s preflight report')
+                    identity={n:{k:r.get(k) for k in ('version','build','subdir','sha256','md5')} for n,r in sorted(before.items())}
+                    promotion={'packages':before,'manifest_sha256':hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest()}
+                    run_args=argparse.Namespace(**vars(args));run_args.log_dir=root/'preview'
+                    result=repair_curl(run_args,base,env,promotion=dict(promotion,root=root))
+                    if result:raise RuntimeError('Review preview failed; inspect '+str(run_args.log_dir))
+                    plan=json.loads((run_args.log_dir/'000-plan.json').read_text())
+                    packages=reviewed_plan_packages(before,plan)
+                    review.update(kind='maintenance',promotion=promotion,plan=plan,packages=packages)
+                else:
+                    print('Initial/security refresh: staging and promotion preview run automatically.',flush=True)
+                    stage_args=argparse.Namespace(**vars(args));stage_args.stage=root/'stage';stage_args.stage_skip=[];stage_args.log_dir=None
+                    result=stage_base(stage_args,base,env)
+                    if result:raise RuntimeError('Automatic private staging failed; inspect '+str(stage_args.stage))
+                    result=main(promotion_arguments(base,stage_args.stage,root/'preview',args))
+                    if result:raise RuntimeError('Automatic promotion preview failed; inspect '+str(root/'preview'))
+                    stage_files={name:hashlib.sha256((stage_args.stage/name).read_bytes()).hexdigest() for name in ('candidate-packages.json','candidate-plan.json','stage-summary.json')}
+                    review.update(kind='stage',stage=str(stage_args.stage),stage_files_sha256=stage_files)
+                if approval_snapshot(base,args)!=snapshot:raise RuntimeError('Installation or CA sources changed during review; run --promote again')
+                review.update(status='ready',source_snapshot=snapshot)
+                result=0
+            except (Exception,KeyboardInterrupt) as exc:
+                review.update(status='failed',issue=redact_verification(str(exc)));result=2
+                print('Review failed: '+review['issue'],flush=True)
+            file=root/'review.json';private_write(file,json.dumps(review,indent=2))
+            private_write(pointer,json.dumps({'directory':str(root),'status':review['status'],'sha256':hashlib.sha256(file.read_bytes()).hexdigest()},indent=2))
+            if result==0:
+                print('Review READY: '+str(root)+'\nReview the planned changes above, then run: python3 patch_miniforge_trust.py --promote --apply',flush=True)
+            print('Existing review directories were preserved; no base changes were made during review.',flush=True)
+            return result
+    finally:os.umask(old_umask)
+
+
+def promotion_arguments(base, stage, directory, args, apply=False):
+    values=[str(base),'--promote',str(stage),'--log-dir',str(directory)]
+    if apply:values.append('--apply')
+    if args.offline:values.append('--offline')
+    if args.verbose:values.append('--verbose')
+    if args.ca_bundle:values+=['--ca-bundle',str(args.ca_bundle)]
+    for path in args.extra_ca:values+=['--extra-ca',str(path)]
+    if args.chains_dir:values+=['--chains-dir',str(args.chains_dir)]
+    return values
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--version',action='version',version='patch_miniforge_trust.py revision %d'%SCRIPT_REVISION)
     ap.add_argument('--base-guide',action='version',version=BASE_ROLLOUT_GUIDE,help='Print the ordered base-only team rollout guide and exit; no access or network checks')
@@ -3438,7 +3625,7 @@ def main():
     ap.add_argument('--verify-user',type=Path,metavar='NEW_HOME_DIR',help='Post-install online user checks in a new private home directory; no base updates or cse membership needed')
     ap.add_argument('--stage',type=Path,metavar='NEW_PRIVATE_DIR',help='Solve and install a fresh private base candidate with comparison reports; source base stays read only; no --apply needed')
     ap.add_argument('--stage-skip',action='append',default=[],metavar='PACKAGE',help='Omit this application request from --stage; repeatable; dependencies may still require it')
-    ap.add_argument('--promote',type=Path,metavar='REVIEWED_STAGE_DIR',help='Preview/apply a reviewed stage; completed stages keep installed packages and add missing matched curl, filtered OS CAs and permissions')
+    ap.add_argument('--promote','--approve',nargs='?',const=True,type=Path,metavar='OPTIONAL_STAGE_DIR',help='Without a path, automatically prepare/save a new review for the loaded base; add --apply to use its latest saved review. An explicit stage path still works')
     ap.add_argument('--check-permissions',action='store_true',help='Read-only complete known-path permission preflight with private owner-grouped reports; may combine with --promote to inspect candidate paths')
     ap.add_argument('--inspect-trust',action='store_true',help='Read actual CSE/base CA files and configuration; no updates')
     ap.add_argument('--trust-only',action='store_true',help='Filter existing base Miniforge PEM files in place; no packages, new CA path, or shell snippet')
@@ -3461,7 +3648,12 @@ def main():
     ap.add_argument('--scan-root',type=Path,action='append',default=[])
     ap.add_argument('--chains-dir',type=Path,help='Approved local incident chain directory; no downloads')
     ap.add_argument('--log-dir',type=Path)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    if args.promote is True:
+        if args.stage or args.stage_skip or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.merge_system_ca or args.all_envs or args.only or args.include or args.exclude or args.scan_root or args.upgrade_conda or args.check_permissions or args.check_curl or args.repair_curl or args.permissions_only or args.verify_user or args.export_changes or args.changes_output or args.curl_url or args.diagnostic_timeout is not None:
+            ap.error('Automatic --promote prepares/applies the loaded base only; diagnostic commands remain separate')
+        if os.geteuid()==0:ap.error('Run as the maintenance account, not root')
+        return automatic_promotion(args)
     if args.merge_system_ca and not args.trust_only:ap.error('--merge-system-ca requires --trust-only; stage/promote already include the filtered OS merge')
     if args.permissions_only:
         if args.check_curl or args.curl_url or args.repair_curl or args.export_changes or args.changes_output or args.verify_user or args.stage or args.stage_skip or args.promote or args.check_permissions or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.only or args.all_envs or args.include or args.exclude or args.scan_root or args.upgrade_conda or args.chains_dir or args.offline or args.ca_bundle or args.extra_ca or args.channel or args.diagnostic_timeout is not None:

@@ -1,88 +1,48 @@
-# Update a Miniforge base
+# Update the loaded Miniforge base
 
-Copy this folder's `README.md` and `patch_miniforge_trust.py` to each system.
-Load the usual site/compiler and intended Miniforge module. Run with Python 3.8+
-as the maintenance account (`cse` group), not root. Only **base** is maintained.
-No checkout/pull or Miniforge installer replacement is needed.
+Use this folder's updated `patch_miniforge_trust.py` and `README.md` (revision 35+).
+Load the intended site/compiler and Miniforge module. Run with Python 3.8+ as the
+maintenance account (`cse` group), not root. The existing Miniforge installation
+and other environments are kept; no preliminary package update is required.
 
-## Already installed: use the same promotion commands
-
-With revision 33, point `cse_stage` at that installation's completed review stage:
+**1. Review/approve the plan.**
 
 ```bash
-cse_stage="$HOME/cse-base-review-1"
-python3 patch_miniforge_trust.py --promote "$cse_stage"
-python3 patch_miniforge_trust.py --promote "$cse_stage" --apply
+python3 patch_miniforge_trust.py --promote
 ```
 
-Review the preview's **planned changes** before applying. It keeps the installed
-Conda, Python and application versions/builds. If only curl is missing, it adds
-curl matching the installed libcurl and any missing dependencies. It does not
-search for newer versions of unrelated packages. An already installed matched
-pair needs no package solve or reinstall.
+The script finds the loaded base, chooses a new private review directory, runs
+the necessary preparation/access checks, and shows the remaining package changes.
+An already updated base keeps installed versions/builds and adds missing matched
+curl/dependencies. It does not need an old stage directory or a base rebuild.
+For an initial/security refresh, any needed private staging runs automatically.
+Review the output and require **Review READY** before continuing.
 
-Apply also merges the OS CAs into the native Miniforge PEMs **through the incident
-certificate/key filter**, checks the result, and normalizes eligible base/file/
-symlink permissions. System CA discovery covers RHEL and SUSE/openSUSE locations
-automatically, including the newer RHEL extracted PEM path. OS trust files stay
-unchanged; known incident certificates cannot return through the merge. No separate trust/merge/permission command or
-`use-ca.sh` step is needed. Read the final status, logs and any owner-review skips.
-
-The stage must belong to this installation. Unrelated package/checksum drift is
-rejected rather than overwritten. If the old stage is unavailable, use the normal
-staging sequence below: a previously maintained base meeting the script's security
-minimums keeps its installed versions/builds, so its comparison shows the remaining
-changes. An incompatible matching curl solve stops for review.
-
-## First rollout, or a new private review stage
-
-**1. Stage privately.** Use a new directory name for each installation or retry.
+**2. Apply that review.**
 
 ```bash
-cse_stage="$HOME/cse-base-review-2"
-python3 patch_miniforge_trust.py --stage "$cse_stage"
+python3 patch_miniforge_trust.py --promote --apply
 ```
 
-A first rollout solves a fresh compatible base. A previously maintained base
-keeps the installed set and adds the missing curl pair/dependencies. If required
-security minimums are no longer met, a fresh compatible solve is required and its
-additional changes appear in the review. Versions across machines need not match.
+It automatically finds the saved review for this installation. Apply installs
+only the reviewed package set, merges OS CAs into native Miniforge PEMs through
+the incident certificate/key filter, and normalizes eligible base/link permissions.
+RHEL and SUSE certificate paths are detected locally. Known eMudhra incident
+certificates/keys are filtered before writing; OS trust files stay unchanged.
+Read the final status and any owner/access review notes.
 
-**2. Review.** Require `ready-for-review`, read `review.md` and `comparison.csv`,
-and test needed applications in `$cse_stage/env`.
+Reviews default to `~/.cse-trust-reviews/`, separated by host and installation.
+Each review/apply gets a new directory; existing records are preserved. Optional
+`--log-dir PATH` chooses a location; an existing path gets a new suffixed sibling.
+If the base or CA sources changed after review, rerun step 1, then step 2.
+Use the normal maintenance window/recovery arrangements and stop concurrent base
+updates/jobs before applying. Repeat for each distinct GCC/Intel installation.
 
-```bash
-python3 patch_miniforge_trust.py --report "$cse_stage"
-```
+`--approve` is an alias for `--promote`. Older explicit stage paths still work.
+The only required rollout commands are the two above. Checks such as `--report
+PRINTED_REVIEW_OR_RUN_DIR`, `--inspect-trust`, `--check-curl`, `--verify-user`, and
+focused repair modes remain optional. `--base-guide` prints this procedure.
 
-**3. Check access and preview.** Resolve required owner/admin blockers.
-
-```bash
-python3 patch_miniforge_trust.py --check-permissions --promote "$cse_stage"
-python3 patch_miniforge_trust.py --promote "$cse_stage"
-```
-
-**4. Apply.** Use the normal maintenance window/recovery arrangements; stop
-concurrent base jobs/updates. Packages, filtered native trust and permissions are
-handled together. Review the final status and any skips.
-
-```bash
-python3 patch_miniforge_trust.py --promote "$cse_stage" --apply
-```
-
-**5. Verify user operations.** In a fresh shell, reload the same modules and
-return to this folder. Ideally use an ordinary account and a new test directory.
-
-```bash
-python3 patch_miniforge_trust.py --verify-user "$HOME/cse-user-check-2"
-python3 patch_miniforge_trust.py --report "$HOME/cse-user-check-2"
-```
-
-Read `verification.md` and require the requested checks to pass. Repeat separately
-for each GCC/Intel installation. If a step fails, bring Ravon the failing command
-and printed log directory. Keep the stage and update logs; `000-user-changes/README.md`
-and its CSV/JSON files provide the user-facing package change list.
-
-`--base-guide` prints this sequence. The focused `--repair-curl`, `--trust-only`,
-`--check-curl`, `--inspect-trust` and `--permissions-only` commands remain available
-for later diagnostics; they are not extra steps in this rollout.
+If a step fails, give Ravon the failing command and printed review/log directory.
+Keep those records. The promotion log's `000-user-changes/README.md` and CSV/JSON
+files provide the user-facing package change list; private logs are not for publication.

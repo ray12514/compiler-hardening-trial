@@ -1,45 +1,52 @@
 # Miniforge base rollout: team handoff
 
-For a transferred folder containing just the script and a short README, use the
-[short handoff instructions](miniforge-base-handoff.md). This page is the detailed
-reference, including retrieval and historical report recovery.
+Use the [short two-step README](miniforge-base-handoff.md) with revision 35 or newer.
+Copy the updated script and README together; no repository checkout is needed on
+the target system. Load the intended site/compiler and Miniforge module first.
 
-Use this sequence for the remaining machines and each distinct GCC/Intel
-Miniforge installation. Scope: refresh **base**, normalize its eligible shared
-permissions, filter its existing PEM certificate files, and verify normal user
-operations. Other baseline environments will be handled in a later sweep.
-
-The installed Miniforge distribution, prefix and module/Spack selection are kept.
-Existing user environments, including `BASE/envs/*`, are not updated or deleted.
-Different installations get their own stage, review, promotion and reports. If
-multiple machines mount the same shared installation, update that installation
-once rather than running competing updates against it.
-
-Revision 33 includes curl, filtered native trust and permissions in the normal
-stage/review/promote/apply sequence. For an already installed reviewed stage,
-load the same installation and rerun the same commands:
+## Required sequence: review/approve, then apply
 
 ```bash
-cse_stage="$HOME/cse-base-review-1"
-python3 patch_miniforge_trust.py --promote "$cse_stage"
-python3 patch_miniforge_trust.py --promote "$cse_stage" --apply
+python3 patch_miniforge_trust.py --promote
+python3 patch_miniforge_trust.py --promote --apply
 ```
 
-The first command previews the remaining work. A completed stage retains current
-Conda, Python, applications and other installed dependency versions/builds. Missing
-curl is matched to installed libcurl, with missing dependencies added as needed.
-An already installed matched pair skips the solve/transaction. No latest-version
-search or blanket update is performed. Every apply also merges/filters native
-certificates and normalizes eligible base/link permissions. A saved stage with
-unrelated application/build/checksum drift is rejected; it is never used to roll
-those packages back. The focused repair/inspection commands remain optional.
+Review the first command's planned changes and require **Review READY** before
+running the second. No old stage path, separate staging command, or preliminary
+package update is needed. `--approve` is an alias for `--promote`.
 
-If the stage is unavailable, make a new private stage below. The script recognizes
-previous maintenance from its CSE marker/rollout record and installed security
-minimums; such a candidate preserves the installed versions/builds. First rollouts
-or bases below the script's security minimums use a fresh compatible solve whose
-additional changes must be reviewed. Different machines need not have identical
-versions. No separate certificate/permission apply command is required.
+An already updated base keeps its installed Conda, Python and application versions/
+builds. Missing curl is matched to installed libcurl, with missing dependencies
+added as needed. A matching installed pair skips package solve/installation.
+Existing maintenance markers and stage directories are not prerequisites. For an
+initial rollout or unmet security minimums, private candidate staging and its
+promotion preview run automatically; review those additional changes.
+
+Apply finds the saved review for the loaded installation. It uses the reviewed
+package versions/builds/checksums, includes the filtered OS-to-native-PEM merge,
+and normalizes eligible base/link permissions. OS bundle discovery covers RHEL
+and SUSE. Known incident certificates/public keys are removed before writing and
+native files are screened afterward. Administrator trust files remain unchanged.
+No extra trust/merge/permissions command or `use-ca.sh` step is required.
+
+Reviews live under `~/.cse-trust-reviews/`, separated by host and resolved base.
+Every review and apply log gets a fresh directory. `--log-dir PATH` optionally
+chooses a location; an existing name gets a new suffixed sibling without changing
+its contents. The latest pointer selects a review; it does not overwrite review
+artifacts. An unsuccessful new review cannot select an older ready review.
+
+If the base, selected CA inputs, script revision or saved plan changes between
+review and apply, the operation stops: run the same review command again, then
+apply. After a successful apply, a later maintenance pass starts with a new
+review; it does not need to rebuild an already updated base. Installation-specific
+records prevent a GCC review from being used for an Intel prefix or another host.
+Different machines do not need identical package versions.
+
+Use the normal maintenance account (`cse` group), maintenance window/recovery
+arrangements, and stop concurrent base jobs/updates before apply. Read final
+status and owner/access skips; group membership cannot change another owner's
+files. Other environments and the Miniforge installer are kept. Shared prefixes
+mounted on several machines should be maintained once, without competing updates.
 
 ## 1. Retrieve the script and short README, then load the intended setup
 
@@ -73,7 +80,7 @@ Start with a fresh shell when switching between GCC and Intel setups so old
 activation/export settings do not select the previous installation or CA file.
 
 ```bash
-python3 patch_miniforge_trust.py --version  # revision 33 or newer
+python3 patch_miniforge_trust.py --version  # revision 35 or newer
 python3 patch_miniforge_trust.py --base-guide
 ```
 
@@ -87,145 +94,30 @@ promotion and native PEM maintenance require the maintenance account's effective
 access and membership in the exact `cse` group. Do not run as root. Normal user
 verification needs no maintenance write access or `cse` membership.
 
-## 2. Build a private candidate under your home
+## Optional inspection and troubleshooting
 
-Choose a new stage name for this installation. Change the name for another
-machine/installation or a retry; an existing stage directory is not reused.
+The normal sequence already performs required checks. These are available when
+needed; they are not additional mandatory rollout commands:
 
-```bash
-cse_stage="$HOME/cse-base-review-1"
-python3 patch_miniforge_trust.py --stage "$cse_stage"
-```
+- `--report PRINTED_REVIEW_OR_RUN_DIR`: read saved review/run evidence without
+  changes or network access. A saved review is not evidence of completed apply.
+- `--inspect-trust`: inspect current native certificate files and configuration.
+- `--check-curl --curl-url https://your-service.example/`: test the installed curl.
+- `--verify-user NEW_HOME_DIR`: exercise private Conda/pip downloads, environment
+  creation, activation, local wheel build and permissions as a representative user.
+- `--trust-only`, `--repair-curl`, `--permissions-only`: independent focused repairs.
 
-This installs the candidate at `$cse_stage/env`, with private caches, temporary
-trust files and comparison reports beside it. The shared base is read only in
-this step. For a first rollout, installed application requests seed a fresh compatible
-solve; old version/build pins are not carried into that initial candidate.
-A previously maintained base meeting security minimums instead requests the
-existing versions/builds plus a missing matched curl/libcurl pair. Required security
-minimums still apply. Conda selects compatible available packages from approved
-channels; it does not compile every package from source or guarantee every
-package's individually newest version.
+Fresh-shell/module reloads and normal application/user tests remain useful when
+validating a rollout. Successful downloads do not prove rejection of every bad
+chain. Optional `--chains-dir PATH` verifies supplied incident chains offline;
+no live incident test sites are probed. If a step fails, give Ravon the failing
+command and printed directory; do not repeatedly apply a failed/changed review.
 
-**Stop if staging fails.** The failed result and command output stay in the
-stage directory. Do not promote an incomplete candidate. See the detailed
-[staging and troubleshooting reference](miniforge-trust-maintenance.md).
+Older explicit `--stage NEW_DIR`, `--report STAGE_DIR`, `--promote STAGE_DIR`,
+`--promote STAGE_DIR --apply` workflows still work for existing operators. They
+are an advanced/manual interface, not prerequisites for the two-step sequence.
 
-## 3. Review and accept the candidate
-
-```bash
-python3 patch_miniforge_trust.py --report "$cse_stage"
-```
-
-Review `$cse_stage/review.md` and `comparison.csv`. Require `ready-for-review`,
-then check the actual versions/builds, security results, additions, changes,
-omissions and source access warnings. `not-selected` means an old package is
-absent from the new graph; it is not proof that the package is deprecated or
-unavailable. Read `candidate-requests.txt` to see retained application requests.
-
-Run the normal application smoke tests using `$cse_stage/env/bin/python` or other
-candidate executables. Include Intel/MPI/scientific-library checks where the
-installation needs them. A successful dependency solve and manager startup do
-not establish that every application or external site library works.
-
-Do not silently discard an application to obtain a passing solve. If an omission
-is intentionally accepted, use a new stage with the documented `--stage-skip`
-option and review that result. Retain the accepted stage and reports.
-
-## 4. Resolve permission blockers before promotion
-
-Run as the account that will perform the shared update:
-
-```bash
-python3 patch_miniforge_trust.py --check-permissions --promote "$cse_stage"
-```
-
-Read the printed private permission report directory. It groups repair targets
-by owner and identifies inspection gaps. Resolve blockers and rerun the scan.
-This is a report, not a permission repair command. `cse` membership does not
-permit changing another owner's permissions or bypassing ACLs. Use the reported
-owner/admin repair process for those paths.
-
-Every promotion also runs this preflight automatically. A blocker needed for
-the accepted transaction stops it before base changes. Read-only inspection
-cannot guarantee access to every future path or filesystem policy.
-
-## 5. Validate and promote the accepted set to base
-
-Use the normal maintenance window, snapshot/recovery arrangements and site
-coordination; stop concurrent base updates and jobs using files being replaced.
-Keep the same intended site/Miniforge setup loaded:
-
-```bash
-python3 patch_miniforge_trust.py --promote "$cse_stage"
-python3 patch_miniforge_trust.py --promote "$cse_stage" --apply
-```
-
-Run the apply command only after the dry run succeeds and the reviewed result is
-accepted. It installs the accepted package set at the original base path,
-verifies it, and normalizes eligible base permissions to `cse`: directories
-`2775`, ordinary files `0664`, existing executables `0775`. Owner UIDs are kept;
-protected, foreign-owned or ACL-controlled paths can be skipped for review.
-
-**Read the final status and exact printed log directory.** Use `--report` with
-that directory. `updated-with-skips` requires reviewing its skip reports; a zero
-exit code alone does not mean every path's permissions were changed. A failed
-transaction can leave partial work: inspect its reports/recovery instructions
-before retrying. Keep the promotion logs, accepted manifest and package records.
-
-The unpromoted stage is tied to its original source state. If base changes before
-that first promotion, make and review a new stage. A completed installed stage
-can be reused for the bounded follow-up described above. Its reviewed applications,
-platforms and checksums are still checked; missing reviewed packages or unrelated
-drift stop reuse. Each repeat preview/apply records a separate log directory;
-`--report` on the stage still describes the original saved candidate, while the
-promotion preview describes the remaining work against today's base.
-
-## 6. Native trust is included in apply
-
-After package verification, revision 33 promotion merges the OS CAs and preserved
-site CAs into the installed base's native `ssl`, certifi and pip-vendored PEM files.
-Both inputs pass through the known incident certificate/public-key filter before
-writing. It validates the output and screens it afterward, preserves unrelated
-CAs, retains internal symlink aliases, and refuses external PEM targets. OS trust
-files remain unchanged. Eligible file/link permissions are normalized afterward.
-
-Earlier script-created base CSE-path settings are redirected to the native PEM.
-No `--trust-only`, `--merge-system-ca`, `--permissions-only` or `use-ca.sh` step is
-needed for this sequence. Those focused modes remain for independent diagnostics.
-The optional `--inspect-trust` command is still available. If an existing shell
-has old CSE exports, start a fresh shell/reload the same modules before user tests;
-a child process cannot change its parent's exports. Other custom trust settings
-are preserved and may select a different CA source.
-
-Known-certificate/key screening does not prove rejection of every possible chain.
-Broad-root filtering can affect legitimate chains; retain the user-operation tests.
-
-## 7. Verify normal user operations
-
-In a fresh shell, load the same site's normal modules and Miniforge. Ideally run
-as a representative ordinary user, using that user's own home directory:
-
-```bash
-python3 patch_miniforge_trust.py --verify-user "$HOME/cse-user-check-1"
-python3 patch_miniforge_trust.py --report "$HOME/cse-user-check-1"
-```
-
-The test directory must be new. It creates a private environment and checks
-Conda creation/install, pip HTTPS download/install, a tiny local wheel build,
-activation, imports, private write/rename/delete access and unchanged base
-metadata/PEMs. Read `verification.md`; require the requested checks to pass.
-No shared permission changes or base package updates happen in this mode.
-
-For approved incident chains already available locally, add `--chains-dir PATH`
-to verification. They are checked offline using OpenSSL 3. Without them,
-`offline-chain-rejection` is explicitly `not-tested`; successful downloads and
-clean root fingerprints alone do not establish rejection of every bad chain.
-No live incident test sites are probed. Tests cover the account and operations
-actually exercised, not every user's login files, all applications or proxy
-upstream policy. Include normal application tests from step 3.
-
-## 8. Record completion, then repeat for the next installation
+## Record completion, then repeat for the next installation
 
 ### Generate the user-facing package change list
 
@@ -281,7 +173,7 @@ results together. Record remaining skips and any intentionally untested checks.
 Keep these records with a Spack-installed base: its original DAG hash does not
 change when Conda updates the contents.
 
-Repeat with fresh stage/test names for the next distinct GCC/Intel installation.
+Repeat the two commands after loading the next distinct GCC/Intel installation.
 Do not use `--all-envs`, `--only`, remove other baseline environments or replace
 the Miniforge installer in this rollout. Those other environments are a later
 separate sweep.

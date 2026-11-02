@@ -2,7 +2,7 @@
 
 For the ordered base-only team procedure, start with the
 [base rollout handoff](miniforge-base-rollout.md), or run the standalone script's
-`--base-guide` (revision 33 or newer). This page is the detailed command reference.
+`--base-guide` (revision 35 or newer). This page is the detailed command reference.
 For user-facing package changes and recovering lists from older completed runs,
 see the handoff's [change-list instructions](miniforge-base-rollout.md#generate-the-user-facing-package-change-list)
 and the [update index](miniforge-updates/README.md).
@@ -11,6 +11,35 @@ The maintenance script is [scripts/patch_miniforge_trust.py](../scripts/patch_mi
 The normal reviewed rollout handles shared Conda packages, native PEM trust and
 permissions together; focused modes remain available for independent maintenance. It leaves the OS and the inspection proxy unchanged.
 No external incident test endpoint is contacted.
+
+## Default two-step workflow (revision 35)
+
+With the updated standalone script and intended Miniforge module loaded, use:
+
+```bash
+python3 patch_miniforge_trust.py --promote
+python3 patch_miniforge_trust.py --promote --apply
+```
+
+The first command prepares a new private review automatically; no old stage path
+or separate staging command is needed. Already updated bases preserve installed
+versions/builds and plan only missing matched curl/dependencies. Initial/security
+refresh staging happens internally only when needed. Review changes and require
+**Review READY** before applying. `--approve` is an alias for `--promote`.
+
+Apply locates the saved review for the same host/loaded installation and verifies
+that base/CA inputs and review contents have not changed. Maintenance apply uses
+the saved exact package plan rather than solving for newer versions. Packages,
+filtered RHEL/SUSE OS-to-native trust merge and eligible base/link permissions
+remain one operation. No preliminary update or installer replacement is required.
+
+Default storage is `~/.cse-trust-reviews/`, scoped by host/base. Review and apply
+logs always get unique directories. Optional `--log-dir PATH` uses a new path or
+new suffixed sibling if it already exists; old records stay intact. Failed/new
+reviews cannot reuse an older successful review. If a review is stale or already
+applied, start a new pass with the same first command. `--report PRINTED_DIR` reads
+saved evidence. Other checks below are optional diagnostics, and the older
+explicit stage-path interfaces remain supported for manual use.
 
 ## System certificate locations: RHEL and SUSE
 
