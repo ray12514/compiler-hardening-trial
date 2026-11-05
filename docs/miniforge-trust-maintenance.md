@@ -40,6 +40,47 @@ file contents, uses the exact `cse` group, and records foreign-owner/ACL excepti
 It does not reinstall packages or replace CA contents. If an owner account itself
 must change, ask that owner/admin to apply the intended site ownership policy.
 
+## Pip failure in an installation selected through PATH
+
+For a failure during the post-build `pip-download-install` check, first run
+`--report` on the existing private test directory. Revision 38 prints the saved
+failing command, exit code and actual stderr (stdout if stderr was empty), with
+URL credentials redacted. It reads saved records only; no module, shared write
+access, rebuild or network request is needed. Full output remains in the named
+private `command-*.json` file. This works with earlier verification logs too.
+
+An older Miniforge installer can contain already updated Conda/Python packages;
+that installer label does not establish why pip fails. Preserve the failing
+PATH/library setup while inspecting it. The handoff README includes a private
+`startup.txt` collection block requiring no module or shared write access.
+
+Compare `conda info --base`, `type -a conda python python3 pip pip3`, the selected
+Python's `sys.executable`/`sys.prefix`, `python -B -m pip --version`,
+`python -I -B -m pip --version`, and `pip --version`:
+
+- A working module invocation with a failed bare launcher points to PATH,
+  executable permissions or the launcher's interpreter/shebang. Use the exact
+  error to distinguish these; do not rewrite launchers as a guess.
+- Normal failure with isolated success points to user-site/PYTHONPATH interference.
+  `-I` is a comparison, not a permanent module or library-path workaround.
+- Failure in both module invocations needs its actual exception/import/loader
+  error before choosing a package repair. Preserve the complete failure text.
+- Successful startup does not establish HTTPS/package installation. Use
+  `--verify-user NEW_HOME_DIR` and `--report` on that directory to identify a
+  certificate, download, dependency or local-build failure privately.
+
+The [pip user guide](https://pip.pypa.io/en/stable/user_guide/) explains that
+`python -m pip` uses the selected interpreter. [Python's isolated mode](https://docs.python.org/3.14/using/cmdline.html#cmdoption-I)
+excludes user-site/current-directory imports and ignores `PYTHON*` variables;
+compare that result without treating isolation as a repair.
+
+The checks do not invoke `pip install`, Conda updates or shared chmod/chgrp.
+They disable Python bytecode and pip's version check and run from a new private
+working directory. Conda and pip resolve from the caller's current PATH; no
+Miniforge installer is downloaded/replaced. Contact Ravon with the private report
+and failing command, with any credentials removed. No pip-specific root cause is
+assumed without that error evidence.
+
 ## Default two-step workflow (revision 35)
 
 With the updated standalone script and intended Miniforge module loaded, use:

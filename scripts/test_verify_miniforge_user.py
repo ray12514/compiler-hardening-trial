@@ -1,7 +1,6 @@
 import contextlib
 import ast
 import sys
-import types
 import importlib.util
 import io
 import json
@@ -171,6 +170,26 @@ class UserVerificationTests(unittest.TestCase):
    with patch.object(m.subprocess,'run') as run,patch.object(m,'maintenance_gid') as group,contextlib.redirect_stdout(io.StringIO()):
     self.assertEqual(m.report_existing(root),0)
    run.assert_not_called();group.assert_not_called()
+
+
+class SavedPipFailureReportTests(unittest.TestCase):
+ def test_report_reads_actual_saved_pip_failure_without_loading_or_modifying_base(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory)
+   summary={'status':'failed','base':'/shared/old-miniforge','uid':123,
+            'checks':{'pip-download-install':{'status':'failed'}},'issues':['pip check failed']}
+   (root/'verification-summary.json').write_text(json.dumps(summary))
+   command={'phase':'pip-download-install','argv':['/home/user/check/env/bin/python','-I','-B','-m','pip','install','packaging'],
+            'returncode':1,'timed_out':False,'stdout':'Collecting packaging',
+            'stderr':'CERTIFICATE_VERIFY_FAILED at https://user:secret@example.test/simple?token=secret'}
+   (root/'command-004.json').write_text(json.dumps(command))
+   before={p.name:p.read_bytes() for p in root.iterdir()}
+   with patch.object(m.subprocess,'run',side_effect=AssertionError('Saved report must not run commands')),patch.object(m,'find_base',side_effect=AssertionError('No loaded module needed')),contextlib.redirect_stdout(io.StringIO()) as output:
+    self.assertEqual(m.main(['--report',str(root)]),0)
+   text=output.getvalue()
+   self.assertIn('pip install packaging',text);self.assertIn('CERTIFICATE_VERIFY_FAILED',text)
+   self.assertNotIn('user:secret',text);self.assertNotIn('token=secret',text)
+   self.assertEqual(before,{p.name:p.read_bytes() for p in root.iterdir()})
 
 
 class VerificationTransactionGuardTests(unittest.TestCase):

@@ -1,6 +1,6 @@
 # Update the loaded Miniforge base
 
-Use this folder's updated `patch_miniforge_trust.py` and `README.md` (revision 37+).
+Use this folder's updated `patch_miniforge_trust.py` and `README.md` (revision 38+).
 Load the intended site/compiler and Miniforge module. Run with Python 3.8+ as the
 maintenance account (`cse` group), not root. The existing Miniforge installation
 and other environments are kept; no preliminary package update is required.
@@ -67,7 +67,8 @@ with an ordinary user to check their actual access. No live incident sites are
 contacted. Other checks/repairs remain optional when troubleshooting.
 
 **Repair existing shared permissions only, when needed.** Load the affected
-Miniforge setup and run as the account that owns the affected files:
+Miniforge setup and run as the account that owns the affected files. Confirm the
+printed `Base` path matches that installation before applying:
 
 ```bash
 python3 patch_miniforge_trust.py --permissions-only
@@ -79,6 +80,46 @@ or certificate-content changes. It keeps owner UIDs: a maintainer's owner name c
 remain while group `cse` has shared access. Other owners' files/ACL exceptions need
 their owner/admin; review the printed skip report. Changing the owner account
 itself is a separate owner/admin action. No `--promote` rerun is needed for this.
+
+**Pip install fails in the post-build user check.** Read its existing report
+first; no rebuild or reinstall is needed to inspect the saved failure:
+
+```bash
+python3 patch_miniforge_trust.py --report "$cse_check"
+```
+
+Use the test directory printed earlier if `cse_check` is no longer set. Revision
+38 shows the failed pip command, exit status and actual saved error. Give Ravon
+that error and the failed check name; it distinguishes certificate/download,
+package/build and Python/launcher failures without guessing.
+
+**Additional startup checks for a PATH-selected Miniforge (no module required).**
+If pip itself will not start, keep the failing setup selected and collect these
+read-only checks in a new private directory. They install nothing and make no
+shared permission changes:
+
+```bash
+cse_pip_check="$(mktemp -d "$HOME/cse-pip-check.XXXXXX")"
+(
+  cd "$cse_pip_check" || exit 1
+  export PYTHONDONTWRITEBYTECODE=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+  type -a conda python python3 pip pip3
+  conda info --base
+  python -B -c 'import sys; print("Python:", sys.executable); print("Prefix:", sys.prefix)'
+  python -B -m pip --version
+  python -I -B -m pip --version
+  pip --version
+) > "$cse_pip_check/startup.txt" 2>&1
+printf 'Pip startup report: %s\n' "$cse_pip_check/startup.txt"
+```
+
+If `python -m pip` works but `pip` fails, focus on the selected launcher/PATH and
+its interpreter. If only `python -I -m pip` works, check `PYTHONPATH`/user-site
+interference. If both fail, send Ravon the exact error from `startup.txt`; the
+installer's age alone does not identify a repair. If startup succeeds but a
+package download/install fails, run the private user check above and send its
+failed check/report. Keep these reports private; do not reinstall or upgrade
+shared packages merely to make this diagnostic pass.
 
 `--approve` is an alias for `--promote`. The two maintenance commands above stay
 the same; the user check is a separate validation after applying.

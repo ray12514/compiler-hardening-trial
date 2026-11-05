@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 37 (2026-11-05).
+"""CSE Miniforge certificate maintenance, revision 38 (2026-11-05).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --base-guide          # ordered team rollout guide
@@ -228,8 +228,8 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 37
-BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TWO-STEP BASE ROLLOUT (revision 37)
+SCRIPT_REVISION = 38
+BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TWO-STEP BASE ROLLOUT (revision 38)
 
 Use the updated standalone script. Load the intended site/compiler and Miniforge
 module. Run as the maintenance account (cse group), never root. No old stage path,
@@ -285,6 +285,10 @@ Existing permission repair only (as the affected files' owner):
 This fixes eligible group/modes, preserves owner UIDs and reports foreign-owner/
 ACL exceptions. It makes no package transaction or certificate-content change.
 Other inspection/repair modes remain optional for troubleshooting.
+
+If the private pip install check fails, --report on its test directory prints
+the saved failing command and actual error without rerunning it. For PATH-only
+Miniforge setups, the README also includes read-only pip startup comparisons.
 
 For the detailed base guide, contact Ravon directly. If a step fails, give Ravon
 its command and printed review/test/log directory. Keep review/run records and
@@ -3015,7 +3019,18 @@ def report_user_verification(directory):
     summary=json.loads((directory/'verification-summary.json').read_text())
     print('SAVED USER VERIFICATION: '+summary['status']+' | base: '+summary['base'])
     for name,result in summary['checks'].items():print('  '+name+': '+result['status'])
-    for issue in summary['issues']:print('  ATTENTION: '+issue)
+    for issue in summary['issues']:print('  ATTENTION: '+redact_verification(issue))
+    failed={name for name,result in summary['checks'].items() if result.get('status')=='failed'}
+    for path in sorted(directory.glob('command-*.json')):
+        try:event=json.loads(path.read_text())
+        except (OSError,ValueError) as exc:
+            print('  Cannot read saved command '+path.name+': '+str(exc));continue
+        if event.get('phase') not in failed or event.get('returncode')==0 and not event.get('timed_out'):continue
+        print('Failure detail: %s | exit=%s%s'%(event.get('phase'),event.get('returncode'),' | timed out' if event.get('timed_out') else ''))
+        print('Command: '+redact_verification(shlex.join(list(map(str,event.get('argv',()))))))
+        output=redact_verification(str(event.get('stderr') or event.get('stdout') or 'No output was captured.'))
+        print(output[-8000:])
+        print('Complete saved output: '+str(path))
     print('Saved evidence for account '+str(summary['uid'])+'; no checks rerun or files changed.')
     return 0
 
@@ -3254,6 +3269,7 @@ def curl_dependency_scope(meta, plan):
 
 
 def permissions_only(args, base):
+    print('Base: '+str(base))
     root=(args.log_dir or Path.home()/'.cse-trust-logs'/('permission-fix-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))).expanduser().resolve()
     if root==base or base in root.parents:raise RuntimeError('Permission reports must be outside the base')
     root.mkdir(mode=0o700,parents=True,exist_ok=False);root.chmod(0o700)
