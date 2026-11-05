@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 40 (2026-11-05).
+"""CSE Miniforge certificate maintenance, revision 41 (2026-11-05).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --base-guide          # ordered team rollout guide
@@ -123,7 +123,9 @@ metadata. An old package-owned directory is preserved by rename in private
 share/X11/.cse-trust-path-backups before installation. Untracked/shared files stop
 the migration. Failed installations restore that tree when package records roll
 back; partial rollback retains the backup and reports recovery paths. These
-backups are excluded from permission normalization. This is not a full snapshot.
+backups are excluded during package-update permission normalization. The explicit
+--permissions-only whole-tree repair includes them with cse group access. This
+is not a full snapshot.
 Outdated pip-managed tools are reported for reviewed migration to conda-forge,
 without automatically overwriting pip-owned files. If sigstore is installed,
 an offline `python -I -m sigstore --help` smoke check reports startup failures.
@@ -183,9 +185,12 @@ in place when all links are selected with the same mode, and detaches links shar
 outside its scope or across different sharing policies. Known credential/config
 files and keys receive cse:0660 (directories 2770, executables 0770), including
 all descendants of credential directories. Public Python namespaces named
-credentials/tokens/secrets retain ordinary shared modes. Recovery backups and
-privileged files are excluded; foreign-owned files needing changes and extended
-ACLs are reported for owner/admin review. Group membership does not
+credentials/tokens/secrets retain ordinary shared modes. Package updates exclude
+recovery backups and privileged files and report ACLs for review. The explicit
+--permissions-only whole-tree repair includes backups, dotfiles and special-mode
+files too, with matching owner/group rwx bits. It repairs POSIX group ACL entries
+using setfacl when present. Foreign-owned paths or filesystem/ACL failures are
+reported; symlink targets outside the tree are not followed. Group membership does not
 allow chmod/chgrp of another owner's files. Parent traversal blockers are
 reported, not widened. Unknown credentials cannot be detected: keep unrelated
 private data outside managed prefixes. Package updates leave cache/nested-prefix metadata alone; standalone
@@ -234,8 +239,8 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 40
-BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TWO-STEP BASE ROLLOUT (revision 40)
+SCRIPT_REVISION = 41
+BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TWO-STEP BASE ROLLOUT (revision 41)
 
 Use the updated standalone script. Load the intended site/compiler and Miniforge
 module. Run as the maintenance account (cse group), never root. No old stage path,
@@ -291,9 +296,11 @@ One-time legacy permission repair, or whenever needed (as the files' owner):
 This sweeps the ENTIRE Miniforge tree, including envs, pkgs and old nested
 environments. It changes only needed group/modes, preserves owner UIDs and grants
 cse group access for credentials too (0660 files, 2770 directories, 0770 executables;
-no other-user access). Public code remains 0664/2775/0775. Recovery backups/link
-targets stay protected; owner/ACL/filesystem exceptions are reported. It makes
-no package transaction or certificate-content change.
+no other-user access). Public code remains 0664/2775/0775. Hidden files, .git and
+X11 recovery backups are included; owner/group rwx permissions match. It repairs
+POSIX group ACLs with setfacl if needed. Directory links are not followed;
+owner/filesystem/ACL failures are reported. It makes no package transaction or
+certificate-content change.
 Other inspection/repair modes remain optional for troubleshooting.
 
 If the private pip install check fails, --report on its test directory prints
@@ -435,6 +442,18 @@ def secret(p, prefix=None):
     return True
 
 
+def sync_group_acl(p, mode):
+    # chmod updates the POSIX ACL mask, which alone may leave the owning group's
+    # ACL entry restrictive. Set both while retaining existing named ACL entries.
+    if not hasattr(os,'listxattr') or 'system.posix_acl_access' not in os.listxattr(str(p)):return
+    command=shutil.which('setfacl')
+    if command is None:raise OSError('Group ACL repair requires setfacl on this host; file owner/admin must repair the ACL')
+    permissions=''.join(char if mode & bit else '-' for char,bit in zip('rwx',(0o40,0o20,0o10)))
+    result=subprocess.run([command,'-m','g::'+permissions+',m::'+permissions,'--',str(p)],
+                          text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    if result.returncode:raise OSError('Group ACL repair failed: '+result.stderr.strip())
+
+
 def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stats=None, whole_tree=False):
     problems, changed = [], 0
     if stats is None: stats = {}
@@ -459,6 +478,9 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
         current=p.lstat()
         if current.st_gid!=shared_gid or new is not None and stat.S_IMODE(current.st_mode)!=new:
             raise OSError('Requested group/mode did not persist; current group %s mode %04o; owner/filesystem policy review required'%(current.st_gid,stat.S_IMODE(current.st_mode)))
+    def finish_metadata(p,new):
+        if whole_tree:sync_group_acl(p,new)
+        verify_metadata(p,new)
     def update_regular(p,st,new):
         nonlocal changed
         if st.st_nlink>1:
@@ -471,14 +493,14 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
         else:
             if shared_gid!=st.st_gid:os.chown(str(p),-1,shared_gid)
             os.chmod(str(p),new)
-        verify_metadata(p,new);changed+=1;stats['changed']=changed
+        finish_metadata(p,new);changed+=1;stats['changed']=changed
     def visit(p):
         nonlocal changed
         st = p.lstat()
         if stat.S_ISDIR(st.st_mode):
             if p in seen_dirs:return
             seen_dirs.add(p)
-        private=secret(p,prefix) or any(parent in private_dirs for parent in p.parents)
+        private=secret(p,prefix) or p==base/PATH_BACKUPS or any(parent in private_dirs for parent in p.parents)
         if private and stat.S_ISDIR(st.st_mode):private_dirs.add(p)
         stats['visited']+=1
         if stat.S_ISLNK(st.st_mode):
@@ -490,19 +512,18 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
             if apply:
                 os.lchown(str(p),-1,shared_gid);verify_metadata(p);changed+=1;stats['changed']=changed
             return
-        if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
-            if whole_tree:protect(p,'Special filesystem object; permissions preserved')
-            return
+        if not whole_tree and not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):return
         if stat.S_ISDIR(st.st_mode) and not whole_tree and not os.access(str(p),os.R_OK|os.X_OK):
             note(p,'Directory is not readable/traversable; left unchanged');return
-        if hasattr(os,'listxattr') and 'system.posix_acl_access' in os.listxattr(str(p)):
+        has_acl=hasattr(os,'listxattr') and 'system.posix_acl_access' in os.listxattr(str(p))
+        if has_acl and not whole_tree:
             note(p,'Extended ACL needs owner/admin review');return
         old=stat.S_IMODE(st.st_mode)
-        if stat.S_ISREG(st.st_mode) and old & (stat.S_ISUID|stat.S_ISGID):
+        if not whole_tree and stat.S_ISREG(st.st_mode) and old & (stat.S_ISUID|stat.S_ISGID):
             note(p,'Privileged file needs owner/admin review');return
         new=public_mode(old,stat.S_ISDIR(st.st_mode))
         if private:new &= ~0o007  # cse can maintain credentials; other users cannot read them.
-        if old == new and shared_gid == st.st_gid:stats['unchanged']+=1;return
+        if old == new and shared_gid == st.st_gid and not (whole_tree and has_acl):stats['unchanged']+=1;return
         if st.st_uid != os.geteuid():
             note(p,'File/directory owner UID %s must set group cse and required permissions (current UID %s)'%(st.st_uid,os.geteuid()));return
         stats['planned'] += 1
@@ -515,7 +536,7 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
         if stat.S_ISREG(st.st_mode):update_regular(p,st,new)
         else:
             if shared_gid!=st.st_gid:os.chown(str(p),-1,shared_gid)
-            os.chmod(str(p),new);verify_metadata(p,new);changed+=1;stats['changed']=changed
+            os.chmod(str(p),new);finish_metadata(p,new);changed+=1;stats['changed']=changed
     def safe_visit(p):
         try:visit(p)
         except OSError as exc:note(p,exc)
@@ -563,7 +584,7 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
             if internal:
                 if fresh.st_uid!=os.geteuid():raise PermissionError('Hardlink owner changed during sweep')
                 if fresh.st_gid!=shared_gid:os.chown(str(first),-1,shared_gid)
-                os.chmod(str(first),new);verify_metadata(first,new);changed+=len(links);stats['changed']=changed
+                os.chmod(str(first),new);finish_metadata(first,new);changed+=len(links);stats['changed']=changed
                 stats['internal_hardlink_groups']+=1
             else:
                 detached=None
@@ -582,7 +603,7 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
                                 os.link(str(detached),tmp);os.replace(tmp,str(p))
                             finally:
                                 if os.path.exists(tmp):os.unlink(tmp)
-                            verify_metadata(p,mode);changed+=1;stats['changed']=changed;stats['detached_paths']+=1
+                            finish_metadata(p,mode);changed+=1;stats['changed']=changed;stats['detached_paths']+=1
                     except OSError as exc:note(p,exc)
         except OSError as exc:
             for p,old,mode in links:note(p,exc)
@@ -3360,7 +3381,7 @@ def curl_dependency_scope(meta, plan):
 
 def permissions_only(args, base):
     print('Base: '+str(base))
-    print('Permission scope: entire Miniforge tree, including legacy environments and package caches; owner UIDs preserved')
+    print('Permission scope: entire Miniforge tree, including dotfiles, X11 backups, legacy environments and package caches; cse group matches owner rwx; owner UIDs preserved')
     root=(args.log_dir or Path.home()/'.cse-trust-logs'/('permission-fix-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))).expanduser().resolve()
     if root==base or base in root.parents:raise RuntimeError('Permission reports must be outside the base')
     root.mkdir(mode=0o700,parents=True,exist_ok=False);root.chmod(0o700)
@@ -3370,7 +3391,7 @@ def permissions_only(args, base):
         def detail(message):
             log.write(message+'\n')
             if args.verbose:print(message,flush=True)
-        warnings=public_permissions(base,base,args.apply,detail,skipped,[base/PATH_BACKUPS],stats,whole_tree=True)
+        warnings=public_permissions(base,base,args.apply,detail,skipped,stats=stats,whole_tree=True)
     write_skip_reports(root,skipped)
     row={'prefix':str(base),'status':('updated' if args.apply else 'previewed')+('-with-skips' if warnings else ''),
          'issues':[],'permissions':stats,'skipped_paths':skipped,'package_changes':[],

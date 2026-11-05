@@ -1,6 +1,6 @@
 # Update the loaded Miniforge base
 
-Use this folder's updated `patch_miniforge_trust.py` and `README.md` (revision 40+).
+Use this folder's updated `patch_miniforge_trust.py` and `README.md` (revision 41+).
 Load the intended site/compiler and Miniforge module. Run with Python 3.8+ as the
 maintenance account (`cse` group), not root. The existing Miniforge installation
 and other environments are kept; no preliminary package update is required.
@@ -71,25 +71,37 @@ Miniforge setup and run as the account that owns the affected files. Confirm the
 printed `Base` path matches that installation before applying:
 
 ```bash
-python3 patch_miniforge_trust.py --version  # require revision 40 or newer
+python3 patch_miniforge_trust.py --version  # require revision 41 or newer
 python3 patch_miniforge_trust.py --permissions-only
 python3 patch_miniforge_trust.py --permissions-only --apply
 ```
 
-Revision 40 sweeps the **entire selected Miniforge tree**, including `envs/`,
-`pkgs/` and older nested Conda environments. It repairs group/modes throughout
-without package transactions or certificate-content changes. Already compliant
+Revision 41 sweeps the **entire selected Miniforge tree**, including `envs/`,
+`pkgs/`, older nested Conda environments, dotfiles, `.git` and the hidden
+`share/X11/.cse-trust-path-backups` tree. No filename/backup exclusion is applied.
+It sets group `cse` and matching owner/group read/write/execute permissions.
+It makes no package transactions or certificate-content changes. Already compliant
 paths are skipped; hardlinks contained within the tree are updated once in place.
 Credential/config files and keys also receive `cse` group read/write access:
 files 0660, directories 2770, executables 0770, with no access for other users.
 Public Python directories named `credentials`, `tokens` or `secrets` (including
 Jedi/Typeshed Docker stubs) use ordinary shared modes: files 0664, directories
-2775, executables 0775. Recovery backups and directory-link targets remain
-protected and listed. Owner/access/ACL/filesystem exceptions are reported explicitly.
-It keeps owner UIDs: a maintainer's owner name can
-remain while group `cse` has shared access. Other owners' files/ACL exceptions need
-their owner/admin; review the printed skip report. Changing the owner account
-itself is a separate owner/admin action. No `--promote` rerun is needed for this.
+2775, executables 0775. X11 recovery backups use the group-only modes too.
+POSIX group ACL entries/masks are repaired with `setfacl` when needed, retaining
+named entries. A missing ACL tool or filesystem refusal is reported. Directory
+links are not followed outside the tree. Other owners' paths cannot be changed
+by group membership alone; review the printed skip report for owner/admin action.
+It keeps owner UIDs: a maintainer's owner name can remain while group `cse` has
+shared access. Changing the owner account itself is a separate owner/admin action. No `--promote` rerun is needed for this.
+
+**Copy/archive as a group member.** The reader needs read access to files and
+read/search access to directories; writing the archive requires write access only
+in its destination. Use `.` to include dotfiles and backups; a shell `*` misses
+dotfiles. Git ignore rules do not affect tar. Write the archive outside the source:
+
+```bash
+tar -cf /outside/path/miniforge.tar -C /path/to/miniforge .
+```
 
 **Pip install fails in the post-build user check.** Read its existing report
 first; no rebuild or reinstall is needed to inspect the saved failure:

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import tarfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -90,20 +91,81 @@ class FullPermissionSweepTests(unittest.TestCase):
    self.assertNotEqual(cache.stat().st_ino,outside.stat().st_ino);self.assertEqual(outside.read_text(),'external original')
    self.assertEqual(row['permissions']['detached_paths'],2)
 
- def test_credentials_get_group_access_while_backups_and_external_targets_are_preserved(self):
+ def test_credentials_and_backups_get_group_access_while_external_targets_are_preserved(self):
   with tempfile.TemporaryDirectory() as directory:
    root=Path(directory);base,paths=self.fixture(root)
    secret=base/'.condarc';secret.write_text('private config');secret.chmod(0o600)
    backup=base/m.PATH_BACKUPS/'old';backup.parent.mkdir(parents=True);backup.write_text('recovery');backup.chmod(0o600)
    outside=root/'outside-env';outside.mkdir();external=outside/'keep';external.write_text('outside');external.chmod(0o600)
    (base/'envs/external-env').symlink_to(outside,target_is_directory=True)
-   original={p:(p.read_bytes(),p.stat().st_mode,p.stat().st_uid) for p in (backup,external)}
+   original={p:(p.read_bytes(),p.stat().st_mode,p.stat().st_uid) for p in (external,)}
    result,row,output=self.run_repair(root,base,True);self.assertEqual(result,0)
-   self.assertEqual(original,{p:(p.read_bytes(),p.stat().st_mode,p.stat().st_uid) for p in (backup,external)})
+   self.assertEqual(original,{p:(p.read_bytes(),p.stat().st_mode,p.stat().st_uid) for p in (external,)})
    self.assertEqual(secret.stat().st_mode&0o777,0o660);self.assertEqual(secret.stat().st_gid,os.getegid())
-   self.assertGreaterEqual(row['permissions']['protected'],2)
+   self.assertEqual(backup.stat().st_mode&0o777,0o660)
+   self.assertGreaterEqual(row['permissions']['protected'],1)
    protected={r['path'] for r in row['skipped_paths'] if r['stage']=='protected'}
-   self.assertNotIn(str(secret),protected);self.assertIn(str(base/m.PATH_BACKUPS),protected);self.assertIn(str(base/'envs/external-env'),protected)
+   self.assertNotIn(str(secret),protected);self.assertNotIn(str(base/m.PATH_BACKUPS),protected);self.assertIn(str(base/'envs/external-env'),protected)
+
+ def test_whole_tree_repairs_x11_hidden_backup_and_all_owned_owner_group_bits(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);base,paths=self.fixture(root)
+   backup=base/m.PATH_BACKUPS/'20261105/xkb/geometry/.file'
+   backup.parent.mkdir(parents=True);backup.write_text('old X11 data');backup.chmod(0o400)
+   dot=base/'.hidden/nested/.another';dot.parent.mkdir(parents=True);dot.write_text('hidden');dot.chmod(0o600)
+   git=base/'.git/objects/ab/.object';git.parent.mkdir(parents=True);git.write_text('object');git.chmod(0o400)
+   alternate=next((group for group in os.getgroups() if group!=os.getegid()),None)
+   if alternate is None:self.skipTest('A second account group is needed for a real chgrp regression')
+   for path in (backup,backup.parent,base/m.PATH_BACKUPS,dot,git):os.chown(path,-1,alternate)
+   before={p:p.read_bytes() for p in (backup,dot,git)}
+   self.run_repair(root,base,False)
+   self.assertEqual(backup.stat().st_mode&0o777,0o400)
+   self.assertEqual(backup.stat().st_gid,alternate)
+   result,row,output=self.run_repair(root,base,True);self.assertEqual(result,0)
+   for path in (base,*base.rglob('*')):
+    st=path.lstat()
+    self.assertEqual(st.st_gid,os.getegid(),str(path))
+    self.assertEqual((st.st_mode>>6)&7,(st.st_mode>>3)&7,str(path))
+    self.assertEqual(st.st_uid,os.geteuid())
+   self.assertEqual(before,{p:p.read_bytes() for p in before})
+   self.assertFalse(any(item['stage']=='protected' for item in row['skipped_paths']))
+   archive=root/'miniforge.tar'
+   with tarfile.open(archive,'w') as stream:stream.add(base,arcname='.')
+   with tarfile.open(archive) as stream:
+    for path in before:self.assertIn('./'+str(path.relative_to(base)),stream.getnames())
+
+ def test_owned_special_mode_file_and_fifo_are_included_in_full_repair(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);base,paths=self.fixture(root)
+   executable=base/'bin/legacy';executable.parent.mkdir();executable.write_text('legacy');executable.chmod(0o4755)
+   fifo=base/'.fifo';os.mkfifo(fifo,0o600)
+   result,row,output=self.run_repair(root,base,True);self.assertEqual(result,0)
+   for path in (executable,fifo):
+    self.assertEqual(path.stat().st_gid,os.getegid())
+    self.assertEqual((path.stat().st_mode>>6)&7,(path.stat().st_mode>>3)&7)
+    self.assertFalse(any(item['path']==str(path) for item in row['skipped_paths']))
+
+ def test_owned_acl_file_gets_group_acl_repaired_instead_of_being_skipped(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);base,paths=self.fixture(root);target=paths[0];skipped=[]
+   target.chmod(0o664);os.chown(target,-1,os.getegid())
+   def attributes(path):return ['system.posix_acl_access'] if Path(path)==target else []
+   with patch.object(m,'maintenance_gid',return_value=os.getegid()),patch.object(m.os,'listxattr',side_effect=attributes,create=True),patch.object(m.shutil,'which',return_value='/usr/bin/setfacl'),patch.object(m.subprocess,'run',return_value=SimpleNamespace(returncode=0,stderr='')) as run:
+    m.public_permissions(base,base,False,lambda message:None,skipped,whole_tree=True)
+    run.assert_not_called()
+    m.public_permissions(base,base,True,lambda message:None,skipped,whole_tree=True)
+   run.assert_called_once()
+   self.assertEqual(run.call_args.args[0],['/usr/bin/setfacl','-m','g::rw-,m::rw-','--',str(target)])
+   self.assertEqual(target.stat().st_mode&0o777,0o664)
+   self.assertFalse(any(item['path']==str(target) for item in skipped))
+
+ def test_missing_acl_tool_is_reported_for_the_actual_path(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);base,paths=self.fixture(root);target=paths[0];skipped=[]
+   def attributes(path):return ['system.posix_acl_access'] if Path(path)==target else []
+   with patch.object(m,'maintenance_gid',return_value=os.getegid()),patch.object(m.os,'listxattr',side_effect=attributes,create=True),patch.object(m.shutil,'which',return_value=None),patch.object(m.subprocess,'run',side_effect=AssertionError('No command without ACL tool')):
+    m.public_permissions(base,base,True,lambda message:None,skipped,whole_tree=True)
+   self.assertTrue(any(item['path']==str(target) and 'requires setfacl' in item['reason'] for item in skipped))
 
  def test_python_namespaces_are_public_and_actual_credentials_have_group_only_access(self):
   with tempfile.TemporaryDirectory() as directory:

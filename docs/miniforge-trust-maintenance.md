@@ -12,6 +12,32 @@ The normal reviewed rollout handles shared Conda packages, native PEM trust and
 permissions together; focused modes remain available for independent maintenance. It leaves the OS and the inspection proxy unchanged.
 No external incident test endpoint is contacted.
 
+## Unfiltered whole-tree group repair (revision 41)
+
+The earlier permission-only call explicitly excluded
+`share/X11/.cse-trust-path-backups`. The leading dot was not the cause. Revision
+41 removes that exclusion from `--permissions-only`: every owned path under the
+selected Miniforge is included, including hidden files, `.git`, X11 recovery
+backups, legacy environments and caches. The same preview/apply commands work;
+no rebuild or promotion is needed. Confirm `--version` reports 41 or newer.
+
+Group becomes `cse`; owner and group receive matching rwx bits. Public directories
+use 2775, ordinary files 0664 and executable files 0775. Known credentials and
+X11 recovery backups use group-only 2770/0660/0770. Special-mode owned files are
+normalized too. POSIX ACL paths are no longer automatically skipped: `setfacl`
+updates the owning group entry and ACL mask to the intended group permissions,
+retaining named entries. Missing tools or filesystem refusals are reported.
+UID ownership and contents are retained. Outside symlink targets and other
+owners' files are not changed; their access may require that owner/admin.
+Package-update operations retain their existing backup/ACL protection; the
+explicit whole-tree permission repair is the comprehensive maintenance step.
+
+A group member can archive dotfiles and backups when files are readable and
+directories are readable/searchable. Write the archive outside Miniforge with
+`tar -cf /outside/path/miniforge.tar -C /path/to/miniforge .`; a shell `*` misses
+hidden names. Git ignore rules do not apply to tar. Tests cover the hidden X11
+backup, all owner/group bits, group-only changes, ACL repair and archive inclusion.
+
 ## Public Python namespaces and group-only repairs (revision 40)
 
 The earlier private-path filter matched the directory name `credentials` at any
@@ -63,7 +89,8 @@ copy. The initial repair can take longer for externally linked files.
 UID owners are preserved. The exact `cse` group and existing shared mode policy
 still apply (directories 2775, ordinary files 0664, executables 0775). Revision 40
 also includes credential paths with group-only modes 2770/0660/0770; recovery
-backups stay protected and are listed explicitly.
+backups were protected through revision 40; revision 41 includes them in the
+explicit whole-tree repair with group-only access and repairs group ACL entries.
 Directory symlink targets are not traversed. Foreign owners, ACLs, privileged
 files, inaccessible paths and filesystem policies needing review are reported;
 requested metadata is checked after each change rather than assuming chmod/chgrp
@@ -816,7 +843,9 @@ Before installation, the updater validates the old directory against installed
 `BASE/share/X11/.cse-trust-path-backups/xkb-*/xkb`. This same-parent-tree rename
 preserves file contents, owners, groups and modes. It also keeps `share/X11`
 nonempty so Conda's rollback cleanup cannot remove the containing directory.
-The private backup is excluded from recursive permission normalization. A manifest
+The private backup is excluded from package-update permission normalization;
+revision 41's explicit whole-tree permission repair includes it with cse group
+access. A manifest
 records the source, backup, original inode/ownership and migration state before
 data moves. Existing file-conflict checks remain enabled.
 
@@ -1576,8 +1605,10 @@ revision 39 standalone whole-tree repair updates hardlinks in place only when
 all their names are selected with the same target mode; external references and
 mixed public/private modes are protected by detachment. Revision 40 includes
 known secret paths and private configuration with group-only sharing as above.
-Recovery backups, privileged files, extended ACLs and files owned by other
-accounts are preserved or reported for review. Another owner's files can only be left unchanged if already compliant; group
+Package updates preserve/report recovery backups, privileged files and extended
+ACLs. Revision 41's explicit whole-tree permission repair includes these paths,
+normalizes special modes and repairs POSIX group ACL entries. Files owned by other
+accounts and filesystem/ACL failures are reported for owner/admin action. Another owner's files can only be left unchanged if already compliant; group
 write access alone does not permit chmod/chgrp. Parent directories and package-cache
 contents are not recursively modified. Private parent traversal can still block access.
 
@@ -1585,7 +1616,8 @@ contents are not recursively modified. Private parent traversal can still block 
 for users outside its owner/group. Group membership or an ACL may still grant access;
 this warning alone does not establish that everyone is blocked. Such paths are
 reported under `parent-access`, with their actual owner where readable. The script
-does not widen home directories or overwrite ACLs. Making an environment group `cse`
+does not widen home directories. Package updates leave ACLs for review; explicit
+whole-tree permission repair updates owning-group ACL entries/masks as above. Making an environment group `cse`
 does not itself fix access through a private parent. For shared software, have the
 parent owner/admin review traversal or move the environment into an approved shared
 software location. All selected eligible environments, including ones in your home,
