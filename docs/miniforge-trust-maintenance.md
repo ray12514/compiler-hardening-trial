@@ -12,6 +12,28 @@ The normal reviewed rollout handles shared Conda packages, native PEM trust and
 permissions together; focused modes remain available for independent maintenance. It leaves the OS and the inspection proxy unchanged.
 No external incident test endpoint is contacted.
 
+## Public Python namespaces and group-only repairs (revision 40)
+
+The earlier private-path filter matched the directory name `credentials` at any
+depth. That incorrectly excluded public library code such as
+`lib/python3.14/site-packages/jedi/third_party/typeshed/stubs/docker/docker/credentials/constants.pyi`.
+Revision 40 includes directories named `credentials`, `tokens` or `secrets` when
+they are Python namespaces beneath `site-packages`/`dist-packages`, including
+vendored stubs, legacy environments and noarch package-cache layouts. Actual
+credential/config files and private keys are also included: cse group read/write
+access with modes 0660 for files, 2770 for directories and 0770 for executables.
+That group-only policy carries through every descendant of a credential directory;
+other users do not get access. UID owners and contents remain unchanged.
+Hardlinks requiring different public/private modes are separated before repair.
+
+The regression covers both the deep Docker credential stub needing group/mode
+repair and a sibling whose mode is already correct but group is wrong. Files
+owned by the maintenance account receive group `cse` plus shared modes; UID owners
+and contents are retained. Confirm `--version` reports 40 or newer, then use the
+same `--permissions-only` preview/apply commands. An older copied script does not
+pick up a repository update automatically; transfer the refreshed standalone
+script and README together. No environment/package rebuild is needed.
+
 ## Whole-tree permission repair for older installations (revision 39)
 
 The earlier standalone `--permissions-only` command reused the base-update walk,
@@ -39,8 +61,9 @@ For those, the payload is copied once per inode and selected names share the new
 copy. The initial repair can take longer for externally linked files.
 
 UID owners are preserved. The exact `cse` group and existing shared mode policy
-still apply (directories 2775, ordinary files 0664, executables 0775). Private/
-credential paths and recovery backups stay protected and are listed explicitly.
+still apply (directories 2775, ordinary files 0664, executables 0775). Revision 40
+also includes credential paths with group-only modes 2770/0660/0770; recovery
+backups stay protected and are listed explicitly.
 Directory symlink targets are not traversed. Foreign owners, ACLs, privileged
 files, inaccessible paths and filesystem policies needing review are reported;
 requested metadata is checked after each change rather than assuming chmod/chgrp
@@ -1537,6 +1560,9 @@ failures still stop the run before it can safely proceed.
 | Shared directories | cse | 2775 (setgid) |
 | Ordinary shared files | cse | 0664 |
 | Files already executable | cse | 0775 |
+| Credential/config directories | cse | 2770 (setgid) |
+| Credential/config files and keys | cse | 0660 |
+| Executables inside credential/config directories | cse | 0770 |
 
 Existing sticky bits on directories are retained. Owner UID is preserved.
 The target group is always `cse`, regardless of your primary group or the prefix's
@@ -1547,9 +1573,11 @@ Owned symlinks get link group `cse` without following/changing their targets.
 Foreign-owned links are reported separately for owner review. Base-update
 hardlinks are detached before mode/group changes to protect other prefixes. The
 revision 39 standalone whole-tree repair updates hardlinks in place only when
-all their names are selected; external references are protected by detachment. Known secret paths, private configuration, privileged
-files, extended ACLs and files owned by other accounts are preserved or reported for
-review. Another owner's files can only be left unchanged if already compliant; group
+all their names are selected with the same target mode; external references and
+mixed public/private modes are protected by detachment. Revision 40 includes
+known secret paths and private configuration with group-only sharing as above.
+Recovery backups, privileged files, extended ACLs and files owned by other
+accounts are preserved or reported for review. Another owner's files can only be left unchanged if already compliant; group
 write access alone does not permit chmod/chgrp. Parent directories and package-cache
 contents are not recursively modified. Private parent traversal can still block access.
 
@@ -1630,7 +1658,7 @@ the script uses offline OpenSSL 3 verification and never downloads test material
 The proxy's upstream verification must be assessed separately by its maintainers.
 
 Local tests cover the exact cse lookup/membership checks, file/directory modes,
-foreign-owner reporting, hardlink isolation, secret exclusions, discovery, pinning,
+foreign-owner reporting, hardlink isolation, credential group access, discovery, pinning,
 CA filtering, quiet/verbose output, owner report grouping, final-summary reasons,
 permission preview counts, read-only legacy-log reporting, structured command-failure
 records, mixed-package review ordering, access-path snapshots, certificate-only

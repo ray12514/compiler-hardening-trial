@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 39 (2026-11-05).
+"""CSE Miniforge certificate maintenance, revision 40 (2026-11-05).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --base-guide          # ordered team rollout guide
@@ -179,12 +179,16 @@ policy applies to eligible selected prefixes, not arbitrary parent directories.
 Owned symlinks receive the cse link group without following their targets.
 Base-update hardlinks are detached before group/mode changes so other prefixes
 keep their metadata. The standalone whole-tree repair updates internal hardlinks
-in place when all links are selected, and detaches links shared outside its scope. Known private/secret paths
-and privileged files are excluded; foreign-owned files needing changes and
-extended ACLs are reported for owner/admin review. Group membership does not
+in place when all links are selected with the same mode, and detaches links shared
+outside its scope or across different sharing policies. Known credential/config
+files and keys receive cse:0660 (directories 2770, executables 0770), including
+all descendants of credential directories. Public Python namespaces named
+credentials/tokens/secrets retain ordinary shared modes. Recovery backups and
+privileged files are excluded; foreign-owned files needing changes and extended
+ACLs are reported for owner/admin review. Group membership does not
 allow chmod/chgrp of another owner's files. Parent traversal blockers are
-reported, not widened. Unknown credentials cannot be detected: exclude private
-prefixes. Package updates leave cache/nested-prefix metadata alone; standalone
+reported, not widened. Unknown credentials cannot be detected: keep unrelated
+private data outside managed prefixes. Package updates leave cache/nested-prefix metadata alone; standalone
 --permissions-only explicitly includes those trees for legacy permission repair.
 
 Logs and configuration backups default to a persistent private directory in your
@@ -230,8 +234,8 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 39
-BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TWO-STEP BASE ROLLOUT (revision 39)
+SCRIPT_REVISION = 40
+BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TWO-STEP BASE ROLLOUT (revision 40)
 
 Use the updated standalone script. Load the intended site/compiler and Miniforge
 module. Run as the maintenance account (cse group), never root. No old stage path,
@@ -285,8 +289,11 @@ One-time legacy permission repair, or whenever needed (as the files' owner):
    python3 patch_miniforge_trust.py --permissions-only
    python3 patch_miniforge_trust.py --permissions-only --apply
 This sweeps the ENTIRE Miniforge tree, including envs, pkgs and old nested
-environments. It changes only needed group/modes, preserves owner UIDs and lists
-protected credentials/backups/link targets plus owner/ACL/filesystem exceptions. It makes no package transaction or certificate-content change.
+environments. It changes only needed group/modes, preserves owner UIDs and grants
+cse group access for credentials too (0660 files, 2770 directories, 0770 executables;
+no other-user access). Public code remains 0664/2775/0775. Recovery backups/link
+targets stay protected; owner/ACL/filesystem exceptions are reported. It makes
+no package transaction or certificate-content change.
 Other inspection/repair modes remain optional for troubleshooting.
 
 If the private pip install check fails, --report on its test directory prints
@@ -415,15 +422,24 @@ def public_mode(mode, is_dir):
     return 0o775 if mode & 0o111 else 0o664
 
 
-def secret(p):
-    return p.name in SECRETS or p.name.endswith(('.key', '.p12', '.pfx'))
+def secret(p, prefix=None):
+    if p.name.endswith(('.key','.p12','.pfx')):return True
+    if p.name not in SECRETS:return False
+    # Public Python namespaces can be named credentials/tokens/secrets. In
+    # particular Jedi vendors Docker's credentials/*.pyi under site-packages.
+    # Actual config files and key material use group-only sharing at any depth.
+    if p.name in ('credentials','tokens','secrets') and prefix is not None and p.is_dir():
+        try:parents=p.relative_to(prefix).parts[:-1]
+        except ValueError:return True
+        if any(part in ('site-packages','dist-packages') for part in parents):return False
+    return True
 
 
 def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stats=None, whole_tree=False):
     problems, changed = [], 0
     if stats is None: stats = {}
     stats.update(planned=0, changed=0, group_changes=0, mode_changes=0, parent_warnings=0,visited=0,unchanged=0,protected=0,internal_hardlink_groups=0,detached_paths=0)
-    pending_links={};seen_dirs=set()
+    pending_links={};seen_dirs=set();private_dirs=set()
     shared_gid = maintenance_gid()
     exclusions = [Path(os.path.abspath(os.path.expanduser(str(p)))) for p in excludes]
     def excluded(p):
@@ -462,6 +478,8 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
         if stat.S_ISDIR(st.st_mode):
             if p in seen_dirs:return
             seen_dirs.add(p)
+        private=secret(p,prefix) or any(parent in private_dirs for parent in p.parents)
+        if private and stat.S_ISDIR(st.st_mode):private_dirs.add(p)
         stats['visited']+=1
         if stat.S_ISLNK(st.st_mode):
             if st.st_gid==shared_gid:stats['unchanged']+=1;return
@@ -483,6 +501,7 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
         if stat.S_ISREG(st.st_mode) and old & (stat.S_ISUID|stat.S_ISGID):
             note(p,'Privileged file needs owner/admin review');return
         new=public_mode(old,stat.S_ISDIR(st.st_mode))
+        if private:new &= ~0o007  # cse can maintain credentials; other users cannot read them.
         if old == new and shared_gid == st.st_gid:stats['unchanged']+=1;return
         if st.st_uid != os.geteuid():
             note(p,'File/directory owner UID %s must set group cse and required permissions (current UID %s)'%(st.st_uid,os.geteuid()));return
@@ -491,7 +510,7 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
         stats['mode_changes'] += int(old != new)
         say('PERMISSION: %s | group %s -> cse | mode %04o -> %04o' % (p,st.st_gid,old,new))
         if whole_tree and stat.S_ISREG(st.st_mode) and st.st_nlink>1:
-            pending_links.setdefault((st.st_dev,st.st_ino),[]).append((p,st,new));return
+            pending_links.setdefault((st.st_dev,st.st_ino,new),[]).append((p,st,new));return
         if not apply:return
         if stat.S_ISREG(st.st_mode):update_regular(p,st,new)
         else:
@@ -515,8 +534,6 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
             try:
                 if excluded(p):
                     protect(p,'Explicitly excluded recovery/maintenance path');continue
-                if secret(p):
-                    protect(p,'Private/credential path; permissions preserved');continue
                 if p.is_symlink():
                     safe_visit(p);protect(p,'Directory symlink not traversed; target handled only if independently reached within the selected tree');continue
                 if whole_tree and not os.access(str(p),os.R_OK|os.X_OK):safe_visit(p)
@@ -531,12 +548,11 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
         for name in files:
             p=root/name
             if excluded(p):protect(p,'Explicitly excluded recovery/maintenance path');continue
-            if secret(p):
-                protect(p,'Private/credential path; permissions preserved');continue
             safe_visit(p)
     # One metadata walk finds the eligible names of each hardlinked inode. If
-    # every link is inside the sweep, update that inode once instead of copying
-    # package payloads. Otherwise detach selected names to protect outside links.
+    # every link is inside the sweep with the same desired mode, update that
+    # inode once. Otherwise detach names to preserve outside links and different
+    # sharing policies for public code versus actual credentials.
     for links in pending_links.values():
         if not apply:continue
         first,old,new=links[0]

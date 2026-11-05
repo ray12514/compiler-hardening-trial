@@ -39,6 +39,25 @@ class FullPermissionSweepTests(unittest.TestCase):
      self.assertEqual(path.stat().st_mode&0o777,0o664,'Permission sweep skipped '+str(path.relative_to(base)))
      self.assertEqual(path.stat().st_gid,os.getegid());self.assertEqual(path.read_bytes(),before[path])
 
+ def test_exact_docker_credentials_stub_and_group_only_sibling_are_repaired(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);base=root/'miniforge'
+   docker=base/'lib/python3.14/site-packages/jedi/third_party/typeshed/stubs/docker/docker'
+   stub=docker/'credentials/constants.pyi';stub.parent.mkdir(parents=True);stub.write_text('DEFAULT: str\n');stub.chmod(0o600)
+   sibling=docker/'constants.pyi';sibling.write_text('VALUE: int\n');sibling.chmod(0o664)
+   alternate=next((group for group in os.getgroups() if group!=os.getegid()),None)
+   if alternate is None:self.skipTest('A second account group is needed for a real chgrp regression')
+   for path in (stub.parent,stub,sibling):os.chown(path,-1,alternate)
+   before={p:(p.read_bytes(),p.stat().st_uid) for p in (stub,sibling)}
+   result,row,output=self.run_repair(root,base,True);self.assertEqual(result,0)
+   for path in (stub,sibling):
+    with self.subTest(path=path.relative_to(base)):
+     self.assertEqual(path.stat().st_gid,os.getegid(),'Wrong group on '+str(path.relative_to(base)))
+     self.assertEqual(path.stat().st_mode&0o777,0o664)
+     self.assertEqual((path.read_bytes(),path.stat().st_uid),before[path])
+   self.assertEqual(stub.parent.stat().st_gid,os.getegid())
+   self.assertFalse(any(entry['path']==str(stub.parent) and entry['stage']=='protected' for entry in row['skipped_paths']))
+
  def test_preview_preserves_all_file_bytes_and_metadata(self):
   with tempfile.TemporaryDirectory() as directory:
    root=Path(directory);base,paths=self.fixture(root)
@@ -71,19 +90,67 @@ class FullPermissionSweepTests(unittest.TestCase):
    self.assertNotEqual(cache.stat().st_ino,outside.stat().st_ino);self.assertEqual(outside.read_text(),'external original')
    self.assertEqual(row['permissions']['detached_paths'],2)
 
- def test_credentials_backups_and_external_directory_targets_are_reported_and_preserved(self):
+ def test_credentials_get_group_access_while_backups_and_external_targets_are_preserved(self):
   with tempfile.TemporaryDirectory() as directory:
    root=Path(directory);base,paths=self.fixture(root)
    secret=base/'.condarc';secret.write_text('private config');secret.chmod(0o600)
    backup=base/m.PATH_BACKUPS/'old';backup.parent.mkdir(parents=True);backup.write_text('recovery');backup.chmod(0o600)
    outside=root/'outside-env';outside.mkdir();external=outside/'keep';external.write_text('outside');external.chmod(0o600)
    (base/'envs/external-env').symlink_to(outside,target_is_directory=True)
-   original={p:(p.read_bytes(),p.stat().st_mode,p.stat().st_uid) for p in (secret,backup,external)}
+   original={p:(p.read_bytes(),p.stat().st_mode,p.stat().st_uid) for p in (backup,external)}
    result,row,output=self.run_repair(root,base,True);self.assertEqual(result,0)
-   self.assertEqual(original,{p:(p.read_bytes(),p.stat().st_mode,p.stat().st_uid) for p in (secret,backup,external)})
-   self.assertGreaterEqual(row['permissions']['protected'],3)
+   self.assertEqual(original,{p:(p.read_bytes(),p.stat().st_mode,p.stat().st_uid) for p in (backup,external)})
+   self.assertEqual(secret.stat().st_mode&0o777,0o660);self.assertEqual(secret.stat().st_gid,os.getegid())
+   self.assertGreaterEqual(row['permissions']['protected'],2)
    protected={r['path'] for r in row['skipped_paths'] if r['stage']=='protected'}
-   self.assertIn(str(secret),protected);self.assertIn(str(base/m.PATH_BACKUPS),protected);self.assertIn(str(base/'envs/external-env'),protected)
+   self.assertNotIn(str(secret),protected);self.assertIn(str(base/m.PATH_BACKUPS),protected);self.assertIn(str(base/'envs/external-env'),protected)
+
+ def test_python_namespaces_are_public_and_actual_credentials_have_group_only_access(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);base,paths=self.fixture(root);modules=[]
+   for relative in ('lib/python3.14/site-packages/sample/credentials/constants.pyi',
+                    'envs/old/lib/python3.10/site-packages/sample/tokens/__init__.py',
+                    'pkgs/old-package/site-packages/sample/secrets/constants.pyi',
+                    'legacy/lib/python3.11/dist-packages/sample/credentials/constants.pyi'):
+    path=base/relative;path.parent.mkdir(parents=True,exist_ok=True);path.write_text('public package code');path.chmod(0o600);modules.append(path)
+   private=[]
+   for relative in ('credentials/account.json', '.aws/credentials',
+                    'lib/python3.14/site-packages/sample/credentials/client.key',
+                    'lib/python3.14/site-packages/sample/credentials/.env',
+                    'lib/python3.14/site-packages/sample/credentials/credentials'):
+    path=base/relative;path.parent.mkdir(parents=True,exist_ok=True);path.write_text('private data');path.chmod(0o600);private.append(path)
+   result,row,output=self.run_repair(root,base,True);self.assertEqual(result,0)
+   for path in modules:self.assertEqual(path.stat().st_mode&0o777,0o664,str(path))
+   for path in private:self.assertEqual(path.stat().st_mode&0o777,0o660,str(path))
+
+ def test_nested_credential_files_and_directories_get_cse_group_access(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);base,paths=self.fixture(root)
+   folder=base/'envs/old-python/.aws/nested';folder.mkdir(parents=True)
+   credential=folder/'account.json';credential.write_text('credential data');credential.chmod(0o600)
+   executable=folder/'helper';executable.write_text('helper');executable.chmod(0o700)
+   alternate=next((group for group in os.getgroups() if group!=os.getegid()),None)
+   if alternate is None:self.skipTest('A second account group is needed for a real chgrp regression')
+   for path in (folder.parent,folder,credential,executable):os.chown(path,-1,alternate)
+   result,row,output=self.run_repair(root,base,True);self.assertEqual(result,0)
+   for path in (folder.parent,folder,credential,executable):
+    self.assertEqual(path.stat().st_gid,os.getegid(),str(path))
+    self.assertEqual(path.stat().st_uid,os.geteuid())
+   self.assertEqual(folder.stat().st_mode&0o777,0o770)
+   self.assertEqual(credential.stat().st_mode&0o777,0o660)
+   self.assertEqual(executable.stat().st_mode&0o777,0o770)
+   self.assertEqual(credential.read_text(),'credential data')
+
+ def test_shared_inode_with_public_and_private_names_gets_each_required_mode(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);base,paths=self.fixture(root)
+   public=base/'lib/public.py';public.write_text('same bytes');public.chmod(0o600)
+   private=base/'.aws/credentials';private.parent.mkdir();os.link(public,private)
+   result,row,output=self.run_repair(root,base,True);self.assertEqual(result,0)
+   self.assertEqual(public.stat().st_mode&0o777,0o664)
+   self.assertEqual(private.stat().st_mode&0o777,0o660)
+   self.assertNotEqual(public.stat().st_ino,private.stat().st_ino)
+   self.assertEqual(public.read_bytes(),private.read_bytes())
 
  def test_foreign_owned_legacy_file_is_reported_for_owner_review(self):
   with tempfile.TemporaryDirectory() as directory:
