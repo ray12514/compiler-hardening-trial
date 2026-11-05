@@ -1,4 +1,7 @@
 import contextlib
+import ast
+import sys
+import types
 import importlib.util
 import io
 import json
@@ -27,7 +30,7 @@ class UserVerificationTests(unittest.TestCase):
     with self.assertRaises(SystemExit):m.main()
     find.assert_not_called()
 
- def run_verification(self,fail=None,insecure=False,change_base=False,pip_settings='',blocked_root=False,chains=None):
+ def run_verification(self,fail=None,insecure=False,change_base=False,pip_settings='',blocked_root=False,chains=None,change_stub=False,inherited_base=False,wrong_target=False):
   with tempfile.TemporaryDirectory() as directory:
    root=Path(directory).resolve();base=root/'base';work=root/'home/check'
    (base/'conda-meta').mkdir(parents=True);(base/'bin').mkdir();(base/'ssl').mkdir()
@@ -36,17 +39,22 @@ class UserVerificationTests(unittest.TestCase):
    (base/'ssl/cacert.pem').write_text(ca)
    installed={'python':{'name':'python','version':'3.12.8','build':'0'},'conda':{'name':'conda','version':m.CONDA_MINIMUM,'build':'0'}}
    for name,r in installed.items():(base/'conda-meta'/(name+'.json')).write_text(json.dumps(r))
+   stub=base/'lib/python3.14/site-packages/jedi/third_party/typeshed/stubs/docker/docker/constants.pyi'
+   stub.parent.mkdir(parents=True);stub.write_text('DEFAULT_TIMEOUT: int\n');stub.chmod(0o664)
    before={str(p.relative_to(base)):p.read_bytes() for p in base.rglob('*') if p.is_file()}
    calls=[];prefix=work/'env'
    selected={n:{'name':n,'version':v,'build':'0','channel':'conda-forge'} for n,v in [('python','3.12.9'),('pip',m.MINIMUM['pip']),('certifi',m.MINIMUM['certifi']),('ca-certificates',m.MINIMUM['ca-certificates']),('click','8.3.0'),('curl','8.23.0'),('libcurl','8.23.0')]}
    def fake(argv,**kwargs):
     argv=list(map(str,argv));calls.append((argv,dict(kwargs['env'])))
+    self.assertEqual(kwargs['cwd'],str(work))
+    for key in ('XDG_DATA_HOME','XDG_STATE_HOME','PYTHONPYCACHEPREFIX'):
+     self.assertTrue(Path(kwargs['env'][key]).is_relative_to(work))
     if fail and fail in ' '.join(argv):return subprocess.CompletedProcess(argv,1,'','simulated download or build failure')
     if '--show' in argv:data={'ssl_verify':False if insecure else True}
     elif '-c' in argv and argv[argv.index('-c')+1]==m.USER_TRUST_AUDIT:
      data={'bundles':{},'ssl_paths':{},'default_ca_fingerprints':[]}
     elif argv[-2:]==['config','list']:return subprocess.CompletedProcess(argv,0,pip_settings,'')
-    elif '--dry-run' in argv:data={'success':True,'actions':{'PREFIX':str(prefix),'LINK':list(selected.values())}}
+    elif '--dry-run' in argv:data={'success':True,'actions':{'PREFIX':str(base if wrong_target else prefix),'LINK':list(selected.values())}}
     elif 'create' in argv or 'install' in argv and '-p' in argv:
      (prefix/'conda-meta').mkdir(parents=True,exist_ok=True);(prefix/'bin').mkdir(exist_ok=True);(prefix/'ssl').mkdir(exist_ok=True);(prefix/'lib').mkdir(exist_ok=True)
      (prefix/'ssl/cacert.pem').write_text(ca)
@@ -55,19 +63,28 @@ class UserVerificationTests(unittest.TestCase):
     elif '--report' in argv:
      Path(argv[argv.index('--report')+1]).write_text(json.dumps({'install':[{'download_info':{'url':'https://files.pythonhosted.org/packaging.whl'}}]}));data={}
     else:data={'prefix':str(prefix)}
+    if change_stub and '--report' in argv:
+     if change_stub=='mode':stub.chmod(0o600)
+     elif change_stub=='replace':
+      replacement=stub.with_name('replacement.pyi');replacement.write_bytes(stub.read_bytes());os.replace(replacement,stub)
+     else:stub.write_text('DEFAULT_TIMEOUT: str\n')
+    if inherited_base and argv[:1]==['bash'] and kwargs['env'].get('CONDA_PREFIX')==str(base):stub.write_text('unexpected inherited activation hook write\n')
     if change_base and '--report' in argv:(base/'.condarc').write_text('concurrent change')
     return subprocess.CompletedProcess(argv,0,json.dumps(data),'')
    args=SimpleNamespace(verify_user=work,channel=[],chains_dir=root/'chains' if chains else None)
    env={'PATH':os.environ['PATH']}
+   if inherited_base:env.update(CONDA_PREFIX=str(base),CONDA_SHLVL='1',CONDA_DEFAULT_ENV='base',CONDA_EXE=str(base/'bin/conda'),BASH_ENV=str(base/'shared-startup.sh'))
    roots={m.pem_entries(ca)[0][0]:'incident root'} if blocked_root else {}
    with patch.object(m.subprocess,'run',side_effect=fake),patch.object(m.Path,'home',return_value=root/'home'),patch.dict(m.ROOTS,roots,clear=blocked_root),patch.object(m,'verify_chains',side_effect=RuntimeError('UNSAFE: accepted local chain') if chains=='accepted' else None) as verify_chains,contextlib.redirect_stdout(io.StringIO()):
     result=m.verify_user_install(args,base,env)
    if chains:self.assertGreater(verify_chains.call_count,0)
    report=json.loads((work/'verification-summary.json').read_text())
-   if not change_base:self.assertEqual(before,{str(p.relative_to(base)):p.read_bytes() for p in base.rglob('*') if p.is_file()})
+   if not change_base and not change_stub:self.assertEqual(before,{str(p.relative_to(base)):p.read_bytes() for p in base.rglob('*') if p.is_file()})
    self.assertEqual(work.stat().st_mode&0o777,0o700)
    self.assertTrue(all(env['CONDA_PKGS_DIRS']==str(work/'pkgs') for argv,env in calls))
    self.assertTrue(all(env['CONDA_REGISTER_ENVS']=='false' for argv,env in calls))
+   self.assertTrue(all(env['CSE_CONDA_VERIFY_PREFIX']==str(prefix) for argv,env in calls))
+   self.assertTrue(all('--copy' in argv for argv,env in calls if 'create' in argv or 'install' in argv and '-p' in argv))
    return result,report,calls
 
  def test_download_install_activation_and_build_checks_are_all_required(self):
@@ -93,6 +110,29 @@ class UserVerificationTests(unittest.TestCase):
  def test_base_changes_fail_the_final_check(self):
   result,report,calls=self.run_verification(change_base=True)
   self.assertEqual(result,2);self.assertEqual(report['checks']['base-unchanged']['status'],'failed')
+
+ def test_changed_jedi_stub_cannot_pass_the_base_unchanged_check(self):
+  result,report,calls=self.run_verification(change_stub=True)
+  self.assertEqual(result,2,'Verification falsely passed after a shared Jedi/Typeshed stub changed')
+  self.assertEqual(report['checks']['base-unchanged']['status'],'failed')
+
+ def test_stub_permission_changes_and_identical_replacement_are_detected(self):
+  for change in ('mode','replace'):
+   with self.subTest(change=change):
+    result,report,calls=self.run_verification(change_stub=change)
+    self.assertEqual(result,2);self.assertEqual(report['checks']['base-unchanged']['status'],'failed')
+    self.assertIn('constants.pyi',report['checks']['base-unchanged']['detail'])
+
+ def test_outside_plan_stops_before_any_create_or_install(self):
+  result,report,calls=self.run_verification(wrong_target=True)
+  self.assertEqual(result,2);self.assertIn('shared/outside prefix',' '.join(report['issues']))
+  self.assertFalse(any('--yes' in argv for argv,env in calls))
+
+ def test_loaded_base_activation_state_cannot_leak_into_private_activation(self):
+  result,report,calls=self.run_verification(inherited_base=True)
+  self.assertEqual(result,0,report['issues'])
+  activation=next(env for argv,env in calls if argv[:1]==['bash'])
+  self.assertNotIn('CONDA_PREFIX',activation);self.assertNotIn('BASH_ENV',activation)
 
  def test_existing_or_live_destination_is_refused(self):
   with tempfile.TemporaryDirectory() as directory:
@@ -131,6 +171,22 @@ class UserVerificationTests(unittest.TestCase):
    with patch.object(m.subprocess,'run') as run,patch.object(m,'maintenance_gid') as group,contextlib.redirect_stdout(io.StringIO()):
     self.assertEqual(m.report_existing(root),0)
    run.assert_not_called();group.assert_not_called()
+
+
+class VerificationTransactionGuardTests(unittest.TestCase):
+ def test_actual_solver_wrapper_blocks_shared_prefix_before_any_package_actions(self):
+  syntax=ast.parse(m.LIBMAMBA_CLI)
+  node=next(node for node in syntax.body if isinstance(node,ast.ClassDef) and node.name=='RetainedBaseSolver')
+  transaction=SimpleNamespace(prefix_setups={'target':SimpleNamespace(target_prefix='/shared/base')})
+  class Backend:
+   def solve_for_transaction(self,*args,**kwargs):return transaction
+  class CondaError(Exception):pass
+  scope={'LibMambaSolver':Backend,'os':os,'sys':sys,'json':json,'approved':{}}
+  module=ast.Module(body=[node],type_ignores=[]);ast.fix_missing_locations(module);exec(compile(module,'<actual solver wrapper>','exec'),scope)
+  with patch.dict(sys.modules,{'conda.exceptions':SimpleNamespace(CondaError=CondaError)}),patch.dict(os.environ,{'CSE_CONDA_VERIFY_PREFIX':'/private/check/env'},clear=True):
+   with self.assertRaisesRegex(CondaError,'shared/outside prefix'):scope['RetainedBaseSolver']().solve_for_transaction()
+   transaction.prefix_setups['target']=SimpleNamespace(target_prefix='/private/check/env',unlink_precs=(),link_precs=())
+   self.assertIs(scope['RetainedBaseSolver']().solve_for_transaction(),transaction)
 
 
 if __name__=='__main__':unittest.main()

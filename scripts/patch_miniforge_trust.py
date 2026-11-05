@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 36 (2026-11-02).
+"""CSE Miniforge certificate maintenance, revision 37 (2026-11-05).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --base-guide          # ordered team rollout guide
@@ -228,8 +228,8 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 36
-BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TWO-STEP BASE ROLLOUT (revision 36)
+SCRIPT_REVISION = 37
+BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TWO-STEP BASE ROLLOUT (revision 37)
 
 Use the updated standalone script. Load the intended site/compiler and Miniforge
 module. Run as the maintenance account (cse group), never root. No old stage path,
@@ -272,11 +272,18 @@ The new private directory holds test environments, packages, caches and reports.
 Checks cover curl HTTPS, Conda create/install, pip HTTPS download/install and a
 small wheel build, activation/imports, and private write/rename/delete access.
 No base package, certificate or shared-permission changes are made by this test.
-It also checks that base metadata/configuration and native PEMs stayed unchanged.
+It audits base files/ownership/modes before and after, including Jedi .pyi stubs.
+Unexpected changes fail base-unchanged; see base-file-changes.json. Separate envs
+and package-cache trees are excluded from this audit; test caches stay private.
 Require User verification: PASSED in the output and a passed base-unchanged row
 in verification.md.
 Downloads/environment creation may take a few minutes. Keep failure reports and
 repeat as an ordinary user to check their access. No live incident sites probed.
+Existing permission repair only (as the affected files' owner):
+   python3 patch_miniforge_trust.py --permissions-only
+   python3 patch_miniforge_trust.py --permissions-only --apply
+This fixes eligible group/modes, preserves owner UIDs and reports foreign-owner/
+ACL exceptions. It makes no package transaction or certificate-content change.
 Other inspection/repair modes remain optional for troubleshooting.
 
 For the detailed base guide, contact Ravon directly. If a step fails, give Ravon
@@ -622,7 +629,7 @@ def records(prefix):
 
 def safe_environment():
     env = os.environ.copy()
-    for k in ('PYTHONPATH','PYTHONHOME','LD_PRELOAD','LD_LIBRARY_PATH','CSE_CONDA_PERMISSION_HOLDS','CSE_CONDA_APPROVED_PLAN',
+    for k in ('PYTHONPATH','PYTHONHOME','LD_PRELOAD','LD_LIBRARY_PATH','CSE_CONDA_PERMISSION_HOLDS','CSE_CONDA_APPROVED_PLAN','CSE_CONDA_VERIFY_PREFIX',
               'OPENSSL_CONF','OPENSSL_MODULES','OPENSSL_ENGINES',
               'SSL_CERT_DIR','PIP_TRUSTED_HOST'):
         env.pop(k, None)
@@ -1386,6 +1393,10 @@ class RetainedBaseSolver(LibMambaSolver):
         # same-build reinstall or Python-triggered noarch relink is forbidden.
         guard=json.loads(os.environ.get('CSE_CONDA_PERMISSION_HOLDS','{}'))
         for setup in transaction.prefix_setups.values():
+            private_prefix=os.environ.get('CSE_CONDA_VERIFY_PREFIX')
+            if private_prefix and os.path.realpath(setup.target_prefix)!=os.path.realpath(private_prefix):
+                from conda.exceptions import CondaError
+                raise CondaError('User verification transaction targets a shared/outside prefix; no transaction attempted')
             if os.path.realpath(setup.target_prefix)==guard.get('prefix'):
                 touched={r.name for r in (*setup.unlink_precs,*setup.link_precs)} & set(guard['packages'])
                 if touched:
@@ -3009,6 +3020,35 @@ def report_user_verification(directory):
     return 0
 
 
+def verification_file_state(base, say):
+    """Read metadata for base files without following directory symlinks.
+
+    Exclude separate environments/package caches; verification never targets
+    those trees. ctime/inode/link counts catch rewrites even with equal bytes.
+    """
+    entries={};excluded=[];last_progress=time.monotonic()
+    def record(path):
+        nonlocal last_progress
+        st=path.lstat()
+        entries[str(path.relative_to(base))]={key:getattr(st,key) for key in
+            ('st_dev','st_ino','st_mode','st_uid','st_gid','st_size','st_mtime_ns','st_ctime_ns','st_nlink')}
+        if stat.S_ISLNK(st.st_mode):entries[str(path.relative_to(base))]['target']=os.readlink(str(path))
+        if time.monotonic()-last_progress>=30:
+            say('Still checking base file metadata: %d paths'%len(entries));last_progress=time.monotonic()
+    def walk_error(exc):raise exc
+    for folder,dirs,files in os.walk(str(base),followlinks=False,onerror=walk_error):
+        folder=Path(folder);record(folder);keep=[]
+        for name in dirs:
+            path=folder/name
+            if folder==base and name in ('pkgs','envs'):
+                excluded.append(str(path.relative_to(base)));continue
+            if path.is_symlink():record(path)
+            else:keep.append(name)
+        dirs[:]=keep
+        for name in files:record(folder/name)
+    return {'entries':entries,'excluded_directories':sorted(excluded)}
+
+
 def verify_user_install(args, base, env):
     root=args.verify_user.expanduser().resolve()
     home=Path.home().resolve()
@@ -3025,17 +3065,27 @@ def verify_user_install(args, base, env):
                CONDA_OFFLINE='false',CONDA_DRY_RUN='false',CONDA_AUTO_UPDATE_CONDA='false',
                CONDA_NOTIFY_OUTDATED_CONDA='false',CONDA_NUMBER_CHANNEL_NOTICES='0',CONDA_REPORT_ERRORS='false',
                PYTHONDONTWRITEBYTECODE='1',PYTHONUSERBASE=str(root/'python-user'),PIP_DISABLE_PIP_VERSION_CHECK='1',
-               PIP_CACHE_DIR=str(root/'pip-cache'),TMPDIR=str(root/'tmp'),XDG_CACHE_HOME=str(root/'user-cache'))
+               PIP_CACHE_DIR=str(root/'pip-cache'),TMPDIR=str(root/'tmp'),TMP=str(root/'tmp'),TEMP=str(root/'tmp'),
+               XDG_CACHE_HOME=str(root/'user-cache'),XDG_DATA_HOME=str(root/'user-data'),XDG_STATE_HOME=str(root/'user-state'),
+               PYTHONPYCACHEPREFIX=str(root/'python-cache'),CONDA_ALWAYS_COPY='true',CONDA_ALLOW_SOFTLINKS='false',
+               CSE_CONDA_VERIFY_PREFIX=str(prefix))
+    # Start a private activation, without deactivating the caller's shared base
+    # or sourcing its deactivate.d hooks. Preserve site/compiler PATH/libraries.
+    for key in list(env):
+        if re.fullmatch(r'CONDA_(?:PREFIX(?:_\d+)?|STACKED_\d+)',key) or key in ('CONDA_EXE','CONDA_PYTHON_EXE','CONDA_DEFAULT_ENV',
+                'CONDA_SHLVL','CONDA_PROMPT_MODIFIER','CONDA_ROOT_PREFIX','MAMBA_ROOT_PREFIX','_CE_CONDA','_CE_M','BASH_ENV','ENV'):
+            env.pop(key,None)
     for key in ('CSE_CONDA_PERMISSION_HOLDS','CSE_CONDA_APPROVED_PLAN'):env.pop(key,None)
-    for name in ('pkgs','envs','pip-cache','tmp','user-cache'):(root/name).mkdir(mode=0o700)
+    for name in ('pkgs','envs','pip-cache','tmp','user-cache','user-data','user-state','python-cache'):(root/name).mkdir(mode=0o700)
     names=('base-trust','base-curl','base-curl-https','conda-create','private-trust','conda-install','pip-download-install','pip-local-build',
            'activation-imports','private-permissions','base-unchanged','offline-chain-rejection')
     summary={'script_revision':SCRIPT_REVISION,'base':str(base),'prefix':str(prefix),'uid':os.geteuid(),
              'status':'running','checks':{name:{'status':'not-run'} for name in names},'issues':[],
              'limits':['This account and these exercises only; repeat as a representative ordinary user.',
                        'No full application/compiler validation or proxy-upstream trust verification.',
-                       'Root fingerprint screening is separate from offline chain-rejection testing.']}
-    baseline=None;native_before=None;phase='prepare';command_number=0
+                       'Root fingerprint screening is separate from offline chain-rejection testing.',
+                       'Base file audit covers the selected prefix; separate environments and package-cache trees are excluded.']}
+    baseline=None;native_before=None;base_files_before=None;phase='prepare';command_number=0
     log=(root/'run.log').open('w',buffering=1)
     def say(message):message=redact_verification(message);print(message,flush=True);log.write(message+'\n')
     def run(command, raw=False, allow_failure=False):
@@ -3048,7 +3098,7 @@ def verify_user_install(args, base, env):
             while not finished.wait(30):say('Still checking %s (%ds elapsed)'%(phase,time.monotonic()-started))
         heartbeat=threading.Thread(target=progress,daemon=True);heartbeat.start()
         timed_out=False
-        try:result=subprocess.run(command,env=env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=600)
+        try:result=subprocess.run(command,env=env,cwd=str(root),text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=600)
         except subprocess.TimeoutExpired as exc:
             decode=lambda value:value.decode(errors='replace') if isinstance(value,bytes) else value or ''
             result=subprocess.CompletedProcess(command,None,decode(exc.stdout),decode(exc.stderr));timed_out=True
@@ -3080,9 +3130,12 @@ def verify_user_install(args, base, env):
                 except (ValueError,SyntaxError):settings[key]=value
         return settings
     def solve_install(verb,specs):
-        common=[verb,'-p',str(prefix),'--solver','libmamba','--json','--no-pin']+channel_args
-        if verb=='create':common+=['--copy','--no-default-packages','--no-shortcuts']
+        common=[verb,'-p',str(prefix),'--solver','libmamba','--json','--no-pin','--copy']+channel_args
+        if verb=='create':common+=['--no-default-packages','--no-shortcuts']
         plan=conda(common+specs+['--dry-run']);check_plan(plan,None,{spec_name(value) for value in specs})
+        planned=plan.get('actions',{}).get('PREFIX')
+        if planned and Path(planned).resolve()!=prefix:
+            raise RuntimeError('Verification plan targets a shared/outside prefix; no transaction attempted')
         for record in plan.get('actions',{}).get('LINK',[]):
             if record.get('url'):verification_source_url(record['url'])
         final,exact=exact_plan_specs(records(prefix) if prefix.exists() else {},plan,{},args.channel,config)
@@ -3094,6 +3147,8 @@ def verify_user_install(args, base, env):
         say('PRIVATE USER VERIFICATION | base: '+str(base)+' | account UID: '+str(os.geteuid()))
         summary['base_access']=[access_snapshot(path) for path in (base,base/'bin',base/'bin/python',base/'bin/conda')]
         before=records(base);baseline=stage_source_state(base,before)
+        base_files_before=verification_file_state(base,say)
+        (root/'base-files-before.json').write_text(json.dumps(base_files_before,indent=2))
         native_before={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in native_bundle_paths(base)}
         config=conda(['config','--show','--json'])
         _,urls,channel_args,_,_,_=environment_channels(before,args.channel,config)
@@ -3159,9 +3214,16 @@ def verify_user_install(args, base, env):
         try:
             def unchanged():
                 if baseline is None:raise RuntimeError('No initial source fingerprint was captured')
+                if base_files_before is None:raise RuntimeError('No complete initial base-file audit was captured')
+                base_files_after=verification_file_state(base,say)
+                (root/'base-files-after.json').write_text(json.dumps(base_files_after,indent=2))
+                old=base_files_before['entries'];new=base_files_after['entries']
+                changed=sorted(name for name in set(old)|set(new) if old.get(name)!=new.get(name))
+                (root/'base-file-changes.json').write_text(json.dumps({'changed_paths':changed,'excluded_directories':base_files_after['excluded_directories']},indent=2))
+                if changed:raise RuntimeError('Shared base files or permissions changed during verification: '+', '.join(changed[:5])+'; see base-file-changes.json')
                 if stage_source_state(base)!=baseline or {str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in native_bundle_paths(base)}!=native_before:
                     raise RuntimeError('Base metadata, configuration or PEM files changed during verification; review concurrent activity')
-                return {'metadata_and_native_pems':'unchanged','shared_package_cache':'not selected for writes'}
+                return {'metadata_and_native_pems':'unchanged','base_files_and_permissions':'unchanged','paths_checked':len(new),'excluded_directories':base_files_after['excluded_directories'],'shared_package_cache':'not selected for writes'}
             check('base-unchanged',unchanged)
         except Exception as exc:summary['status']='failed';summary['issues'].append(redact_verification(str(exc)))
         try:

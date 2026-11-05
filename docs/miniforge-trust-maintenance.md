@@ -12,6 +12,34 @@ The normal reviewed rollout handles shared Conda packages, native PEM trust and
 permissions together; focused modes remain available for independent maintenance. It leaves the OS and the inspection proxy unchanged.
 No external incident test endpoint is contacted.
 
+## Private user-test isolation (revision 37)
+
+`--verify-user NEW_HOME_DIR` clears inherited Conda activation/startup state,
+retains site/compiler PATH and library settings, runs commands from the private
+test directory, and places temporary/cache/data/state files there. Normal package
+and certificate configuration remains readable. Both Conda create and install
+use `--copy`; the solver wrapper rejects transactions outside the private test
+prefix before package unlink/link actions. No permission repair is part of this
+mode, even when the account can maintain the shared base.
+
+The previous `base-unchanged` check covered package/control metadata and PEMs.
+It could miss a change to an unrelated shared file. Revision 37 additionally
+records base file ownership, group, mode, inode, size, timestamps and link counts
+before/after, including `site-packages/jedi/third_party/typeshed/.../*.pyi`.
+A rewrite, mode/owner change, added or removed path fails verification and is
+listed in private `base-file-changes.json`; identical bytes do not hide replacement.
+Directory symlinks are not followed, and other environments/package-cache trees
+are excluded. This audit reports unexpected/concurrent changes; it does not
+identify which earlier process modified an existing file or undo unknown changes.
+The selected commands/targets are constrained, not an OS security sandbox for
+arbitrary package/hook code. All records remain under the private test directory.
+
+For existing shared group/mode problems, use `--permissions-only` then
+`--permissions-only --apply` as the files' owner. This preserves owner UIDs and
+file contents, uses the exact `cse` group, and records foreign-owner/ACL exceptions.
+It does not reinstall packages or replace CA contents. If an owner account itself
+must change, ask that owner/admin to apply the intended site ownership policy.
+
 ## Default two-step workflow (revision 35)
 
 With the updated standalone script and intended Miniforge module loaded, use:

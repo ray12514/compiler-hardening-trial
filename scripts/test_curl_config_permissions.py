@@ -46,6 +46,17 @@ class LinkGroupTests(unittest.TestCase):
    run.assert_not_called();self.assertEqual(pem.read_text(),'already merged OS certificates')
    self.assertEqual(pem.stat().st_mode&0o777,0o664)
 
+ def test_permissions_only_repairs_owned_jedi_stub_without_changing_owner_or_bytes(self):
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory);base=root/'base';stub=base/'lib/python3.14/site-packages/jedi/third_party/typeshed/stubs/docker/docker/constants.pyi'
+   stub.parent.mkdir(parents=True);stub.write_text('DEFAULT_TIMEOUT: int\n');stub.chmod(0o600)
+   original=stub.read_bytes();uid=stub.stat().st_uid
+   args=SimpleNamespace(log_dir=root/'logs',apply=True,verbose=False)
+   with patch.object(m,'maintenance_gid',return_value=os.getegid()),patch.object(m.subprocess,'run',side_effect=AssertionError('Permission fix must not launch package tools')),contextlib.redirect_stdout(io.StringIO()):
+    self.assertEqual(m.permissions_only(args,base),0)
+   self.assertEqual(stub.read_bytes(),original);self.assertEqual(stub.stat().st_uid,uid)
+   self.assertEqual(stub.stat().st_gid,os.getegid());self.assertEqual(stub.stat().st_mode&0o777,0o664)
+
 
 class CurlReadOnlyCheckTests(unittest.TestCase):
  def test_cli_check_needs_no_shared_maintenance_access(self):

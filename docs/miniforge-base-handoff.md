@@ -1,6 +1,6 @@
 # Update the loaded Miniforge base
 
-Use this folder's updated `patch_miniforge_trust.py` and `README.md` (revision 36+).
+Use this folder's updated `patch_miniforge_trust.py` and `README.md` (revision 37+).
 Load the intended site/compiler and Miniforge module. Run with Python 3.8+ as the
 maintenance account (`cse` group), not root. The existing Miniforge installation
 and other environments are kept; no preliminary package update is required.
@@ -56,13 +56,29 @@ checks curl HTTPS access, Conda creation/install in a private environment, pip
 HTTPS download/install and a small wheel build, activation/imports, and private
 write/rename/delete access. Test packages and caches stay under that private
 directory. It does not update base packages, rewrite base certificates or change
-shared permissions. It also checks that base metadata/configuration/PEMs stayed
-unchanged. Package downloads/environment creation can take a few minutes.
+shared permissions. It also audits base files (including Jedi/Typeshed stubs), ownership, modes and
+file metadata before/after. Unexpected changes fail `base-unchanged`; inspect
+`base-file-changes.json`. Other environment/package-cache trees are excluded
+from that file walk; the test uses its own private caches. Package downloads/environment creation can take a few minutes.
 
 Require **User verification: PASSED** in the output. In `verification.md`,
 require the `base-unchanged` row to show `passed`. The report covers the account and operations tested; repeat
 with an ordinary user to check their actual access. No live incident sites are
 contacted. Other checks/repairs remain optional when troubleshooting.
+
+**Repair existing shared permissions only, when needed.** Load the affected
+Miniforge setup and run as the account that owns the affected files:
+
+```bash
+python3 patch_miniforge_trust.py --permissions-only
+python3 patch_miniforge_trust.py --permissions-only --apply
+```
+
+This repairs eligible base/file/link group and modes without package transactions
+or certificate-content changes. It keeps owner UIDs: a maintainer's owner name can
+remain while group `cse` has shared access. Other owners' files/ACL exceptions need
+their owner/admin; review the printed skip report. Changing the owner account
+itself is a separate owner/admin action. No `--promote` rerun is needed for this.
 
 `--approve` is an alias for `--promote`. The two maintenance commands above stay
 the same; the user check is a separate validation after applying.
