@@ -12,6 +12,42 @@ The normal reviewed rollout handles shared Conda packages, native PEM trust and
 permissions together; focused modes remain available for independent maintenance. It leaves the OS and the inspection proxy unchanged.
 No external incident test endpoint is contacted.
 
+## Whole-tree permission repair for older installations (revision 39)
+
+The earlier standalone `--permissions-only` command reused the base-update walk,
+which skipped the contents of `envs/`, `pkgs/` and other nested Conda prefixes.
+Revision 39 makes that existing command a full permission sweep of the selected
+Miniforge root. Load the affected setup and, as the files' owner, run:
+
+```bash
+python3 patch_miniforge_trust.py --permissions-only
+python3 patch_miniforge_trust.py --permissions-only --apply
+```
+
+Confirm the printed base path before apply. This is the one-time repair for
+legacy permissions; no package solve, rebuild or certificate-content change is
+needed. The ordinary package rollout remains base-only, and user verification
+remains private. Old environment packages are not upgraded by this sweep.
+
+The sweep includes old environments, cache contents and unregistered/nested
+prefixes. It repairs owned directories that need traversal bits before walking
+their children. Already compliant paths are untouched. One metadata walk groups
+hardlinks: if every link is inside the eligible sweep, one inode update fixes
+all its names without copying package payloads. Links also referenced outside
+the sweep are detached before group/mode repair so outside permissions stay put.
+For those, the payload is copied once per inode and selected names share the new
+copy. The initial repair can take longer for externally linked files.
+
+UID owners are preserved. The exact `cse` group and existing shared mode policy
+still apply (directories 2775, ordinary files 0664, executables 0775). Private/
+credential paths and recovery backups stay protected and are listed explicitly.
+Directory symlink targets are not traversed. Foreign owners, ACLs, privileged
+files, inaccessible paths and filesystem policies needing review are reported;
+requested metadata is checked after each change rather than assuming chmod/chgrp
+succeeded. The summary distinguishes changed, already compliant and protected
+paths from owner/access review notes. `--report PRINTED_LOG_DIR` shows the recorded
+scope/counts and points to full path/owner details. No blanket UID chown is done.
+
 ## Private user-test isolation (revision 37)
 
 `--verify-user NEW_HOME_DIR` clears inherited Conda activation/startup state,
@@ -1508,8 +1544,10 @@ previous group. Setgid enables group inheritance in newly created subdirectories
 Package installation permissions are normalized after a successful update.
 
 Owned symlinks get link group `cse` without following/changing their targets.
-Foreign-owned links are reported separately for owner review. Hardlinks are broken before mode/group changes to avoid
-changing caches or other prefixes. Known secret paths, private configuration, privileged
+Foreign-owned links are reported separately for owner review. Base-update
+hardlinks are detached before mode/group changes to protect other prefixes. The
+revision 39 standalone whole-tree repair updates hardlinks in place only when
+all their names are selected; external references are protected by detachment. Known secret paths, private configuration, privileged
 files, extended ACLs and files owned by other accounts are preserved or reported for
 review. Another owner's files can only be left unchanged if already compliant; group
 write access alone does not permit chmod/chgrp. Parent directories and package-cache

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CSE Miniforge certificate maintenance, revision 38 (2026-11-05).
+"""CSE Miniforge certificate maintenance, revision 39 (2026-11-05).
 
 Python 3.8+, standard library. Run as a maintenance account, not root.
   python3 patch_miniforge_trust.py --base-guide          # ordered team rollout guide
@@ -177,13 +177,15 @@ cse:0775. UID ownership is preserved. Membership in other groups is still used
 to discover maintainable prefixes, but never selects the output group. This
 policy applies to eligible selected prefixes, not arbitrary parent directories.
 Owned symlinks receive the cse link group without following their targets.
-Hardlinks are broken before group/mode changes so
-other environments and caches keep their metadata. Known private/secret paths
+Base-update hardlinks are detached before group/mode changes so other prefixes
+keep their metadata. The standalone whole-tree repair updates internal hardlinks
+in place when all links are selected, and detaches links shared outside its scope. Known private/secret paths
 and privileged files are excluded; foreign-owned files needing changes and
 extended ACLs are reported for owner/admin review. Group membership does not
 allow chmod/chgrp of another owner's files. Parent traversal blockers are
 reported, not widened. Unknown credentials cannot be detected: exclude private
-prefixes. Package-cache contents and unrelated nested prefixes are not changed.
+prefixes. Package updates leave cache/nested-prefix metadata alone; standalone
+--permissions-only explicitly includes those trees for legacy permission repair.
 
 Logs and configuration backups default to a persistent private directory in your
 home (or --log-dir), outside managed trees. They are NOT a package/filesystem
@@ -228,8 +230,8 @@ from urllib.parse import urlsplit, urlunsplit
 MINIMUM = {'ca-certificates':'2026.10.19', 'certifi':'2026.10.19',
            'pip':'26.2.2', 'uv':'0.13.4', 'sigstore':'4.5.1'}
 CONDA_MINIMUM = '26.9.4'
-SCRIPT_REVISION = 38
-BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TWO-STEP BASE ROLLOUT (revision 38)
+SCRIPT_REVISION = 39
+BASE_ROLLOUT_GUIDE = """CSE MINIFORGE: TWO-STEP BASE ROLLOUT (revision 39)
 
 Use the updated standalone script. Load the intended site/compiler and Miniforge
 module. Run as the maintenance account (cse group), never root. No old stage path,
@@ -279,11 +281,12 @@ Require User verification: PASSED in the output and a passed base-unchanged row
 in verification.md.
 Downloads/environment creation may take a few minutes. Keep failure reports and
 repeat as an ordinary user to check their access. No live incident sites probed.
-Existing permission repair only (as the affected files' owner):
+One-time legacy permission repair, or whenever needed (as the files' owner):
    python3 patch_miniforge_trust.py --permissions-only
    python3 patch_miniforge_trust.py --permissions-only --apply
-This fixes eligible group/modes, preserves owner UIDs and reports foreign-owner/
-ACL exceptions. It makes no package transaction or certificate-content change.
+This sweeps the ENTIRE Miniforge tree, including envs, pkgs and old nested
+environments. It changes only needed group/modes, preserves owner UIDs and lists
+protected credentials/backups/link targets plus owner/ACL/filesystem exceptions. It makes no package transaction or certificate-content change.
 Other inspection/repair modes remain optional for troubleshooting.
 
 If the private pip install check fails, --report on its test directory prints
@@ -293,7 +296,7 @@ Miniforge setups, the README also includes read-only pip startup comparisons.
 For the detailed base guide, contact Ravon directly. If a step fails, give Ravon
 its command and printed review/test/log directory. Keep review/run records and
 the 000-user-changes/README.md plus CSV/JSON package list. Private logs are not for
-publication; other baseline environments stay unchanged.
+publication; legacy permission repair does not upgrade other environment packages.
 """
 BASE_REPLACEMENTS = {'boost':('libboost-python-devel',),'boost-cpp':('libboost-devel',)}
 ROOTS = {
@@ -416,10 +419,11 @@ def secret(p):
     return p.name in SECRETS or p.name.endswith(('.key', '.p12', '.pfx'))
 
 
-def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stats=None):
+def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stats=None, whole_tree=False):
     problems, changed = [], 0
     if stats is None: stats = {}
-    stats.update(planned=0, changed=0, group_changes=0, mode_changes=0, parent_warnings=0)
+    stats.update(planned=0, changed=0, group_changes=0, mode_changes=0, parent_warnings=0,visited=0,unchanged=0,protected=0,internal_hardlink_groups=0,detached_paths=0)
+    pending_links={};seen_dirs=set()
     shared_gid = maintenance_gid()
     exclusions = [Path(os.path.abspath(os.path.expanduser(str(p)))) for p in excludes]
     def excluded(p):
@@ -431,20 +435,47 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
             skipped.append({'path':str(p),'stage':stage,'reason':str(reason),
                             'prefix':str(prefix)})
         say('SKIP PATH: ' + message)
+    def protect(p,reason):
+        stats['protected']+=1
+        say('PROTECTED: '+str(p)+' | '+reason)
+        if skipped is not None:skipped.append({'path':str(p),'stage':'protected','reason':reason,'prefix':str(prefix)})
+    def verify_metadata(p,new=None):
+        current=p.lstat()
+        if current.st_gid!=shared_gid or new is not None and stat.S_IMODE(current.st_mode)!=new:
+            raise OSError('Requested group/mode did not persist; current group %s mode %04o; owner/filesystem policy review required'%(current.st_gid,stat.S_IMODE(current.st_mode)))
+    def update_regular(p,st,new):
+        nonlocal changed
+        if st.st_nlink>1:
+            fd,tmp=tempfile.mkstemp(prefix='.trust-mode-',dir=str(p.parent));os.close(fd)
+            try:
+                shutil.copy2(str(p),tmp);os.chown(tmp,-1,shared_gid);os.chmod(tmp,new)
+                os.replace(tmp,str(p));stats['detached_paths']+=1
+            finally:
+                if os.path.exists(tmp):os.unlink(tmp)
+        else:
+            if shared_gid!=st.st_gid:os.chown(str(p),-1,shared_gid)
+            os.chmod(str(p),new)
+        verify_metadata(p,new);changed+=1;stats['changed']=changed
     def visit(p):
         nonlocal changed
         st = p.lstat()
+        if stat.S_ISDIR(st.st_mode):
+            if p in seen_dirs:return
+            seen_dirs.add(p)
+        stats['visited']+=1
         if stat.S_ISLNK(st.st_mode):
-            if st.st_gid==shared_gid:return
+            if st.st_gid==shared_gid:stats['unchanged']+=1;return
             if st.st_uid!=os.geteuid():
                 note(p,'Symlink owner UID %s must set link group cse; target ownership/access is separate'%st.st_uid,'link-group');return
             stats['planned']+=1;stats['group_changes']+=1
             say('LINK GROUP: %s | group %s -> cse; target unchanged'%(p,st.st_gid))
             if apply:
-                os.lchown(str(p),-1,shared_gid);changed+=1;stats['changed']=changed
+                os.lchown(str(p),-1,shared_gid);verify_metadata(p);changed+=1;stats['changed']=changed
             return
-        if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)): return
-        if stat.S_ISDIR(st.st_mode) and not os.access(str(p),os.R_OK|os.X_OK):
+        if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
+            if whole_tree:protect(p,'Special filesystem object; permissions preserved')
+            return
+        if stat.S_ISDIR(st.st_mode) and not whole_tree and not os.access(str(p),os.R_OK|os.X_OK):
             note(p,'Directory is not readable/traversable; left unchanged');return
         if hasattr(os,'listxattr') and 'system.posix_acl_access' in os.listxattr(str(p)):
             note(p,'Extended ACL needs owner/admin review');return
@@ -452,33 +483,29 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
         if stat.S_ISREG(st.st_mode) and old & (stat.S_ISUID|stat.S_ISGID):
             note(p,'Privileged file needs owner/admin review');return
         new=public_mode(old,stat.S_ISDIR(st.st_mode))
-        if old == new and shared_gid == st.st_gid:return
+        if old == new and shared_gid == st.st_gid:stats['unchanged']+=1;return
         if st.st_uid != os.geteuid():
             note(p,'File/directory owner UID %s must set group cse and required permissions (current UID %s)'%(st.st_uid,os.geteuid()));return
         stats['planned'] += 1
         stats['group_changes'] += int(shared_gid != st.st_gid)
         stats['mode_changes'] += int(old != new)
         say('PERMISSION: %s | group %s -> cse | mode %04o -> %04o' % (p,st.st_gid,old,new))
+        if whole_tree and stat.S_ISREG(st.st_mode) and st.st_nlink>1:
+            pending_links.setdefault((st.st_dev,st.st_ino),[]).append((p,st,new));return
         if not apply:return
-        if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
-            fd,tmp=tempfile.mkstemp(prefix='.trust-mode-',dir=str(p.parent));os.close(fd)
-            try:
-                shutil.copy2(str(p),tmp);os.chown(tmp,-1,shared_gid);os.chmod(tmp,new)
-                os.replace(tmp,str(p))
-            finally:
-                if os.path.exists(tmp):os.unlink(tmp)
+        if stat.S_ISREG(st.st_mode):update_regular(p,st,new)
         else:
-            if shared_gid != st.st_gid:os.chown(str(p),-1,shared_gid)
-            os.chmod(str(p),new)
-        changed += 1
-        stats['changed'] = changed
+            if shared_gid!=st.st_gid:os.chown(str(p),-1,shared_gid)
+            os.chmod(str(p),new);verify_metadata(p,new);changed+=1;stats['changed']=changed
     def safe_visit(p):
         try:visit(p)
         except OSError as exc:note(p,exc)
     def walk_error(exc):note(exc.filename or prefix,exc)
+    if whole_tree and not os.access(str(prefix),os.R_OK|os.X_OK):safe_visit(prefix)
     for root,dirs,files in os.walk(str(prefix),followlinks=False,onerror=walk_error):
         root=Path(root)
-        if excluded(root):dirs[:]=[];continue
+        if excluded(root):
+            protect(root,'Explicitly excluded recovery/maintenance path');dirs[:]=[];continue
         if not os.access(str(root),os.R_OK|os.X_OK):
             note(root,'Directory is not readable/traversable; left unchanged');dirs[:]=[];continue
         safe_visit(root)
@@ -487,24 +514,62 @@ def public_permissions(prefix, base, apply, say, skipped=None, excludes=(), stat
             p=root/name
             try:
                 if excluded(p):
-                    say('EXCLUDED: '+str(p));continue
+                    protect(p,'Explicitly excluded recovery/maintenance path');continue
                 if secret(p):
-                    say('Preserving private-path permissions: '+str(p));continue
-                if p.is_symlink():safe_visit(p);continue
+                    protect(p,'Private/credential path; permissions preserved');continue
+                if p.is_symlink():
+                    safe_visit(p);protect(p,'Directory symlink not traversed; target handled only if independently reached within the selected tree');continue
+                if whole_tree and not os.access(str(p),os.R_OK|os.X_OK):safe_visit(p)
                 if not os.access(str(p),os.R_OK|os.X_OK):
                     note(p,'Directory is not readable/traversable; left unchanged');continue
-                if prefix == base and name in ('pkgs','envs') and root == base:
+                if not whole_tree and prefix == base and name in ('pkgs','envs') and root == base:
                     safe_visit(p);continue
-                if (p/'conda-meta/history').is_file():continue
+                if not whole_tree and (p/'conda-meta/history').is_file():continue
                 keep.append(name)
             except OSError as exc:note(p,exc)
         dirs[:]=keep
         for name in files:
             p=root/name
-            if excluded(p):continue
+            if excluded(p):protect(p,'Explicitly excluded recovery/maintenance path');continue
             if secret(p):
-                say('Preserving private-path permissions: '+str(p));continue
+                protect(p,'Private/credential path; permissions preserved');continue
             safe_visit(p)
+    # One metadata walk finds the eligible names of each hardlinked inode. If
+    # every link is inside the sweep, update that inode once instead of copying
+    # package payloads. Otherwise detach selected names to protect outside links.
+    for links in pending_links.values():
+        if not apply:continue
+        first,old,new=links[0]
+        try:
+            current=[p.lstat() for p,old,mode in links];fresh=current[0]
+            internal=fresh.st_nlink==len(links) and all(
+                (now.st_dev,now.st_ino)==(old.st_dev,old.st_ino) for now,(p,old,mode) in zip(current,links))
+            if internal:
+                if fresh.st_uid!=os.geteuid():raise PermissionError('Hardlink owner changed during sweep')
+                if fresh.st_gid!=shared_gid:os.chown(str(first),-1,shared_gid)
+                os.chmod(str(first),new);verify_metadata(first,new);changed+=len(links);stats['changed']=changed
+                stats['internal_hardlink_groups']+=1
+            else:
+                detached=None
+                for p,old,mode in links:
+                    try:
+                        fresh=p.lstat()
+                        if (fresh.st_dev,fresh.st_ino,fresh.st_uid)!=(old.st_dev,old.st_ino,os.geteuid()):
+                            raise PermissionError('Hardlink identity/owner changed during sweep')
+                        if detached is None:
+                            update_regular(p,fresh,mode);detached=p
+                        else:
+                            # Copy the shared payload once, then preserve sharing
+                            # among selected names without touching outside links.
+                            fd,tmp=tempfile.mkstemp(prefix='.trust-mode-',dir=str(p.parent));os.close(fd);os.unlink(tmp)
+                            try:
+                                os.link(str(detached),tmp);os.replace(tmp,str(p))
+                            finally:
+                                if os.path.exists(tmp):os.unlink(tmp)
+                            verify_metadata(p,mode);changed+=1;stats['changed']=changed;stats['detached_paths']+=1
+                    except OSError as exc:note(p,exc)
+        except OSError as exc:
+            for p,old,mode in links:note(p,exc)
     for p in prefix.parents:
         try:
             if not p.stat().st_mode & stat.S_IXOTH:
@@ -1732,6 +1797,15 @@ def report_existing(directory, verbose=False):
     for row in results:
         counts[row['status']] = counts.get(row['status'],0)+1
         if row.get('package_change_list'):print('User package change list: '+row['package_change_list']['path'])
+        if row.get('mode')=='permissions-only':
+            stats=row.get('permissions',{})
+            print('Permission scope: '+row.get('scope','base-only (older report; nested environments/cache were not swept)'))
+            print('  %d visited; %d planned; %d changed; %d already compliant; %d protected exclusions'%(
+                stats.get('visited',0),stats.get('planned',0),stats.get('changed',0),stats.get('unchanged',0),stats.get('protected',0)))
+            warnings=row.get('permission_warnings',[])
+            for warning in warnings[:10]:print('  OWNER/ACCESS REVIEW: '+str(warning))
+            print('  Full path/owner details: '+str(directory/'skipped-paths.txt'))
+            continue
         if row['status'] not in ('incomplete','skipped') and not row.get('permission_holds') and not row.get('promotion') and not verbose: continue
         issues = row.get('issues',[])
         evidence = row.get('command_failures',[])
@@ -3270,22 +3344,23 @@ def curl_dependency_scope(meta, plan):
 
 def permissions_only(args, base):
     print('Base: '+str(base))
+    print('Permission scope: entire Miniforge tree, including legacy environments and package caches; owner UIDs preserved')
     root=(args.log_dir or Path.home()/'.cse-trust-logs'/('permission-fix-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))).expanduser().resolve()
     if root==base or base in root.parents:raise RuntimeError('Permission reports must be outside the base')
     root.mkdir(mode=0o700,parents=True,exist_ok=False);root.chmod(0o700)
     stats={};skipped=[]
     with (root/'run.log').open('w') as log:
-        log.write('Mode: '+('APPLY' if args.apply else 'LOCAL PREVIEW')+'; permissions only\n')
+        log.write('Mode: '+('APPLY' if args.apply else 'LOCAL PREVIEW')+'; permissions only; entire Miniforge tree including envs/pkgs/nested prefixes\n')
         def detail(message):
             log.write(message+'\n')
             if args.verbose:print(message,flush=True)
-        warnings=public_permissions(base,base,args.apply,detail,skipped,[base/PATH_BACKUPS],stats)
+        warnings=public_permissions(base,base,args.apply,detail,skipped,[base/PATH_BACKUPS],stats,whole_tree=True)
     write_skip_reports(root,skipped)
     row={'prefix':str(base),'status':('updated' if args.apply else 'previewed')+('-with-skips' if warnings else ''),
          'issues':[],'permissions':stats,'skipped_paths':skipped,'package_changes':[],
-         'permission_warnings':warnings,'mode':'permissions-only'}
+         'permission_warnings':warnings,'mode':'permissions-only','scope':'entire-miniforge-tree'}
     (root/'summary.json').write_text(json.dumps([row],indent=2))
-    print('Base permissions: %d %s; %d access/owner review notes'%(stats['changed'] if args.apply else stats['planned'],'changed' if args.apply else 'planned',len(warnings)))
+    print('Whole-tree permissions: %d %s; %d already compliant; %d protected exclusions; %d access/owner review notes'%(stats['changed'] if args.apply else stats['planned'],'changed' if args.apply else 'planned',stats['unchanged'],stats['protected'],len(warnings)))
     print('Details: '+str(root/'skipped-paths.txt'))
     print('No package transactions or certificate-content changes were performed. Symlink targets outside base were not modified.')
     return 0
@@ -3715,7 +3790,7 @@ def main(argv=None):
     ap.add_argument('--repair-curl',action='store_true',help='Target only the base curl executable, matched libcurl and necessary dependencies; default dry-run, add --apply to repair')
     ap.add_argument('--check-curl',action='store_true',help='Read-only startup and HTTPS check of the installed curl; no package or permission changes')
     ap.add_argument('--curl-url',metavar='HTTPS_URL',help='HTTPS endpoint for --check-curl, --repair-curl or --verify-user; default approved channel noarch repodata')
-    ap.add_argument('--permissions-only',action='store_true',help='Preview base group/mode normalization only; add --apply to fix owned files/links, without packages or PEM-content changes')
+    ap.add_argument('--permissions-only',action='store_true',help='Preview group/mode repair across the entire Miniforge tree, including old envs and caches; add --apply. Owner UIDs and file contents preserved')
     ap.add_argument('--verify-user',type=Path,metavar='NEW_HOME_DIR',help='Post-install online user checks in a new private home directory; no base updates or cse membership needed')
     ap.add_argument('--stage',type=Path,metavar='NEW_PRIVATE_DIR',help='Solve and install a fresh private base candidate with comparison reports; source base stays read only; no --apply needed')
     ap.add_argument('--stage-skip',action='append',default=[],metavar='PACKAGE',help='Omit this application request from --stage; repeatable; dependencies may still require it')
@@ -3751,7 +3826,7 @@ def main(argv=None):
     if args.merge_system_ca and not args.trust_only:ap.error('--merge-system-ca requires --trust-only; stage/promote already include the filtered OS merge')
     if args.permissions_only:
         if args.check_curl or args.curl_url or args.repair_curl or args.export_changes or args.changes_output or args.verify_user or args.stage or args.stage_skip or args.promote or args.check_permissions or args.report or args.diagnose or args.inspect_trust or args.trust_only or args.only or args.all_envs or args.include or args.exclude or args.scan_root or args.upgrade_conda or args.chains_dir or args.offline or args.ca_bundle or args.extra_ca or args.channel or args.diagnostic_timeout is not None:
-            ap.error('--permissions-only targets base ownership/modes only; combine with --apply, --log-dir or --verbose')
+            ap.error('--permissions-only sweeps the loaded Miniforge tree; combine with --apply, --log-dir or --verbose')
         if os.geteuid()==0:ap.error('Run as the maintenance account, not root')
         maintenance_gid();base=find_base(args.miniforge,safe_environment())
         if not maintainable(base):raise RuntimeError('No maintenance access to the loaded base')

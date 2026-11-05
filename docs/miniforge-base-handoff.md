@@ -1,6 +1,6 @@
 # Update the loaded Miniforge base
 
-Use this folder's updated `patch_miniforge_trust.py` and `README.md` (revision 38+).
+Use this folder's updated `patch_miniforge_trust.py` and `README.md` (revision 39+).
 Load the intended site/compiler and Miniforge module. Run with Python 3.8+ as the
 maintenance account (`cse` group), not root. The existing Miniforge installation
 and other environments are kept; no preliminary package update is required.
@@ -66,7 +66,7 @@ require the `base-unchanged` row to show `passed`. The report covers the account
 with an ordinary user to check their actual access. No live incident sites are
 contacted. Other checks/repairs remain optional when troubleshooting.
 
-**Repair existing shared permissions only, when needed.** Load the affected
+**One-time repair for older Miniforge permissions (or whenever needed).** Load the affected
 Miniforge setup and run as the account that owns the affected files. Confirm the
 printed `Base` path matches that installation before applying:
 
@@ -75,8 +75,12 @@ python3 patch_miniforge_trust.py --permissions-only
 python3 patch_miniforge_trust.py --permissions-only --apply
 ```
 
-This repairs eligible base/file/link group and modes without package transactions
-or certificate-content changes. It keeps owner UIDs: a maintainer's owner name can
+Revision 39 sweeps the **entire selected Miniforge tree**, including `envs/`,
+`pkgs/` and older nested Conda environments. It repairs group/modes throughout
+without package transactions or certificate-content changes. Already compliant
+paths are skipped; hardlinks contained within the tree are updated once in place.
+Credentials, recovery backups and directory-link targets are protected and listed
+in the report. Owner/access/ACL/filesystem exceptions are reported explicitly. It keeps owner UIDs: a maintainer's owner name can
 remain while group `cse` has shared access. Other owners' files/ACL exceptions need
 their owner/admin; review the printed skip report. Changing the owner account
 itself is a separate owner/admin action. No `--promote` rerun is needed for this.
